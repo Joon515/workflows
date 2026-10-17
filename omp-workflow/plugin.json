@@ -1,0 +1,5 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "omp-workflow",
+  "description": "An evidence-driven engineering workflow for agent-heavy, rapidly evolving CLI and agent systems: change admission, canonical ownership, impact closure, documentation, logs, verification, and delivery."
+}
