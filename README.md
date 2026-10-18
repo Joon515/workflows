@@ -1,12 +1,13 @@
 # workflows
 
-本仓库为 AI-assisted software development 提供可迁移的 **operational workflow packages**，不是仅供阅读的 upstream studies。目标 harness 是 **oh-my-pi（omp）**：每个 workflow 必须考虑 dynamic system prompt、discovery、tools、context lifecycle、delegation、permissions 与实际执行机制。
+本仓库提供可迁移的 **operational workflow packages**，覆盖 AI-assisted software development 与书籍翻译，不是仅供阅读的 upstream studies。目标 harness 是 **oh-my-pi（omp）**：每个 workflow 必须考虑 dynamic system prompt、discovery、tools、context lifecycle、delegation、permissions 与实际执行机制。
 
 ## Workflow index
 
 | Workflow | 适用范围 | 入口 |
 |---|---|---|
 | `omp-workflow` | agent-heavy、rapidly evolving software，尤其是 multi-package CLI / agent harness 及其 native、provider、UI、RPC、release 边界 | [README](omp-workflow/README.md) |
+| `translator` | PDF/EPUB/MOBI/DjVu（含扫描版）到 LaTeX PDF 的书籍翻译；术语、不可翻译内容、版面证据与有界审核 | [README](translator/README.md) |
 
 整个 workflow directory 可以复制到目标项目的 `.agents/` 或 `.omp/`。若 harness 不自动扫描任意子目录，就提供并验证显式 activation；不将“文件已经存在”描述为“政策已经生效”。首个 package 使用标准 Agent Plugin，通过 `omp --plugin-dir <package>` 加载，无需全局 settings、额外 extension code 或 system-prompt override。
 
@@ -31,6 +32,7 @@ Shared AI conversations 是待核验假设，不是独立证据。规模、relea
 ## Repository layout
 
 - `omp-workflow/`：独立分发的 workflow package；具体 activation、覆盖范围和 verification 见其 README。
+- `translator/`：独立分发的书籍翻译 workflow package；包含转换脚本、LaTeX 模板和 omp 阶段协议。
 - `ref/`：经典 software engineering 参考书。
 - `ref_repo/`：optional upstream checkouts，已由 `.gitignore` 排除；交付 package 不依赖它们。
 - [AGENTS.md](AGENTS.md)：本仓库的 English management guidance，不随 workflow 复制到目标项目。

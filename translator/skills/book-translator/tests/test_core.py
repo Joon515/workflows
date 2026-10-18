@@ -1,0 +1,667 @@
+"""Consumer-facing contract tests using isolated, real file and image fixtures."""
+
+import copy
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import unittest
+
+from PIL import Image
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+import core
+
+
+class CoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "job"
+        (self.root / "assets").mkdir(parents=True)
+        (self.root / "evidence").mkdir()
+        (self.root / "evidence/source.pdf").write_bytes(b"Original source evidence\n")
+        Image.new("RGB", (40, 20), "red").save(self.root / "assets/wide.png")
+        Image.new("RGB", (20, 40), "blue").save(self.root / "assets/tall.png")
+        (self.root / "assets/unused.txt").write_text("Retained extraction evidence", encoding="utf-8")
+        self.job = {
+            "version": 1, "title": "Source book", "source_language": "en", "target_language": "ko",
+            "source_file": "evidence/source.pdf",
+            "source_sha256": hashlib.sha256((self.root / "evidence/source.pdf").read_bytes()).hexdigest(),
+            "max_rounds": 3, "round": 0, "state": "source_ready",
+            "models": {"terminology": {"provider": "anthropic", "model": "claude-sonnet-4-6"}, "translation": {"provider": "google", "model": "gemini-2.5-pro"}},
+            "layout": {"paper": "a5", "outer_mm": 8, "inner_min_mm": 20, "top_mm": 15, "bottom_mm": 15, "source_mark_edge_mm": 3},
+            "history": [],
+        }
+        self.source = {
+            "version": 1, "title": "Source book",
+            "source_pages": [
+                {"id": "p1", "locator": "extraction:p0001", "printed_label": "iv", "label_verified": True, "evidence": "Original page image evidence/pages/p0001.png"},
+                {"id": "p2", "locator": "extraction:p0002", "printed_label": None, "label_verified": False, "evidence": "Original unnumbered page image"},
+            ],
+            "protected": [
+                {"id": "person", "kind": "name", "value": "Euler"},
+                {"id": "variable", "kind": "variable", "value": "x_{1}"},
+                {"id": "formula", "kind": "math", "value": r"E = \frac{m c^2}{2}"},
+                {"id": "program", "kind": "code", "value": "# English comment\nvalue = 1\n\tprint(value)\n"},
+            ],
+            "blocks": [
+                {"id": "heading", "kind": "heading", "level": 1, "source_pages": ["p1"], "source": [{"page": "p1"}, {"text": "Chapter"}], "target": []},
+                {"id": "paragraph", "kind": "paragraph", "source_pages": ["p1"], "source": [{"text": "A method by "}, {"protected": "person"}, {"text": " uses "}, {"protected": "variable"}, {"note": "n1"}, {"protected": "variable"}], "target": []},
+                {"id": "equation", "kind": "display_math", "source_pages": ["p1"], "source": [], "target": [], "protected_id": "formula"},
+                {"id": "listing", "kind": "code", "source_pages": ["p1"], "source": [], "target": [], "protected_id": "program"},
+                {"id": "figure", "kind": "image", "source_pages": ["p2"], "source": [{"page": "p2"}, {"text": "A wide image"}], "target": [], "asset": "assets/wide.png", "width": 40, "height": 20},
+                {"id": "related", "kind": "group", "source_pages": ["p2"], "source": [{"text": "Related panels"}], "target": [], "relation": "text-left", "images": [{"asset": "assets/wide.png", "x": 0, "y": 10, "width": 40, "height": 20}, {"asset": "assets/tall.png", "x": 50, "y": 0, "width": 20, "height": 40}], "canvas_width": 70, "canvas_height": 40, "text_fraction": 0.4},
+            ],
+            "notes": [{"id": "n1", "source": [{"text": "A small value "}, {"protected": "variable"}], "target": []}],
+            "agent_preface": [], "human_preface": None,
+        }
+        self.terms = {"version": 1, "terms": [
+            {"id": "euler", "number": 1, "source": "Euler", "target": "Euler method", "authority": "Field consensus", "authority_locator": "Reviewed field bibliography section 1", "rationale": "Keep the original personal name", "protected_ids": ["person"]},
+            {"id": "small", "number": 2, "source": "small", "target": "small", "authority": "Domain standard", "authority_locator": "Section 2", "rationale": "Established usage", "protected_ids": []},
+        ]}
+        self.book = copy.deepcopy(self.source)
+        self.book["title"] = "Translated book"
+        for block in self.book["blocks"]:
+            block["target"] = copy.deepcopy(block["source"])
+        self.book["blocks"][1]["target"] = [{"text": "Method: "}, {"term": "euler"}, {"protected": "variable"}, {"note": "n1"}, {"protected": "variable"}]
+        self.book["notes"][0]["target"] = [{"text": "A "}, {"term": "small"}, {"text": " value "}, {"protected": "variable"}]
+        self.book["agent_preface"] = [{"text": "Machine translation. Terminology and source limitations were reviewed; review status is pending."}]
+        self.write("job.json", self.job)
+        self.write("book-source.json", self.source)
+        core.seal_source(self.root)
+        self.write("terms.json", self.terms)
+        self.write("book.json", self.book)
+
+    def write(self, name, value):
+        core.save_json(self.root / name, value)
+
+    def assert_bad_book(self, change, pattern=None):
+        book = copy.deepcopy(self.book)
+        change(book)
+        self.write("book.json", book)
+        if pattern:
+            with self.assertRaisesRegex(ValueError, pattern):
+                core.validate_book(self.root)
+        else:
+            with self.assertRaises(ValueError):
+                core.validate_book(self.root)
+
+    def assert_bad_source(self, change, pattern=None):
+        source = copy.deepcopy(self.source)
+        change(source)
+        self.write("book-source.json", source)
+        if pattern:
+            with self.assertRaisesRegex(ValueError, pattern):
+                core.seal_source(self.root)
+        else:
+            with self.assertRaises(ValueError):
+                core.seal_source(self.root)
+
+    def test_valid_translated_book(self):
+        self.assertEqual(core.validate_book(self.root), self.book)
+        self.assertRegex(core.content_digest(self.root), r"^[a-f0-9]{64}$")
+
+    def test_source_stage_needs_no_terms_targets_or_preface(self):
+        (self.root / "terms.json").unlink()
+        (self.root / "book.json").unlink()
+        (self.root / "source.sha256").unlink()
+        self.assertEqual(core.validate_book(self.root, translated=False), self.source)
+        self.assertRegex(core.seal_source(self.root), r"^[a-f0-9]{64}$")
+
+    def test_source_stage_ignores_unfinished_targets(self):
+        self.source["blocks"][1]["target"] = [{"term": "not_written_yet"}]
+        self.write("book-source.json", self.source)
+        (self.root / "source.sha256").unlink()
+        self.assertEqual(core.validate_book(self.root, translated=False), self.source)
+
+    def test_schema_rejects_additional_fields_at_every_level(self):
+        locations = [(), ("source_pages", 0), ("protected", 0), ("blocks", 0), ("blocks", 0, "source", 0), ("notes", 0), ("blocks", 5, "images", 0)]
+        for location in locations:
+            with self.subTest(location=location):
+                value = copy.deepcopy(self.book)
+                target = value
+                for key in location:
+                    target = target[key]
+                target["unexpected"] = "ignored fields are dangerous"
+                with self.assertRaises(ValueError):
+                    core.validate_document("book", value)
+
+    def test_schema_requires_every_document_field(self):
+        for kind, document in [("book", self.book), ("terms", self.terms), ("job", self.job), ("review", self.review())]:
+            for key in document:
+                with self.subTest(kind=kind, key=key):
+                    value = copy.deepcopy(document)
+                    del value[key]
+                    with self.assertRaises(ValueError):
+                        core.validate_document(kind, value)
+
+    def test_schema_blocks_cannot_mix_kind_fields(self):
+        self.assert_bad_book(lambda book: book["blocks"][1].update(level=1))
+        self.assert_bad_book(lambda book: book["blocks"][0].update(kind="paragraph"))
+
+    def test_inline_must_have_exactly_one_known_key(self):
+        for token in [{}, {"text": "text", "protected": "person"}, {"mystery": "person"}, {"protected": "1bad"}]:
+            with self.subTest(token=token):
+                self.assert_bad_book(lambda book: book["blocks"][0].update(target=[token]))
+
+    def test_versions_and_numeric_types_are_strict(self):
+        for version in [True, 2, "1", None]:
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                core.validate_document("book", dict(self.book, version=version))
+        for number in [0, -1, True, 1.5]:
+            terms = copy.deepcopy(self.terms)
+            terms["terms"][0]["number"] = number
+            with self.subTest(number=number), self.assertRaises(ValueError):
+                core.validate_document("terms", terms)
+
+    def test_duplicate_ids_and_term_numbers(self):
+        for name in ("source_pages", "protected", "blocks", "notes"):
+            with self.subTest(name=name):
+                self.assert_bad_source(lambda book: book[name].append(copy.deepcopy(book[name][0])), "duplicate")
+        terms = copy.deepcopy(self.terms)
+        terms["terms"][1]["number"] = 1
+        with self.assertRaisesRegex(ValueError, "duplicate number"):
+            core.validate_document("terms", terms)
+        terms["terms"][1]["number"] = 2
+        terms["terms"][1]["id"] = "euler"
+        with self.assertRaisesRegex(ValueError, "duplicate id"):
+            core.validate_document("terms", terms)
+
+    def test_cross_category_ids_are_unique(self):
+        self.assert_bad_source(lambda book: book["blocks"][0].update(id="p1"), "unique across")
+
+    def test_bad_ids_rejected(self):
+        for value in ["1page", "has space", "a/b", "", "a.b"]:
+            with self.subTest(value=value):
+                self.assert_bad_source(lambda book: book["source_pages"][0].update(id=value))
+
+    def test_source_rejects_term_tokens(self):
+        self.assert_bad_source(lambda book: book["blocks"][0]["source"].append({"term": "euler"}), "source inline")
+        self.assert_bad_source(lambda book: book["notes"][0]["source"].append({"term": "small"}), "source inline")
+
+    def test_source_requires_real_content_not_page_only(self):
+        for tokens in [[], [{"text": " \n"}], [{"page": "p1"}]]:
+            with self.subTest(tokens=tokens):
+                self.assert_bad_source(lambda book: book["blocks"][0].update(source=tokens), "source text/evidence")
+
+    def test_present_printed_labels_require_review(self):
+        self.assert_bad_source(lambda book: book["source_pages"][0].update(label_verified=False), "printed label")
+
+    def test_null_repeated_roman_and_prefixed_page_labels(self):
+        for label in [None, "iv", "A-12"]:
+            with self.subTest(label=label):
+                self.source["source_pages"][1].update(printed_label=label, label_verified=label is not None)
+                self.write("book-source.json", self.source)
+                core.seal_source(self.root)
+                self.assertEqual(core.validate_book(self.root, translated=False), self.source)
+
+    def test_pages_require_locator_and_evidence(self):
+        for field in ["locator", "evidence"]:
+            with self.subTest(field=field):
+                self.assert_bad_source(lambda book: book["source_pages"][0].update({field: " "}))
+
+    def test_page_coverage_and_reading_order(self):
+        self.assert_bad_source(lambda book: book["source_pages"].append({"id": "p3", "locator": "p0003", "printed_label": None, "label_verified": False, "evidence": "page image"}), "coverage")
+        self.assert_bad_source(lambda book: book["blocks"][1].update(source_pages=["missing"]), "unknown source page")
+        self.assert_bad_source(lambda book: book["blocks"][0].update(source_pages=[]))
+        self.assert_bad_source(lambda book: book["blocks"].reverse(), "reading order")
+
+    def test_page_tokens_stay_with_block_and_occur_once(self):
+        self.assert_bad_source(lambda book: book["blocks"][0]["source"].append({"page": "p2"}), "absent from block")
+        self.assert_bad_source(lambda book: book["blocks"][1]["source"].append({"page": "p1"}), "once")
+
+    def test_targets_preserve_every_protected_note_page_token(self):
+        for index, key in [(0, "page"), (1, "protected"), (1, "note")]:
+            with self.subTest(index=index, key=key):
+                self.assert_bad_book(lambda book: book["blocks"][index].update(target=[token for token in book["blocks"][index]["target"] if key not in token]), "preserve")
+        self.assert_bad_book(lambda book: book["blocks"][1]["target"].reverse(), "preserve")
+        self.assert_bad_book(lambda book: book["blocks"][1]["target"].append({"protected": "variable"}), "multiplicity")
+
+    def test_protected_names_expand_through_terms(self):
+        self.assertEqual(core.validate_book(self.root), self.book)
+        self.terms["terms"][0]["protected_ids"] = []
+        self.write("terms.json", self.terms)
+        with self.assertRaisesRegex(ValueError, "preserve"):
+            core.validate_book(self.root)
+
+    def test_terms_require_exact_protected_names_order_and_multiplicity(self):
+        for target in ["euler method", "Euler Euler method", "Renamed method"]:
+            with self.subTest(target=target):
+                terms = copy.deepcopy(self.terms)
+                terms["terms"][0]["target"] = target
+                self.write("terms.json", terms)
+                with self.assertRaisesRegex(ValueError, "protected name"):
+                    core.validate_book(self.root)
+        terms = copy.deepcopy(self.terms)
+        terms["terms"][0]["protected_ids"] = ["variable"]
+        self.write("terms.json", terms)
+        with self.assertRaisesRegex(ValueError, "protected names"):
+            core.validate_book(self.root)
+
+    def test_terms_require_source_literal_and_known_protected_ids(self):
+        for change in [lambda term: term.update(source="Renamed"), lambda term: term.update(protected_ids=["missing"])]:
+            terms = copy.deepcopy(self.terms)
+            change(terms["terms"][0])
+            self.write("terms.json", terms)
+            with self.assertRaises(ValueError):
+                core.validate_book(self.root)
+
+    def test_overlapping_protected_name_values_use_disjoint_spans(self):
+        self.source["protected"][0]["value"] = "Ann"
+        self.source["protected"].append({"id": "other", "kind": "name", "value": "Anna"})
+        self.source["blocks"][1]["source"].insert(2, {"protected": "other"})
+        self.write("book-source.json", self.source)
+        core.seal_source(self.root)
+        self.book["protected"] = copy.deepcopy(self.source["protected"])
+        self.book["blocks"][1]["source"] = copy.deepcopy(self.source["blocks"][1]["source"])
+        self.terms["terms"][0].update(source="Ann and Anna method", target="Ann and Anna method", protected_ids=["person", "other"])
+        self.write("book.json", self.book)
+        self.write("terms.json", self.terms)
+        self.assertEqual(core.validate_book(self.root), self.book)
+        for target in ["Ann and Anna method Ann", "Ann and Anna method Anna", "Anna and Ann method"]:
+            self.terms["terms"][0]["target"] = target
+            self.write("terms.json", self.terms)
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "protected name"):
+                core.validate_book(self.root)
+
+    def test_unknown_and_unused_terms_rejected_only_on_translation(self):
+        self.assert_bad_book(lambda book: book["blocks"][1]["target"].append({"term": "missing"}), "unknown term")
+        self.write("book.json", self.book)
+        terms = copy.deepcopy(self.terms)
+        extra = copy.deepcopy(terms["terms"][1])
+        extra.update(id="unused", number=3)
+        terms["terms"].append(extra)
+        core.validate_document("terms", terms)
+        self.write("terms.json", terms)
+        core.validate_book(self.root, translated=False)
+        with self.assertRaisesRegex(ValueError, "Unused terminology"):
+            core.validate_book(self.root)
+
+    def test_terms_require_authority_locator_and_rationale(self):
+        for field in ["authority", "authority_locator", "rationale", "source", "target"]:
+            terms = copy.deepcopy(self.terms)
+            terms["terms"][0][field] = " "
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                core.validate_document("terms", terms)
+
+    def test_notes_have_exactly_one_body_callout(self):
+        self.assert_bad_source(lambda book: book["blocks"][1]["source"].append({"note": "n1"}), "exactly one")
+        self.assert_bad_source(lambda book: book["blocks"][1].update(source=[token for token in book["blocks"][1]["source"] if "note" not in token]), "exactly one")
+        self.assert_bad_source(lambda book: book["blocks"][1]["source"].append({"note": "missing"}), "unknown note")
+
+    def test_note_nesting_and_page_tokens_are_forbidden(self):
+        for token in [{"note": "n1"}, {"page": "p1"}]:
+            with self.subTest(token=token):
+                self.assert_bad_source(lambda book: book["notes"][0]["source"].append(token), "nested note or page")
+                self.assert_bad_book(lambda book: book["notes"][0]["target"].append(token), "nested note or page")
+
+    def test_note_targets_preserve_protected_values(self):
+        self.assert_bad_book(lambda book: book["notes"][0].update(target=[{"text": "Removed variable"}]), "preserve")
+        self.assert_bad_book(lambda book: book["notes"][0].update(target=[]), "preserve")
+
+    def test_unknown_and_unused_protected_values_are_rejected(self):
+        self.assert_bad_source(lambda book: book["blocks"][0]["source"].append({"protected": "missing"}), "unknown protected")
+        self.assert_bad_source(lambda book: book["protected"].append({"id": "unused", "kind": "name", "value": "Unused"}), "all be used")
+
+    def test_direct_math_and_code_references_have_correct_kind(self):
+        self.assert_bad_source(lambda book: book["blocks"][2].update(protected_id="program"), "protected math")
+        self.assert_bad_source(lambda book: book["blocks"][3].update(protected_id="formula"), "protected code")
+
+    def test_translated_targets_and_agent_preface_are_required(self):
+        self.assert_bad_book(lambda book: book["blocks"][0].update(target=[]), "preserve")
+        for preface in [[], [{"text": " \n"}]]:
+            with self.subTest(preface=preface):
+                self.assert_bad_book(lambda book: book.update(agent_preface=preface), "nonempty agent_preface")
+
+    def test_prefaces_allow_text_protected_and_terms_but_not_note_page(self):
+        for field in ["agent_preface", "human_preface"]:
+            for token in [{"note": "n1"}, {"page": "p1"}]:
+                with self.subTest(field=field, token=token):
+                    self.assert_bad_book(lambda book: book.update({field: [token]}), "prefaces permit")
+        self.book["human_preface"] = [{"text": "Human note "}, {"protected": "person"}, {"term": "euler"}]
+        self.book["agent_preface"].extend([{"protected": "variable"}, {"term": "small"}])
+        self.write("book.json", self.book)
+        self.assertEqual(core.validate_book(self.root), self.book)
+
+    def test_preface_only_terminology_counts_as_used(self):
+        term = copy.deepcopy(self.terms["terms"][1])
+        term.update(id="prefaceOnly", number=3, source="introduction", target="introduction")
+        self.terms["terms"].append(term)
+        self.write("terms.json", self.terms)
+        for field in ["agent_preface", "human_preface"]:
+            book = copy.deepcopy(self.book)
+            book[field] = [{"term": "prefaceOnly"}]
+            self.write("book.json", book)
+            with self.subTest(field=field):
+                self.assertEqual(core.validate_book(self.root), book)
+
+    def test_prefaces_reject_unknown_terminology(self):
+        for field in ["agent_preface", "human_preface"]:
+            with self.subTest(field=field):
+                self.assert_bad_book(lambda book: book.update({field: [{"term": "missing"}]}), "unknown term")
+
+    def test_immutable_source_changes_are_rejected(self):
+        changes = [
+            lambda book: book["blocks"][1]["source"][0].update(text="Changed original text"),
+            lambda book: book["protected"][0].update(value="EULER"),
+            lambda book: book["protected"][3].update(value=book["protected"][3]["value"].replace("\t", "    ")),
+            lambda book: book["source_pages"][0].update(printed_label="invented"),
+            lambda book: book["blocks"][0].update(level=2),
+            lambda book: book["blocks"][5].update(relation="column"),
+            lambda book: book["blocks"][5]["images"][0].update(x=1),
+            lambda book: book["notes"][0]["source"][0].update(text="Changed note"),
+            lambda book: book["blocks"].pop(),
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.assert_bad_book(change, "immutable source")
+
+    def test_only_title_targets_and_prefaces_may_change(self):
+        self.book["title"] = "A different translated title"
+        self.book["blocks"][0]["target"][1]["text"] = "New translated heading"
+        self.book["notes"][0]["target"][0]["text"] = "Different wording "
+        self.book["agent_preface"] = [{"text": "Updated machine-translation disclosure"}]
+        self.book["human_preface"] = [{"text": "Human introduction"}]
+        self.write("book.json", self.book)
+        self.assertEqual(core.validate_book(self.root), self.book)
+
+    def test_seal_binds_entire_source_and_rejects_missing_or_corrupt_seal(self):
+        seal = (self.root / "source.sha256").read_text(encoding="ascii")
+        for value in ["", "0" * 64, "not a checksum"]:
+            with self.subTest(value=value):
+                (self.root / "source.sha256").write_text(value, encoding="ascii")
+                with self.assertRaisesRegex(ValueError, "Source seal"):
+                    core.validate_book(self.root)
+        (self.root / "source.sha256").unlink()
+        with self.assertRaisesRegex(ValueError, "source seal"):
+            core.validate_book(self.root)
+        (self.root / "source.sha256").write_text(seal, encoding="ascii")
+        self.source["title"] = "Changed source title"
+        self.write("book-source.json", self.source)
+        with self.assertRaisesRegex(ValueError, "Source seal"):
+            core.validate_book(self.root)
+        with self.assertRaisesRegex(ValueError, "Source seal"):
+            core.validate_book(self.root, translated=False)
+        core.seal_source(self.root)
+        self.assertEqual(core.validate_book(self.root, translated=False), self.source)
+
+    def test_seal_binds_referenced_image_bytes(self):
+        Image.new("RGB", (40, 20), "green").save(self.root / "assets/wide.png")
+        with self.assertRaisesRegex(ValueError, "Source seal"):
+            core.validate_book(self.root)
+
+    def test_original_source_must_match_checksum(self):
+        (self.root / "evidence/source.pdf").write_bytes(b"changed source")
+        with self.assertRaisesRegex(ValueError, "Original source checksum"):
+            core.validate_book(self.root)
+        with self.assertRaisesRegex(ValueError, "Original source checksum"):
+            core.seal_source(self.root)
+
+    def test_asset_dimensions_and_group_canvas_are_strict(self):
+        changes = [
+            lambda book: book["blocks"][4].update(width=0),
+            lambda book: book["blocks"][4].update(height=-1),
+            lambda book: book["blocks"][5].update(images=[]),
+            lambda book: book["blocks"][5].update(canvas_width=0),
+            lambda book: book["blocks"][5].update(text_fraction=0.1),
+            lambda book: book["blocks"][5]["images"][0].update(x=-1),
+            lambda book: book["blocks"][5]["images"][0].update(y=21),
+            lambda book: book["blocks"][5]["images"][1].update(x=51),
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                self.assert_bad_source(change)
+
+    def test_declared_asset_aspect_ratio_matches_source(self):
+        self.assert_bad_source(lambda book: book["blocks"][4].update(width=41), "aspect ratio")
+        self.assert_bad_source(lambda book: book["blocks"][5]["images"][0].update(height=19), "aspect ratio")
+
+    def test_missing_and_unreadable_assets_fail(self):
+        self.assert_bad_source(lambda book: book["blocks"][4].update(asset="assets/missing.png"), "missing file")
+        self.assert_bad_source(lambda book: book["blocks"][4].update(asset="assets/unused.txt"), "readable raster")
+
+    def test_asset_paths_cannot_escape_or_use_absolute_paths(self):
+        for value in ["../escape.png", "/tmp/image.png", "assets/../../image.png", "C:/image.png", r"C:\image.png", "assets\\wide.png"]:
+            with self.subTest(value=value):
+                self.assert_bad_source(lambda book: book["blocks"][4].update(asset=value), "path")
+
+    def test_asset_symlink_escape_is_rejected(self):
+        outside = Path(self.temporary.name) / "outside.png"
+        shutil.copyfile(self.root / "assets/wide.png", outside)
+        (self.root / "assets/escape.png").symlink_to(outside)
+        self.assert_bad_source(lambda book: book["blocks"][4].update(asset="assets/escape.png"), "escapes")
+
+    def test_generated_artifacts_are_not_source_assets(self):
+        (self.root / "build").mkdir()
+        shutil.copyfile(self.root / "assets/wide.png", self.root / "build/image.png")
+        self.assert_bad_source(lambda book: book["blocks"][4].update(asset="build/image.png"), "Generated artifacts")
+
+    def test_source_file_path_is_contained(self):
+        for value in ["../source.pdf", "/tmp/source.pdf", "C:/source.pdf"]:
+            self.job["source_file"] = value
+            self.write("job.json", self.job)
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "path"):
+                core.validate_book(self.root)
+
+    def test_manuscript_and_seal_symlinks_cannot_escape(self):
+        for name in ["book-source.json", "book.json", "terms.json", "job.json", "source.sha256"]:
+            with self.subTest(name=name):
+                path = self.root / name
+                outside = Path(self.temporary.name) / (name + ".outside")
+                shutil.copyfile(path, outside)
+                path.unlink()
+                path.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "escapes"):
+                    core.validate_book(self.root)
+                path.unlink()
+                shutil.copyfile(outside, path)
+
+    def test_math_allowlist_rejects_executable_and_obfuscated_tex(self):
+        commands = [r"\input{secret}", r"\include{file}", r"\write18{cmd}", r"\read1", r"\openout1", r"\catcode`x=0", r"\csname input\endcsname", r"\special{cmd}", r"\directlua{cmd}", r"\def\a{x}", r"\newcommand{\a}{x}", r"\usepackage{x}", r"\begin{document}x\end{document}", "x% comment", "^^5cinput{file}", r"\begin x", r"\unknowncommand{x}"]
+        for value in commands:
+            with self.subTest(value=value):
+                self.assert_bad_source(lambda book: book["protected"][2].update(value=value), "TeX|math")
+
+    def test_safe_math_environment_and_code_whitespace_survive(self):
+        self.source["protected"][2]["value"] = r"\begin{aligned} x &= \sqrt{2} \\ y &= \alpha + \mathrm{d}t \end{aligned}"
+        self.write("book-source.json", self.source)
+        core.seal_source(self.root)
+        self.book["protected"] = copy.deepcopy(self.source["protected"])
+        self.write("book.json", self.book)
+        self.assertEqual(core.validate_book(self.root)["protected"][3]["value"], "# English comment\nvalue = 1\n\tprint(value)\n")
+
+    def test_digest_changes_for_content_terms_layout_and_identity(self):
+        original = core.content_digest(self.root)
+        self.book["blocks"][0]["target"][1]["text"] = "Changed translated heading"
+        self.write("book.json", self.book)
+        self.assertNotEqual(original, core.content_digest(self.root))
+        self.write("book.json", dict(self.book, title="Another title"))
+        original = core.content_digest(self.root)
+        self.terms["terms"][0]["rationale"] = "Revised authority decision"
+        self.write("terms.json", self.terms)
+        self.assertNotEqual(original, core.content_digest(self.root))
+        original = core.content_digest(self.root)
+        self.job["layout"]["outer_mm"] = 9
+        self.write("job.json", self.job)
+        self.assertNotEqual(original, core.content_digest(self.root))
+        original = core.content_digest(self.root)
+        self.job["source_language"] = "de"
+        self.write("job.json", self.job)
+        self.assertNotEqual(original, core.content_digest(self.root))
+
+    def test_digest_includes_all_asset_bytes_not_just_references(self):
+        original = core.content_digest(self.root)
+        (self.root / "assets/unused.txt").write_text("Changed unused evidence", encoding="utf-8")
+        self.assertNotEqual(original, core.content_digest(self.root))
+        original = core.content_digest(self.root)
+        (self.root / "assets/another.bin").write_bytes(b"New evidence")
+        self.assertNotEqual(original, core.content_digest(self.root))
+
+    def test_digest_excludes_mutable_review_and_generated_state(self):
+        original = core.content_digest(self.root)
+        self.job.update(state="approved", round=2, history=[{"event": "reviewed", "arbitrary": [1, "evidence"]}], max_rounds=4)
+        self.write("job.json", self.job)
+        (self.root / "reviews").mkdir()
+        self.write("reviews/round-2.json", self.review())
+        self.write("build/verification.json", {"content_digest": "stale", "passed": False})
+        (self.root / "output.pdf").write_bytes(b"Generated PDF")
+        self.assertEqual(original, core.content_digest(self.root))
+
+    def test_digest_rejects_unused_asset_symlinks_escaping_job(self):
+        outside = Path(self.temporary.name) / "secret"
+        outside.write_bytes(b"private")
+        (self.root / "assets/secret").symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            core.content_digest(self.root)
+
+    def test_json_roundtrip_and_canonical_digest_ignore_key_order(self):
+        original = core.content_digest(self.root)
+        self.write("book.json", dict(reversed(list(self.book.items()))))
+        self.assertEqual(original, core.content_digest(self.root))
+        self.assertEqual(core.load_json(self.root / "book.json"), self.book)
+
+    def test_json_rejects_duplicate_keys_nonfinite_nonobject_and_invalid_utf8(self):
+        path = self.root / "bad.json"
+        for data in [b'{"a": 1, "a": 2}', b'{"a": NaN}', b'{"a": Infinity}', b'{"a": 1e999}', b'[]', b'{"a": "\xff"}', b'{broken']:
+            path.write_bytes(data)
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                core.load_json(path)
+
+    def test_save_rejects_nonfinite_without_overwriting_existing_document(self):
+        for value in [{"value": float("nan")}, {"value": float("inf")}, []]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                core.save_json(self.root / "job.json", value)
+            self.assertEqual(core.load_json(self.root / "job.json"), self.job)
+
+    def test_programmatic_documents_reject_nonfinite_numbers(self):
+        for value in [float("nan"), float("inf"), -float("inf")]:
+            job = copy.deepcopy(self.job)
+            job["layout"]["outer_mm"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "non-finite"):
+                core.validate_document("job", job)
+
+    def test_models_admit_only_direct_known_provider_prefix_pairs(self):
+        self.assertEqual(core.admit_model("anthropic", "claude-sonnet-4-6"), "anthropic/claude-sonnet-4-6")
+        self.assertEqual(core.admit_model("google", "gemini-2.5-pro"), "google/gemini-2.5-pro")
+        for disguised in ["claude-o1", "claude-o3-mini", "gemini-o4-mini"]:
+            with self.subTest(disguised=disguised), self.assertRaises(ValueError):
+                core.admit_model("anthropic" if disguised.startswith("claude-") else "google", disguised)
+        pairs = [("openai", "gpt-5"), ("anthropic", "gpt-5"), ("google", "claude-sonnet-4-6"), ("anthropic", "gemini-2.5-pro"), ("router", "claude-sonnet-4-6"), ("openrouter", "anthropic/claude-sonnet-4-6"), ("google-vertex", "gemini-2.5-pro"), ("unknown", "claude-sonnet-4-6"), ("auto", "auto"), ("", ""), ("Anthropic", "claude-sonnet-4-6"), ("anthropic ", "claude-sonnet-4-6"), ("anthropic", "claude-"), ("anthropic", "claude-auto"), ("google", "gemini-default"), ("anthropic", "claude-gpt-5"), ("google", "gemini-openai"), ("anthropic", "claude-unknown"), ("google", "gemini-openrouter"), ("anthropic", "claude-codex"), ("anthropic", "claude-sonnet-4-6/auto"), ("google", "gemini-2.5-pro:router")]
+        for provider, model in pairs:
+            with self.subTest(provider=provider, model=model), self.assertRaises(ValueError):
+                core.admit_model(provider, model)
+
+    def test_unassigned_models_allowed_but_partial_or_unsafe_rejected(self):
+        job = copy.deepcopy(self.job)
+        job["models"]["terminology"] = {"provider": "", "model": ""}
+        core.validate_document("job", job)
+        job["models"]["terminology"] = {"provider": "anthropic", "model": ""}
+        with self.assertRaisesRegex(ValueError, "set together"):
+            core.validate_document("job", job)
+        job["models"]["terminology"] = {"provider": "openai", "model": "claude-disguised"}
+        with self.assertRaisesRegex(ValueError, "direct providers"):
+            core.validate_document("job", job)
+
+    def test_job_rounds_layout_and_history(self):
+        job = copy.deepcopy(self.job)
+        job["max_rounds"] = 5
+        job["history"] = [{"stage": "initialized", "anything": [True, None]}]
+        core.validate_document("job", job)
+        for field, value in [("max_rounds", 0), ("round", 6), ("state", "invented")]:
+            document = copy.deepcopy(job)
+            document[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                core.validate_document("job", document)
+        for field, value in [("paper", "letter"), ("outer_mm", 0), ("source_mark_edge_mm", 9), ("top_mm", 200), ("inner_min_mm", 150)]:
+            document = copy.deepcopy(job)
+            document["layout"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                core.validate_document("job", document)
+
+    def test_job_horizontal_margins_leave_usable_width_without_compensation(self):
+        job = copy.deepcopy(self.job)
+        job["layout"]["inner_min_mm"] = 139
+        core.validate_document("job", job)
+        job["layout"]["inner_min_mm"] = 140
+        with self.assertRaisesRegex(ValueError, "horizontal margins"):
+            core.validate_document("job", job)
+
+    @staticmethod
+    def review():
+        return {"version": 1, "round": 1, "content_digest": "a" * 64, "pdf_sha256": "b" * 64, "verdict": "pass", "checks": {name: True for name in ["coverage", "terminology", "protected_content", "source_pages", "image_relations", "footnotes", "typography", "preface"]}, "findings": [], "evidence": ["Inspected PDF pages 1-4 against manuscript blocks heading-related and source p1-p2"]}
+
+    def test_passing_review_requires_every_check_and_no_findings(self):
+        core.validate_document("review", self.review())
+        for check in self.review()["checks"]:
+            review = self.review()
+            review["checks"][check] = False
+            with self.subTest(check=check), self.assertRaises(ValueError):
+                core.validate_document("review", review)
+        review = self.review()
+        review["findings"].append({"id": "issue", "severity": "minor", "location": "PDF page 2", "detail": "Fix spacing"})
+        with self.assertRaises(ValueError):
+            core.validate_document("review", review)
+        review["verdict"] = "changes_requested"
+        review["checks"]["typography"] = False
+        core.validate_document("review", review)
+
+    def test_review_requires_exact_checks_and_real_evidence(self):
+        for key in self.review()["checks"]:
+            review = self.review()
+            del review["checks"][key]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                core.validate_document("review", review)
+        for evidence in [[], [" "]]:
+            review = self.review()
+            review["evidence"] = evidence
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                core.validate_document("review", review)
+        review = self.review()
+        review["checks"]["extra"] = True
+        with self.assertRaises(ValueError):
+            core.validate_document("review", review)
+        review = self.review()
+        review["verdict"] = "changes_requested"
+        finding = {"id": "duplicate", "severity": "blocking", "location": "PDF page 1", "detail": "Needs repair"}
+        review["findings"] = [finding, copy.deepcopy(finding)]
+        with self.assertRaisesRegex(ValueError, "duplicate id"):
+            core.validate_document("review", review)
+
+    def test_review_requires_author_artifact_identities(self):
+        for verdict in ["pass", "changes_requested"]:
+            for field in ["content_digest", "pdf_sha256"]:
+                for value in [None, "", "a" * 63, "a" * 65, "A" * 64, "g" * 64, 1]:
+                    review = self.review()
+                    review["verdict"] = verdict
+                    review[field] = value
+                    with self.subTest(verdict=verdict, field=field, value=value), self.assertRaises(ValueError):
+                        core.validate_document("review", review)
+                review = self.review()
+                review["verdict"] = verdict
+                del review[field]
+                with self.subTest(verdict=verdict, missing=field), self.assertRaises(ValueError):
+                    core.validate_document("review", review)
+
+    def test_unknown_document_kind_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "Unknown document kind"):
+            core.validate_document("automatic", {})
+
+    def test_module_and_schemas_work_when_copied_without_repository(self):
+        standalone = Path(self.temporary.name) / "standalone"
+        (standalone / "scripts").mkdir(parents=True)
+        shutil.copyfile(SCRIPTS / "core.py", standalone / "scripts/core.py")
+        shutil.copytree(SCRIPTS.parent / "contracts", standalone / "contracts")
+        spec = importlib.util.spec_from_file_location("standalone_core", standalone / "scripts/core.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.validate_book(self.root), self.book)
+        self.assertEqual(module.content_digest(self.root), core.content_digest(self.root))
+
+
+if __name__ == "__main__":
+    unittest.main()

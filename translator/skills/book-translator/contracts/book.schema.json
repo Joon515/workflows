@@ -1,0 +1,588 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Book manuscript",
+  "type": "object",
+  "properties": {
+    "version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "source_pages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/sourcePage"
+      }
+    },
+    "protected": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/protected"
+      }
+    },
+    "blocks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/note"
+      }
+    },
+    "agent_preface": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inline"
+      }
+    },
+    "human_preface": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inline"
+          }
+        }
+      ]
+    }
+  },
+  "required": [
+    "version",
+    "title",
+    "source_pages",
+    "protected",
+    "blocks",
+    "notes",
+    "agent_preface",
+    "human_preface"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "inline": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "protected": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "protected"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "term": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "term"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "note": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "note"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "page": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "page"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "sourcePage": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "printed_label": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            }
+          ]
+        },
+        "label_verified": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "id",
+        "locator",
+        "printed_label",
+        "label_verified",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "protected": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "kind": {
+          "enum": [
+            "math",
+            "variable",
+            "code",
+            "name"
+          ]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "note": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "source": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inline"
+          }
+        },
+        "target": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inline"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "block": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "heading"
+            },
+            "level": {
+              "enum": [
+                1,
+                2,
+                3
+              ],
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "level"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "paragraph"
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "display_math"
+            },
+            "protected_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "protected_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "code"
+            },
+            "protected_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "protected_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "image"
+            },
+            "asset": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            "width": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "height": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "asset",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "group"
+            },
+            "relation": {
+              "enum": [
+                "row",
+                "column",
+                "text-left",
+                "text-right"
+              ]
+            },
+            "images": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "asset": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  },
+                  "x": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "y": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "width": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "height": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "required": [
+                  "asset",
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "canvas_width": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "canvas_height": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "text_fraction": {
+              "type": "number",
+              "minimum": 0.2,
+              "maximum": 0.8
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "relation",
+            "images",
+            "canvas_width",
+            "canvas_height",
+            "text_fraction"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

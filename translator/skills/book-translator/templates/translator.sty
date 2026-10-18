@@ -1,0 +1,58 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{translator}[2026/10/18 Verified book layout]
+\RequirePackage{geometry}
+\geometry{a5paper,inner=\BTInner mm,outer=\BTOuter mm,top=\BTTop mm,bottom=\BTBottom mm}
+\RequirePackage{amsmath,amssymb,graphicx,longtable,array,fvextra,tikz}
+\RequirePackage[bottom,splitrule]{footmisc}
+\RequirePackage{zref-savepos,zref-abspage}
+\setCJKfamilyfont{BTTerm}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolSong-Bold.otf,BoldItalicFont=FandolSong-Bold.otf,FakeSlant=0.2]{FandolSong-Bold.otf}
+\newcommand{\BTFirstTerm}[1]{\textbf{\textit{\CJKfamily{BTTerm}#1}}}
+\setlength{\parindent}{1em}
+\setlength{\parskip}{3pt}
+\setlength{\emergencystretch}{1em}
+\setlength{\dimen\footins}{\dimexpr.5\textheight-\skip\footins\relax}
+\setlength{\footnotesep}{\baselineskip}
+\interfootnotelinepenalty=0
+\floatingpenalty=20000
+\raggedbottom
+\pagestyle{plain}
+\renewcommand{\footnoterule}{\kern-3pt\hrule width .4\columnwidth\kern2.6pt}
+\renewcommand{\splitfootnoterule}{\kern-3pt\hrule width .4\columnwidth\kern2.6pt}
+\newsavebox{\BTTextBox}
+\newsavebox{\BTImageBox}
+\newsavebox{\BTTempBox}
+\newlength{\BTAvailableHeight}
+\newcount\BTShipout
+\zref@addprops{savepos}{abspage}
+\newcommand{\BTPosition}[1]{\zsavepos{#1}}
+\newcommand{\BTSourceOverlay}[2]{%
+  \ifnum\zref@extractdefault{#1}{abspage}{0}=\BTShipout
+    \begin{tikzpicture}[remember picture,overlay]
+    \ifodd\BTShipout
+      \node[anchor=base east,inner sep=0pt,font=\fontsize{5}{6}\selectfont]
+      at ([xshift=-\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south east) {#2};%
+    \else
+      \node[anchor=base west,inner sep=0pt,font=\fontsize{5}{6}\selectfont]
+      at ([xshift=\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south west) {#2};%
+    \fi
+    \end{tikzpicture}%
+  \fi}
+\AddToHook{cmd/@makecol/before}{%
+  \ifvoid\footins\else
+    \typeout{BTFOOT|\thepage|\number\dimexpr\ht\footins+\dp\footins+\skip\footins\relax|\number\dimexpr.5\textheight\relax}%
+  \fi}
+\AtBeginDocument{\typeout{BTGEOMETRY|\number\paperwidth|\number\paperheight|\number\textwidth|\number\textheight|\number\dimexpr\oddsidemargin+1in\relax|\number\dimexpr\evensidemargin+1in\relax|\number\dimexpr\topmargin+\headheight+\headsep+1in\relax}}
+\newcommand{\BTHeading}[2]{%
+  \par\ifnum#1=1\clearpage\fi
+  \addvspace{\baselineskip}\noindent
+  {\bfseries\ifcase#1\or\LARGE\or\Large\or\large\fi #2\par}
+  \nobreak\smallskip}
+\newcommand{\BTImageEvidence}[1]{%
+  \typeout{BTIMAGE|#1|\number\wd\BTImageBox|\number\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax}}
+\newcommand{\BTScaleCanvas}{%
+  \sbox{\BTTempBox}{\resizebox{\linewidth}{!}{\usebox{\BTImageBox}}}%
+  \sbox{\BTImageBox}{\usebox{\BTTempBox}}%
+  \ifdim\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax>\BTAvailableHeight
+    \sbox{\BTTempBox}{\resizebox{!}{\BTAvailableHeight}{\usebox{\BTImageBox}}}%
+    \sbox{\BTImageBox}{\usebox{\BTTempBox}}%
+  \fi}

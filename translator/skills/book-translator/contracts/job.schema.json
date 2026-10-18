@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Translation job",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "source_language": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "target_language": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "source_file": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "max_rounds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "state": {
+      "enum": [
+        "initialized",
+        "extracted",
+        "source_ready",
+        "terminology_ready",
+        "translated",
+        "changes_requested",
+        "approved",
+        "exhausted"
+      ]
+    },
+    "models": {
+      "type": "object",
+      "properties": {
+        "terminology": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "additionalProperties": false
+        },
+        "translation": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "terminology",
+        "translation"
+      ],
+      "additionalProperties": false
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "paper": {
+          "const": "a5"
+        },
+        "outer_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "inner_min_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "top_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "bottom_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "source_mark_edge_mm": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "paper",
+        "outer_mm",
+        "inner_min_mm",
+        "top_mm",
+        "bottom_mm",
+        "source_mark_edge_mm"
+      ],
+      "additionalProperties": false
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "version",
+    "title",
+    "source_language",
+    "target_language",
+    "source_file",
+    "source_sha256",
+    "max_rounds",
+    "round",
+    "state",
+    "models",
+    "layout",
+    "history"
+  ],
+  "additionalProperties": false
+}

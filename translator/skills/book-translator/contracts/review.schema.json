@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Translation review",
+  "type": "object",
+  "properties": {
+    "content_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "pdf_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "changes_requested"
+      ]
+    },
+    "checks": {
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "type": "boolean"
+        },
+        "terminology": {
+          "type": "boolean"
+        },
+        "protected_content": {
+          "type": "boolean"
+        },
+        "source_pages": {
+          "type": "boolean"
+        },
+        "image_relations": {
+          "type": "boolean"
+        },
+        "footnotes": {
+          "type": "boolean"
+        },
+        "typography": {
+          "type": "boolean"
+        },
+        "preface": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "coverage",
+        "terminology",
+        "protected_content",
+        "source_pages",
+        "image_relations",
+        "footnotes",
+        "typography",
+        "preface"
+      ],
+      "additionalProperties": false
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+          },
+          "severity": {
+            "enum": [
+              "blocking",
+              "major",
+              "minor"
+            ]
+          },
+          "location": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "required": [
+          "id",
+          "severity",
+          "location",
+          "detail"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    }
+  },
+  "required": [
+    "content_digest",
+    "pdf_sha256",
+    "version",
+    "round",
+    "verdict",
+    "checks",
+    "findings",
+    "evidence"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "pass"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "checks": {
+            "properties": {
+              "coverage": {
+                "const": true
+              },
+              "terminology": {
+                "const": true
+              },
+              "protected_content": {
+                "const": true
+              },
+              "source_pages": {
+                "const": true
+              },
+              "image_relations": {
+                "const": true
+              },
+              "footnotes": {
+                "const": true
+              },
+              "typography": {
+                "const": true
+              },
+              "preface": {
+                "const": true
+              }
+            }
+          },
+          "findings": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}
