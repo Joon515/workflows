@@ -15,7 +15,7 @@ import unicodedata
 from jsonschema import Draft202012Validator
 from PIL import Image, UnidentifiedImageError
 
-__all__ = ["load_json", "save_json", "validate_document", "validate_source", "source_snapshot_digest", "validate_book", "seal_source", "content_digest", "admit_model"]
+__all__ = ["load_json", "save_json", "validate_document", "extraction_identity", "extraction_inventory", "validate_source", "source_snapshot_digest", "validate_book", "seal_source", "content_digest", "admit_model"]
 
 _CONTRACTS = Path(__file__).resolve().parent.parent / "contracts"
 _JOB_CONTENT_KEYS = ("version", "title", "source_language", "target_language", "source_file", "source_sha256", "models", "layout")
@@ -216,6 +216,51 @@ def _file_hash(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _extraction_record(job_dir: Path) -> tuple[dict, str | None]:
+    job_dir = Path(job_dir).resolve()
+    job = _job(job_dir)
+    event = next((item for item in reversed(job["history"]) if item.get("event") == "extracted"), None)
+    path = job_dir / "extraction.json"
+    if not path.exists() and not path.is_symlink():
+        if event is None:
+            return job, None
+        raise ValueError("Controller-recorded extraction is missing")
+    path = _contained(job_dir, "extraction.json", "extraction inventory")
+    digest = _file_hash(path)
+    if event is None or event.get("extraction_sha256") != digest:
+        raise ValueError("Extraction differs from the latest controller-recorded extraction")
+    return job, digest
+
+
+def extraction_identity(job_dir: Path) -> str | None:
+    """Stream-check controller-recorded extraction bytes, without decoding its pages.
+
+    A bound plan may reuse its previously checked inventory only when this identity
+    and its exact original job/source bindings still match. This is not a cache.
+    """
+    return _extraction_record(job_dir)[1]
+
+
+def extraction_inventory(job_dir: Path) -> dict | None:
+    """Load the canonical original-page inventory, not a declared draft page set."""
+    job_dir = Path(job_dir).resolve()
+    job, identity = _extraction_record(job_dir)
+    if identity is None:
+        return None
+    extraction = load_json(_contained(job_dir, "extraction.json", "extraction inventory"))
+    if not isinstance(extraction.get("input"), dict) or extraction["input"].get("sha256") != job["source_sha256"]:
+        raise ValueError("Extraction inventory belongs to a different original source")
+    pages = extraction.get("pages")
+    if (not isinstance(pages, list) or not pages
+            or any(not isinstance(page, dict)
+                   or any(not isinstance(page.get(key), str) or not page[key].strip() for key in ("id", "locator"))
+                   for page in pages)):
+        raise ValueError("Extraction requires a nonempty original-page inventory")
+    if any(len({page[key] for page in pages}) != len(pages) for key in ("id", "locator")):
+        raise ValueError("Extraction original-page IDs and locators must be unique")
+    return extraction
 
 
 def _canonical_hash(value: Any) -> str:

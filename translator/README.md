@@ -58,9 +58,9 @@ omp --plugin-dir .omp/translator -e .omp/translator/hooks/pre/translator.ts
 | 2：翻译 / 排版 | 源稿、术语、交接 → 完整译稿、代理译者序、编译 PDF |
 | 3：审核 | 逐块来源核对与实际页面检查 → 通过，或完整问题清单退回阶段 2 |
 
-**取消阶段 1、2 的非 OpenAI 限制；四个角色都可以选择实际可用的 OpenAI 或非 OpenAI 模型。每次新工作流开始前必须通过 ask 询问 source、terminology、translation、review 的实际可用选项和用户选择。** 不能把旧预设、当前父模型、task/default 配置或例子当作授权；只有用户明确选“沿用当前配置”时才解析并记录所沿用的精确角色模型。缺项或选定模型不可用时须停下重新询问，不允许擅自回退。多个角色可共用模型，但也必须由本次选择覆盖。完整询问协议集中在 [operation.md](skills/book-translator/references/operation.md)。默认最多 3 个完整的“翻译—审核”轮次；第三轮仍未通过则停止，不能以编译通过或部分译稿交付。增加上限必须显式选择。
+All four roles may use actually available OpenAI or non-OpenAI models. Before a new workflow, record explicit current-user choices for source, terminology, translation and review. An exact model already explicitly authorized for these roles in the current request satisfies intake; do not ask the identical question again. Use ask only for missing, unavailable or ambiguous choices. Old presets, parent/task defaults and examples are not authorization. Explicit reuse must resolve and record exact role identities; no unauthorized fallback. One chosen model may cover multiple roles when the current choice says so. See [operation.md](skills/book-translator/references/operation.md). The default cap is three complete translation/review rounds; a third failure blocks delivery without a false success claim.
 
-四个角色统一走当前 omp 会话的原生路径：`book_translator_prepare` → 按返回 agent 与完整 assignment（含不透明 run 标记）派发**恰好一个原生 task** → 等 task 完成后调用 `book_translator_finish`。不要猜测 task 的 `model` 参数。基于 eval 的 book agent 不准入，是因为此流程必须取得原生 task 的最终结果证据，不是 omp 没有 eval 委派能力。模型路由只改当前父会话中的命名 book 角色，子会话单独禁用模型回退，并核对实际子任务身份；不启动独立 omp/RPC，不修改全局配置。现有原生模型注册、认证、OAuth、自定义和无密钥供应商能力继续保留。精确接口集中在 [format.md](skills/book-translator/references/format.md)，原生机制与限制见 [omp-contract.md](skills/book-translator/references/omp-contract.md)。
+All four roles use the current omp session's native flow: `book_translator_prepare` → exactly one native task with top-level `context=prepared.details.context` unchanged and one item containing `agent=prepared.details.agent`, `task=prepared.details.assignment` unchanged, and `solutionSpace=prepared.details.solutionSpace` unchanged → wait for settlement → `book_translator_finish`. Both context and per-item solutionSpace are required; an assignment/run marker supplies neither. Every assistant provider/model/API identity must match, including intermediate errors. Aborts always reject. A recovered intermediate same-model error is allowed only with a final usable successful assistant and settled successful native task, without fallback or identity mismatch. Do not guess model arguments. Eval-based book agents lack this workflow's required final native task-result evidence, not general delegation capability. Routing changes only named book roles in the current parent and disables child fallback. No independent omp/RPC launcher, private executor or global configuration change is used. Native registry/authentication, OAuth, custom and keyless providers are reused through the runtime. See [format.md](skills/book-translator/references/format.md).
 
 这是**父会话局部路由与已观察身份的准入边界，不是恶意代理或网络沙箱**，也不独立证明端点身份。hook 可失效、超时或被禁用；只有完整原生证据通过控制器准入才有凭证，安装或任务成功标记本身不够。本包不静默安装额外 SDK/egress gate，也不承诺阻止任意 shell/network 绕过。
 
@@ -72,7 +72,7 @@ PyMuPDF/MuPDF 使用 AGPL 或商业授权；是否符合目标项目的分发/�
 
 ## 操作与工件
 
-令 `skill` 指向复制后的 skill 目录；任务目录不要放在插件内。**先通过 ask 完成本次四个角色的模型选择**，再将下列变量设为用户实际选择的精确供应商/模型，不从旧任务或默认配置自动取值：
+Set `skill` to the copied skill directory and keep jobs outside the plugin. First record the current user's explicit choices for all four roles (including an exact choice already supplied, without asking again). Set the variables below to those exact provider/model identities, not inherited defaults:
 
 ```sh
 skill=.agents/translator/skills/book-translator
@@ -85,14 +85,26 @@ python3 "$skill/scripts/translator.py" configure-model /path/book-job review --p
 python3 "$skill/scripts/translator.py" extract /path/book-job --ocr auto --language eng
 ```
 
-接着在已激活的原生会话按上述 prepare/task/finish 顺序完成 source。协调者检查其工件与准入凭证后另行执行：
+For source, translation and review jobs with more than eight source pages, use durable bounded units; eligible smaller jobs retain the whole-role path. The controller is the single aggregate merge owner. Unit workers complete the entire assigned unit and write only its assigned result/inspection evidence, never canonical source/book files or a sibling result. Every imported draft page starts pending. Fresh extraction without a draft produces only an unreviewed OCR/page skeleton, not ready source. Every assigned source page needs visual inspection and page-specific evidence; sampled pages never establish whole-book coverage.
+
+Inspection records and hashes bind model-declared page coverage to exact source evidence and native identity; they do not independently prove image perception, proofreading, semantic non-duplication or linguistic quality. Actual source/PDF review must inspect every owned page and reconcile cross-unit seams. Read-only neighboring blocks/notes and their declared owners help check carry-over; they do not grant a second writer. Unsupported newly introduced cross-unit structure remains explicitly pending and requires replanning, never silent omission or a fabricated completion.
+
+Review planning additionally bounds each task to at most eight owned physical PDF pages and at most two immediate read-only PDF seam pages. Deterministic overflow units repeat the same bounded source scope; complete source inspection may overlap across review tasks, but physical PDF inspection must cover the exact entire output once. This is automatic planning, not a sampling option or another public tuning flag.
 
 ```sh
+python3 "$skill/scripts/translator.py" plan-units /path/book-job source --pages-per-unit 4
+# Optional source draft import: add --draft /path/existing-source-draft.json
+python3 "$skill/scripts/translator.py" unit-status /path/book-job source
+# For each pending unit: book_translator_prepare {job, role:"source", unit:UNIT_ID}
+# Dispatch one native task: context=prepared.details.context unchanged; item agent=prepared.details.agent, task=prepared.details.assignment unchanged, solutionSpace=prepared.details.solutionSpace unchanged; finish(prepared.details.run).
+python3 "$skill/scripts/translator.py" assemble-units /path/book-job source
 python3 "$skill/scripts/translator.py" validate /path/book-job --source
 python3 "$skill/scripts/translator.py" seal-source /path/book-job
 ```
 
-依次以同一路径完成 terminology、translation。翻译准入先持久保存完整作者证据，再构建并成功完成一次轮次；当前编译 PDF 供独立 review 检查。review 的 finish 准入成功后，协调者提交同一报告，并且只在当前报告通过时验收：
+The exact CLI is `plan-units JOB ROLE --pages-per-unit N [--draft PATH] [--revise]`, `unit-status JOB ROLE` and `assemble-units JOB ROLE`; supported unit roles are source, translation and review. Preparation can use `prepare-native JOB ROLE --unit UNIT_ID` through the native hook. Preserve the original file, existing job and historical provenance. Unit completion changes no whole-book state/round and cannot seal, submit review or accept. Assembly requires all planned units/pages admitted and validates the aggregate; source sealing remains separate.
+
+Run terminology against the complete sealed source, then plan/admit/assemble translation units. Only complete aggregate translation authoring and a successful canonical build finalize one round, not each unit. Review units inspect the exact current manuscript/PDF and must collectively cover every source page and physical PDF page. The controller assembles the exact complete report; finish/assembly never auto-submit it or accept output. The coordinator then submits that same admitted report and accepts only a fresh whole-book pass:
 
 ```sh
 python3 "$skill/scripts/translator.py" review /path/book-job /path/report.json
@@ -100,17 +112,17 @@ python3 "$skill/scripts/translator.py" accept /path/book-job
 python3 "$skill/scripts/translator.py" status /path/book-job
 ```
 
-阶段 0 对照页图重建 version-2 `book-source.json`，核对正文起点、段落/列表/空白页、原书页码、保护区、图文相对尺寸、脚注转录和补全注释。来源缺少可靠字号校准、没有可辩护的辨读或技术值仍有实质歧义时应阻塞；有依据且在内部元数据明确标为猜测的普通文字补全不因此一律拒绝。不能把未经核对的 OCR 晋升为可交付源稿。source 与 review 的原生凭证分别是封存与报告提交的必要前提，但完成角色不自动封存源稿、提交审核或验收，协调者须另行执行。
+Stage 0 reconstructs version-2 source from actual page images: body boundary, blocks/lists/blank pages, printed page labels, protected spans, source-em image calibration, semantic notes and restoration associations. Unit assembly must cover the entire authorized source; an imported draft or OCR dump cannot be promoted without every page being inspected. Missing defensible calibration/readings or materially ambiguous technical values block affected work; evidence-backed ordinary-prose conjectures remain explicitly marked in internal metadata. Current aggregate source/review provenance is required for sealing/report submission. Completing a role or unit never automatically seals, submits review or accepts.
 
-通过当前 omp 的原生注册与认证使用所选模型，不额外转发凭据，不构造私有注册表，也不将认证限制为 API key。原生已支持的 OAuth、自定义或无密钥模型保持可用；具体身份仍须实际解析和核对，不承诺所有模型免费或持续可用。注册、认证可用、实际请求成功和翻译质量是不同证据；失败时重新取得用户选择，不能静默换模型。
+Use selected models only through the current runtime's native registry and authentication. Do not forward credentials to a private registry/executor or restrict auth to API keys. Native OAuth, custom and keyless models remain available where configured; registration/authentication, actual request success and translation quality are different evidence. Availability or repeated requests are not guaranteed. If selection is unavailable, clarify the user's choice instead of silently changing models.
 
-`book.json` 为完整译稿，`terms.json` 为术语依据，`handoff.md` 为交接，`reviews/` 保存每轮报告及内容绑定，`provenance/` 保存原生请求、执行证据、trace 和准入凭证，`build/` 保存 TeX/PDF/十一项机械门槛结果。审核报告必须绑定实际检查的内容与 PDF 身份；提交不能把旧报告改标为当前报告，且必须有匹配的原生 reviewer 凭证。只有当前审核与新鲜度检查通过后才释放 `output.pdf`。恢复时读磁盘记录，不依赖短期 conversation、task ID 或 run token。
+`book.json` is the complete assembled translation; `terms.json` and `handoff.md` retain terminology/context. Durable unit plans, assigned results, per-page inspections and receipts support resumption; see the exact unit contract in [format.md](skills/book-translator/references/format.md). `reviews/` holds round reports bound to content/PDF identity, `provenance/` holds native requests/evidence/traces/admission, and `build/` holds TeX/PDF and eleven mandatory build checks. Submission cannot relabel an old report as current; acceptance releases `output.pdf` only for a current passing complete report/build. Recover from disk records, not short-lived conversation, task IDs or run tokens alone.
 
-封存后的源稿修正先记录反馈/范围，并以 `book_translator_prepare` 的 source 修订模式准备新原生任务（Python 桥接为 `prepare-native JOB source --revise`）。完成后得到匹配新源稿的凭证，**旧 seal、状态与轮次不因此改变**；协调者仍须显式执行 `seal-source JOB --reseal` 才替换 seal、作废下游准入/构建/批准并归档旧审核。未改变源稿的重新封存不能清零轮次。术语若在首次翻译前被独立审查退回，则保留只读反馈并链接进历史，以同一原生路径准备 terminology 修订；仍只接受 `terminology_ready`、第 0 轮且当前凭证/工件绑定完整的任务，不得用来绕过审核、修改封存源稿或重置轮次。完整恢复流程见 operation.md。
+For sealed-source corrections, retain feedback/scope and use source revision preparation. Long books plan source units with `plan-units JOB source --pages-per-unit N --revise`, then prepare each unit with revise enabled. Small whole-role bridging remains `prepare-native JOB source --revise`. Admitting/assembling corrected source does not replace the old seal, state or round; the coordinator must deliberately run `seal-source JOB --reseal`. Changed-source resealing invalidates downstream admission/build/approval and archives journal-owned old reviews; unchanged resealing cannot reset the cap. Pretranslation terminology revision remains eligible only at `terminology_ready`, round 0, with current provenance and linked read-only feedback. It cannot alter sealed source or bypass the review/round boundary. See [operation.md](skills/book-translator/references/operation.md).
 
 可见书名中的术语由准入译者以 `title_terms` 显式标注，先于译者序参与整本书首现格式和定位统计；不靠字符串匹配猜概念。正文前首现保留前置页定位，正文首现使用从正文起算的译本页码。原书页边标记仍保留真实印刷标签；超宽标签只在其外侧页码带内按测量结果适配，不改源标签、基线或 3 mm 锚点，这不构成图片任意缩放的许可。
 
-模型完成后先保存内容作者证据，再进行可能失败的编译。若存在完整有效且内容未变的待构建作者证据，协调者可执行 `python3 "$skill/scripts/translator.py" finalize-translation JOB`，不重新调用模型，也不复用旧构建；成功后才增加一次翻译轮次，随后仍须审核和验收。没有该证据的旧失败稿、手工拼出的稿件或已更改的内容，不能用此命令补造准入。
+Complete model authorship is saved before fallible compilation. For units this requires complete admitted aggregate coverage, not one successful unit. If an unchanged valid pending complete-authoring proof exists, the coordinator may run `python3 "$skill/scripts/translator.py" finalize-translation JOB` without new inference or reusing an old build. Only successful canonical finalization advances one round; review and acceptance remain required. Old failed drafts, manually assembled unreceipted content or changed content cannot use this command to manufacture admission.
 
 完整字段与操作协议见 [format.md](skills/book-translator/references/format.md)、[operation.md](skills/book-translator/references/operation.md) 及 `stages/`。除本 README 外，包内文件均为 English agent-facing assets；书籍译文自然使用所请求的目标语言。
 

@@ -22,6 +22,8 @@ interface PreparedRequest {
 	model: string;
 	selector: string;
 	prompt: string;
+	context: string;
+	solutionSpace: string;
 }
 interface Run {
 	request: PreparedRequest;
@@ -97,7 +99,7 @@ function snapshot(run: Run): RecordValue {
 		provider_requests: run.providerRequests, assistant_messages: run.assistantMessages,
 		lifecycle: run.lifecycle, progress: run.progress, task_result: run.taskResult,
 		task_tool: { tool_call_id: run.toolCallId, is_error: run.toolIsError },
-		route: run.route, failure: run.failure,
+		route: run.route, failure: run.failure, capture_error: run.captureError,
 		trace: path.relative(run.request.job_path, run.tracePath).split(path.sep).join("/"),
 	};
 }
@@ -153,13 +155,13 @@ export default function translatorExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: "book_translator_prepare", label: "Prepare book role", approval: "exec", loadMode: "essential",
-		description: "Prepare one explicitly selected book role. Use the returned agent and assignment in one blocking native task, then call book_translator_finish. This does not run a model.",
-		parameters: Type.Object({ job: Type.String(), role: Type.Union(ROLES.map(role => Type.Literal(role))), revise: Type.Optional(Type.Boolean()) }),
+		description: "Prepare one explicitly selected book role. Pass returned context unchanged as task.context and returned agent, assignment and solutionSpace unchanged in one blocking native task item, then call book_translator_finish. This does not run a model.",
+		parameters: Type.Object({ job: Type.String(), role: Type.Union(ROLES.map(role => Type.Literal(role))), revise: Type.Optional(Type.Boolean()), unit: Type.Optional(Type.String()) }),
 		async execute(_id, params, signal, _update, ctx) {
 			try {
 				if (roleForAgent(ctx.agent.name)) throw new Error("Book workers cannot prepare or delegate book roles.");
 				if (prepared?.spawned && !prepared.taskResult && !prepared.failure) throw new Error("The prepared book worker has not settled.");
-				const request = await runPython(["prepare-native", path.resolve(ctx.cwd, params.job), params.role, ...(params.revise ? ["--revise"] : [])], signal) as PreparedRequest;
+				const request = await runPython(["prepare-native", path.resolve(ctx.cwd, params.job), params.role, ...(params.revise ? ["--revise"] : []), ...(params.unit !== undefined ? ["--unit", params.unit] : [])], signal) as PreparedRequest;
 				await verifyRequest(request);
 				const selected = availableModel(ctx, request);
 				const expectedModel = modelIdentity(selected);
@@ -186,6 +188,8 @@ export default function translatorExtension(pi: ExtensionAPI): void {
 				record(run, "prepared", { request_path: request.request_path, request_sha256: request.request_sha256, selected_model: expectedModel, parent_session_id: run.parentSession });
 				await run.queue;
 				const details = { run: request.request_id, agent: request.agent, selector: request.selector,
+					context: request.context,
+					solutionSpace: request.solutionSpace,
 					assignment: `${run.marker}\nExecute only the admitted book role. The native hook supplies its complete immutable assignment. Do not delegate, change models, or alter controller metadata.`,
 					request_path: request.request_path, evidence_path: run.evidencePath };
 				return { content: [{ type: "text", text: JSON.stringify(details) }], details };
@@ -327,6 +331,7 @@ export default function translatorExtension(pi: ExtensionAPI): void {
 		const run = prepared;
 		if (!run || !object(data) || data.id !== (run.childId ?? run.observedChildId) || !object(data.event) || run.taskResult) return;
 		const event = data.event;
+		if (["retry_fallback_applied", "retry_fallback_succeeded"].includes(String(event.type))) run.failure = "Native fallback routing was observed for the book role.";
 		if (event.type === "message_end" && object(event.message) && event.message.role === "assistant") run.assistantMessages.push(clone(event.message));
 		if (["message_end", "agent_end", "tool_execution_start", "tool_execution_end", "auto_retry_start", "auto_retry_end", "retry_fallback_applied", "retry_fallback_succeeded"].includes(String(event.type))) record(run, "child_event", data);
 	});
