@@ -7,7 +7,7 @@
 \RequirePackage{zref-savepos,zref-abspage}
 \setCJKfamilyfont{BTTerm}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolSong-Bold.otf,BoldItalicFont=FandolSong-Bold.otf,FakeSlant=0.2]{FandolSong-Bold.otf}
 \newcommand{\BTFirstTerm}[1]{\textbf{\textit{\CJKfamily{BTTerm}#1}}}
-\setlength{\parindent}{1em}
+\setlength{\parindent}{2em}
 \setlength{\parskip}{3pt}
 \setlength{\emergencystretch}{1em}
 \setlength{\dimen\footins}{\dimexpr.5\textheight-\skip\footins\relax}
@@ -15,44 +15,109 @@
 \interfootnotelinepenalty=0
 \floatingpenalty=20000
 \raggedbottom
-\pagestyle{plain}
+% TeX's page total ends at the last body baseline. Attach bottom material there,
+% subtracting the actual capped line depth rather than counting it a second time.
+\@ifundefined{IfSocketExistsTF}{%
+  \PackageError{book-translator}{Required LaTeX socket API is unavailable}{Upgrade LaTeX to a kernel providing build/column/baselineattach.}%
+}{%
+  \IfSocketExistsTF{build/column/baselineattach}{%
+    \AssignSocketPlug{build/column/baselineattach}{on}%
+  }{%
+    \PackageError{book-translator}{Required LaTeX baseline-attachment socket is unavailable}{Upgrade LaTeX to a kernel providing build/column/baselineattach.}%
+  }%
+}
+% The physical page counter is never reset: binding and source anchors use it.
+\newcount\BTBodyStart
+\renewcommand{\thepage}{\ifnum\BTBodyStart>0 \number\numexpr\value{page}-\BTBodyStart+1\relax\fi}
+\newcommand{\BTMainBody}{\clearpage\global\BTBodyStart=\value{page}\markboth{}{}}
+\renewcommand{\rightmark}{\LastMark{2e-right}}
+\newcommand{\BTHeaderLabel}[1]{\ifcsname BTLabel@#1\endcsname\csname BTLabel@#1\endcsname\fi}
+\newcommand{\BTInnerHeader}[1]{\BTPosition{header:\number\value{page}:inner:start}\BTHeaderLabel{#1}\BTPosition{header:\number\value{page}:inner:end}}
+\newcommand{\BTOuterHeader}{\BTPosition{header:\number\value{page}:outer:start}\thepage\BTPosition{header:\number\value{page}:outer:end}}
+\def\ps@bt{%
+  \def\@oddhead{\ifnum\BTBodyStart>0\small\BTInnerHeader{\rightmark}\hfil\BTOuterHeader\fi}%
+  \def\@evenhead{\ifnum\BTBodyStart>0\small\BTOuterHeader\hfil\BTInnerHeader{\leftmark}\fi}%
+  \let\@oddfoot\@empty\let\@evenfoot\@empty}
+\pagestyle{bt}
+\newcommand{\BTFirstReference}[1]{%
+  \ifnum\zref@extractdefault{term:#1}{abspage}{0}<\zref@extractdefault{mainbody:start}{abspage}{0}%
+    \BTBeforeBody\space PDF~\zref@extractdefault{term:#1}{abspage}{0}%
+  \else
+    \number\numexpr\zref@extractdefault{term:#1}{abspage}{0}-\zref@extractdefault{mainbody:start}{abspage}{0}+1\relax
+  \fi}
 \renewcommand{\footnoterule}{\kern-3pt\hrule width .4\columnwidth\kern2.6pt}
 \renewcommand{\splitfootnoterule}{\kern-3pt\hrule width .4\columnwidth\kern2.6pt}
 \newsavebox{\BTTextBox}
 \newsavebox{\BTImageBox}
 \newsavebox{\BTTempBox}
+\newsavebox{\BTMarkerBox}
+\newlength{\BTMarkerWidth}
+\setlength{\BTMarkerWidth}{\dimexpr\BTOuter mm-\BTMarkEdge mm\relax}
 \newlength{\BTAvailableHeight}
 \newcount\BTShipout
 \zref@addprops{savepos}{abspage}
 \newcommand{\BTPosition}[1]{\zsavepos{#1}}
+\newcommand{\BTSourceLabel}[1]{%
+  \sbox{\BTMarkerBox}{#1}%
+  \ifdim\wd\BTMarkerBox>\BTMarkerWidth
+    \resizebox{\BTMarkerWidth}{!}{\usebox{\BTMarkerBox}}%
+  \else
+    \usebox{\BTMarkerBox}%
+  \fi}
 \newcommand{\BTSourceOverlay}[2]{%
   \ifnum\zref@extractdefault{#1}{abspage}{0}=\BTShipout
     \begin{tikzpicture}[remember picture,overlay]
     \ifodd\BTShipout
-      \node[anchor=base east,inner sep=0pt,font=\fontsize{5}{6}\selectfont]
-      at ([xshift=-\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south east) {#2};%
+      \node[anchor=base east,inner sep=0pt,outer sep=0pt,font=\fontsize{5}{6}\selectfont]
+      at ([xshift=-\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south east) {\BTSourceLabel{#2}};%
     \else
-      \node[anchor=base west,inner sep=0pt,font=\fontsize{5}{6}\selectfont]
-      at ([xshift=\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south west) {#2};%
+      \node[anchor=base west,inner sep=0pt,outer sep=0pt,font=\fontsize{5}{6}\selectfont]
+      at ([xshift=\BTMarkEdge mm,yshift=\zposy{#1}sp]current page.south west) {\BTSourceLabel{#2}};%
     \fi
     \end{tikzpicture}%
   \fi}
 \AddToHook{cmd/@makecol/before}{%
   \ifvoid\footins\else
-    \typeout{BTFOOT|\thepage|\number\dimexpr\ht\footins+\dp\footins+\skip\footins\relax|\number\dimexpr.5\textheight\relax}%
+    % Include final-line depth in footer height, also for lowered inline rasters.
+    \setbox\footins\vbox{\unvbox\footins\kern0pt}%
+    \typeout{BTFOOT|\number\value{page}|\number\dimexpr\ht\footins+\dp\footins+\skip\footins\relax|\number\dimexpr.5\textheight\relax}%
   \fi}
 \AtBeginDocument{\typeout{BTGEOMETRY|\number\paperwidth|\number\paperheight|\number\textwidth|\number\textheight|\number\dimexpr\oddsidemargin+1in\relax|\number\dimexpr\evensidemargin+1in\relax|\number\dimexpr\topmargin+\headheight+\headsep+1in\relax}}
-\newcommand{\BTHeading}[2]{%
+\newcommand{\BTHeading}[4]{%
   \par\ifnum#1=1\clearpage\fi
+  \expandafter\gdef\csname BTLabel@#2\endcsname{#4}%
+  \ifnum#1=1\markboth{#2}{}\else\ifnum#1=2\markright{#2}\fi\fi
   \addvspace{\baselineskip}\noindent
-  {\bfseries\ifcase#1\or\LARGE\or\Large\or\large\fi #2\par}
+  {\bfseries\ifcase#1\or\LARGE\or\Large\or\large\fi #3\par}
   \nobreak\smallskip}
+\newcommand{\BTParagraph}[2]{%
+  \par\begingroup\parindent=2em\indent\typeout{BTTYPE|#1|paragraph|\number\dimexpr1em\relax}%
+  \BTPosition{#1:start}#2\BTPosition{#1:end}\par\endgroup}
+% Start each table-cell paragraph explicitly, independent of CJK body indentation.
+\newcommand{\BTTableCell}{\setlength{\parindent}{0pt}\noindent}
+\newlength{\BTListLabelWidth}
+\newcommand{\BTListItem}[4]{%
+  \par\begingroup
+  \setlength{\leftskip}{\dimexpr2em+#2em+#2em\relax}%
+  \settowidth{\BTListLabelWidth}{#3\hspace{.5em}}%
+  \ifdim\BTListLabelWidth<2em\setlength{\BTListLabelWidth}{2em}\fi
+  \parindent=0pt\hangindent=\BTListLabelWidth\hangafter=1
+  \noindent\typeout{BTTYPE|#1|list_item|\number\dimexpr1em\relax|\number\BTListLabelWidth}%
+  \BTPosition{list:#1:label}\makebox[\BTListLabelWidth][l]{#3}%
+  \BTPosition{block:#1:start}#4\BTPosition{block:#1:end}\par\endgroup}
 \newcommand{\BTImageEvidence}[1]{%
-  \typeout{BTIMAGE|#1|\number\wd\BTImageBox|\number\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax}}
-\newcommand{\BTScaleCanvas}{%
-  \sbox{\BTTempBox}{\resizebox{\linewidth}{!}{\usebox{\BTImageBox}}}%
-  \sbox{\BTImageBox}{\usebox{\BTTempBox}}%
+  \typeout{BTIMAGE|#1|\number\dimexpr1em\relax|\number\wd\BTImageBox|\number\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax}}
+\newcommand{\BTInlineImage}[5]{%
+  \leavevmode\hbox{%
+    \typeout{BTINLINE|#1|\number\dimexpr1em\relax}%
+    \BTPosition{#1:start}%
+    \raisebox{#4em}{\includegraphics[width=#2em,height=#3em]{#5}}%
+    \BTPosition{#1:end}}}
+\newcommand{\BTCheckCanvas}[1]{%
+  \typeout{BTCANVAS|#1|\number\wd\BTImageBox|\number\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax|\number\linewidth|\number\BTAvailableHeight|\BTCanvasScale|\BTCanvasFloor}%
+  \ifdim\wd\BTImageBox>\linewidth
+    \PackageError{book-translator}{Graphic #1 at reviewed source-font scale \BTCanvasScale\space exceeds its eligible column width; choose reviewed fit.scale at/above fit.min_scale or request an explicit reconstruction/layout choice}{Inspect BTCANVAS dimensions; the admitted floor is \BTCanvasFloor. Never enlarge, crop, split artwork, or silently change paper.}%
+  \fi
   \ifdim\dimexpr\ht\BTImageBox+\dp\BTImageBox\relax>\BTAvailableHeight
-    \sbox{\BTTempBox}{\resizebox{!}{\BTAvailableHeight}{\usebox{\BTImageBox}}}%
-    \sbox{\BTImageBox}{\usebox{\BTTempBox}}%
+    \PackageError{book-translator}{Graphic #1 at reviewed source-font scale \BTCanvasScale\space cannot fit a whole page with its caption and note; choose reviewed fit.scale at/above fit.min_scale or request an explicit reconstruction/layout choice}{Inspect BTCANVAS dimensions; the admitted floor is \BTCanvasFloor. Never enlarge, crop, split artwork, or silently change paper.}%
   \fi}

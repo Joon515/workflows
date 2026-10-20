@@ -6,6 +6,7 @@ import ast
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import posixpath
@@ -222,7 +223,7 @@ def _djvu_text(tool: str, source: Path, number: int, width: float, height: float
     for match in re.finditer(pattern, content):
         left, bottom, right, top = map(int, match.groups()[:4])
         text = ast.literal_eval(match.group(5))
-        spans.append({"text": text, "bbox": [(left - x0) * width / (x1 - x0), (y1 - top) * height / (y1 - y0), (right - x0) * width / (x1 - x0), (y1 - bottom) * height / (y1 - y0)]})
+        spans.append(_span_evidence(text, [(left - x0) * width / (x1 - x0), (y1 - top) * height / (y1 - y0), (right - x0) * width / (x1 - x0), (y1 - bottom) * height / (y1 - y0)]))
     # Preserve the exact structured output as evidence; this joined text is not a reviewed reading order.
     return " ".join(span["text"] for span in spans), spans, evidence.relative(path)
 
@@ -232,8 +233,39 @@ def _bbox(fitz, page, values):
     return [float(value) for value in rectangle]
 
 
-def _spans(fitz, page, data):
-    return [{"text": span["text"], "bbox": _bbox(fitz, page, span["bbox"])} for block in data["blocks"] if block["type"] == 0 for line in block["lines"] for span in line["spans"]]
+def _span_evidence(text, bbox):
+    # Missing source measurements stay explicit; a box is not a font em.
+    return {"text": text, "bbox": bbox, "font_size": None, "font_name": None, "origin": None, "font_size_source": None, "font_size_unit": None, "block_index": None, "line_index": None, "span_index": None, "line_bbox": None, "line_direction": None, "line_wmode": None}
+
+
+def _spans(fitz, page, data, font_source):
+    spans = []
+    rotation = page.rotation_matrix
+    direction_rotation = fitz.Matrix(rotation.a, rotation.b, rotation.c, rotation.d, 0, 0)
+    for block_index, block in enumerate(data["blocks"]):
+        if block["type"] != 0:
+            continue
+        for line_index, line in enumerate(block["lines"]):
+            line_bbox = _bbox(fitz, page, line["bbox"]) if "bbox" in line else None
+            direction = [float(value) for value in fitz.Point(line["dir"]) * direction_rotation] if "dir" in line else None
+            for span_index, span in enumerate(line["spans"]):
+                item = _span_evidence(span["text"], _bbox(fitz, page, span["bbox"]))
+                item.update(block_index=block_index, line_index=line_index, span_index=span_index, line_bbox=line_bbox, line_direction=direction, line_wmode=line.get("wmode"))
+                if font_source is not None:
+                    # Native/reflow provenance does not attest original printed typography.
+                    font = span.get("font")
+                    if isinstance(font, str) and font.strip():
+                        item["font_name"] = font
+                    # Known OCR fonts remain synthetic even inside a selectable PDF.
+                    synthetic_ocr = isinstance(font, str) and font.rsplit("+", 1)[-1] == "GlyphLessFont"
+                    if not synthetic_ocr:
+                        size = span.get("size")
+                        if isinstance(size, (int, float)) and not isinstance(size, bool) and math.isfinite(size) and size > 0:
+                            item.update(font_size=float(size), font_size_source=font_source, font_size_unit="pt")
+                        if span.get("origin") is not None:
+                            item["origin"] = [float(value) for value in fitz.Point(span["origin"]) * rotation]
+                spans.append(item)
+    return spans
 
 
 def _label_candidates(page):
@@ -257,7 +289,7 @@ def _label_candidates(page):
     return candidates
 
 
-def _native_page(fitz, document, page, number: int, evidence: _Evidence, reflowable: bool, policy: str, language: str, dpi: int, tessdata):
+def _native_page(fitz, document, page, number: int, evidence: _Evidence, source_format: str, policy: str, language: str, dpi: int, tessdata):
     identifier = f"p{number:04d}"
     flags = fitz.TEXTFLAGS_DICT | fitz.TEXT_PRESERVE_IMAGES
     data = page.get_text("dict", flags=flags)
@@ -265,7 +297,8 @@ def _native_page(fitz, document, page, number: int, evidence: _Evidence, reflowa
     pixmap = page.get_pixmap(dpi=dpi, alpha=False)
     image_path = evidence.directory / f"{identifier}.png"
     pixmap.save(str(image_path))
-    spans = _spans(fitz, page, data)
+    font_source = "native_pdf" if source_format == "pdf" else "reflow_layout" if source_format in {"epub", "mobi"} else None
+    spans = _spans(fitz, page, data, font_source)
     assets, regions = [], []
     for block in data["blocks"]:
         if block["type"] != 1:
@@ -289,7 +322,7 @@ def _native_page(fitz, document, page, number: int, evidence: _Evidence, reflowa
     dominant, color = pixmap.color_topusage()
     has_marks = dominant < 1.0 or any(component < 250 for component in color)
     needed = bool(regions) or "\ufffd" in text or (not text.strip() and has_marks)
-    if reflowable:
+    if source_format in {"epub", "mobi"}:
         chapter, chapter_page = document.location_from_page_number(number - 1)
         locator = f"virtual:chapter:{chapter}:page:{chapter_page}"
     else:
@@ -301,7 +334,7 @@ def _native_page(fitz, document, page, number: int, evidence: _Evidence, reflowa
             # Full-page OCR remains distinct from native text and also covers mixed pages.
             textpage = page.get_textpage_ocr(language=language, dpi=dpi, full=True, tessdata=str(directory))
             ocr_data = page.get_text("dict", textpage=textpage)
-            result["ocr"].update(performed=True, engine="PyMuPDF/Tesseract", text=page.get_text("text", textpage=textpage), spans=_spans(fitz, page, ocr_data))
+            result["ocr"].update(performed=True, engine="PyMuPDF/Tesseract", text=page.get_text("text", textpage=textpage), spans=_spans(fitz, page, ocr_data, None))
         except Exception as exc:
             raise RuntimeError(f"OCR failed on {identifier} ({language}). Verify the PyMuPDF OCR build and matching TESSDATA_PREFIX language files: {exc}") from exc
     return result
@@ -381,7 +414,7 @@ def extract(source: Path, job_dir: Path, ocr: str = "auto", language: str = "eng
             pages = []
             for index in range(document.page_count):
                 page = document.load_page(index)
-                result = _native_page(fitz, document, page, index + 1, evidence, source_format in {"epub", "mobi"}, ocr, language, dpi, tessdata)
+                result = _native_page(fitz, document, page, index + 1, evidence, source_format, ocr, language, dpi, tessdata)
                 if source_format == "djvu" and tools["djvutxt"]:
                     text, spans, raw = _djvu_text(tools["djvutxt"], source, index + 1, result["width"], result["height"], evidence)
                     result.update(text=text, spans=spans, native_text_evidence=raw)

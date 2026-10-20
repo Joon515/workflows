@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -36,6 +37,22 @@ def make_pdf(path, scanned=False, mixed=False, image=False, rotated=False):
         if rotated:
             page.set_rotation(90)
         document.save(path)
+
+
+def make_font_pdf(path, rotation=0):
+    with fitz.open() as document:
+        page = document.new_page(width=360, height=240)
+        pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), False)
+        pixmap.clear_with(80)
+        page.insert_image(fitz.Rect(300, 20, 330, 50), pixmap=pixmap)
+        page.insert_text((40, 60), "Body ", fontsize=12, fontname="helv")
+        continuation = 40 + fitz.get_text_length("Body ", fontsize=12, fontname="helv")
+        page.insert_text((continuation, 60), "context", fontsize=12, fontname="tiit")
+        page.insert_text((40, 75), "Second line", fontsize=12, fontname="helv")
+        page.insert_text((40, 150), "Section heading", fontsize=21, fontname="tibo")
+        page.set_rotation(rotation)
+        document.save(path)
+
 
 
 def make_epub(path, encrypted=False, missing=False):
@@ -106,6 +123,13 @@ class ExtractTests(unittest.TestCase):
         for asset in output["assets"]:
             self.assertTrue((self.job / asset["path"]).is_file())
 
+    def assert_no_source_font(self, span):
+        for key in ("font_size", "font_size_source", "font_size_unit", "origin"):
+            self.assertIn(key, span)
+            self.assertIsNone(span[key], key)
+
+
+
     def test_doctor_reports_actual_dependencies(self):
         self.assertTrue(self.dependencies["pymupdf"]["available"])
         self.assertEqual(self.dependencies["tools"]["ddjvu"], shutil.which("ddjvu"))
@@ -124,6 +148,127 @@ class ExtractTests(unittest.TestCase):
         self.assertFalse(page["ocr"]["needed"])
         self.assertFalse(page["ocr"]["performed"])
         self.assertEqual(page["locator"], "page:1")
+
+    def test_native_pdf_font_em_baselines_and_context_keep_source_identity(self):
+        for rotation in (0, 90):
+            with self.subTest(rotation=rotation):
+                source = self.root / f"font-evidence-{rotation}.pdf"
+                make_font_pdf(source, rotation)
+                original_bytes = source.read_bytes()
+                job = self.job / str(rotation)
+                output = extractor.extract(source, job, ocr="never", dpi=72)
+                page = output["pages"][0]
+                self.assertEqual(output["input"]["sha256"], hashlib.sha256(original_bytes).hexdigest())
+                self.assertEqual((job / output["input"]["path"]).read_bytes(), original_bytes)
+                self.assertEqual(source.read_bytes(), original_bytes)
+                self.assertEqual(page["locator"], "page:1")
+                self.assertEqual(output, json.loads((job / "extraction.json").read_text(encoding="utf-8")))
+                self.assertIn("Second line", page["text"])
+                self.assertTrue(page["assets"])
+                self.assertTrue(any(span["line_index"] > 0 for span in page["spans"]))
+                expected_sizes = {"Body": 12, "context": 12, "Second line": 12, "Section heading": 21}
+                self.assertEqual({span["text"].strip() for span in page["spans"]}, set(expected_sizes))
+                with fitz.open(source) as original:
+                    native_page = original[0]
+                    data = native_page.get_text("dict", flags=fitz.TEXTFLAGS_DICT | fitz.TEXT_PRESERVE_IMAGES)
+                    self.assertEqual(page["text"], native_page.get_text("text"))
+                    for span in page["spans"]:
+                        block = data["blocks"][span["block_index"]]
+                        line = block["lines"][span["line_index"]]
+                        native = line["spans"][span["span_index"]]
+                        self.assertEqual(span["text"], native["text"])
+                        self.assertEqual(span["font_size"], expected_sizes[span["text"].strip()])
+                        self.assertEqual(span["font_size"], native["size"])
+                        self.assertEqual(span["font_name"], native["font"])
+                        self.assertEqual(span["font_size_source"], "native_pdf")
+                        self.assertEqual(span["font_size_unit"], "pt")
+                        self.assertEqual(span["bbox"], list(fitz.Rect(native["bbox"]) * native_page.rotation_matrix))
+                        self.assertEqual(span["line_bbox"], list(fitz.Rect(line["bbox"]) * native_page.rotation_matrix))
+                        self.assertEqual(span["origin"], list(fitz.Point(native["origin"]) * native_page.rotation_matrix))
+                        self.assertEqual(span["line_wmode"], line["wmode"])
+                        self.assertEqual(span["line_direction"], [0.0, 1.0] if rotation else [1.0, 0.0])
+                body = next(span for span in page["spans"] if span["text"].strip() == "Body")
+                context = next(span for span in page["spans"] if span["text"] == "context")
+                self.assertEqual((body["block_index"], body["line_index"]), (context["block_index"], context["line_index"]))
+                self.assertNotEqual(body["span_index"], context["span_index"])
+                if not rotation:
+                    self.assertEqual(body["origin"], [40.0, 60.0])
+                    self.assertNotAlmostEqual(body["bbox"][3] - body["bbox"][1], 12, places=3)
+                    self.assertNotAlmostEqual(body["bbox"][3] - body["bbox"][1], context["bbox"][3] - context["bbox"][1], places=3)
+                higher_dpi = extractor.extract(source, job / "higher-dpi", ocr="never", dpi=144)
+                self.assertEqual(higher_dpi["pages"][0]["spans"], page["spans"])
+                self.assertEqual(higher_dpi["input"], output["input"])
+
+    def test_unavailable_or_invalid_font_measurements_are_not_derived_from_boxes(self):
+        with fitz.open() as document:
+            page = document.new_page()
+            for size in (None, 0, -1, float("nan"), float("inf"), True, "12"):
+                with self.subTest(size=size):
+                    native = {"text": "Unmeasured text", "bbox": [10, 20, 110, 45], "origin": None}
+                    if size is not None:
+                        native["size"] = size
+                    data = {"blocks": [{"type": 0, "lines": [{"spans": [native]}]}]}
+                    span = extractor._spans(fitz, page, data, "native_pdf")[0]
+                    self.assertEqual(span["text"], native["text"])
+                    self.assertEqual(span["bbox"], native["bbox"])
+                    self.assert_no_source_font(span)
+                    for key in ("font_name", "line_bbox", "line_direction", "line_wmode"):
+                        self.assertIsNone(span[key])
+
+    def test_ocr_span_metrics_are_not_calibration_for_any_extraction_channel(self):
+        with fitz.open() as document:
+            page = document.new_page()
+            for font_source in (None, "native_pdf", "reflow_layout"):
+                for font_name in ("GlyphLessFont", "ABCDEF+GlyphLessFont"):
+                    with self.subTest(font_source=font_source, font_name=font_name):
+                        native = {"text": "OCR words", "bbox": [10, 20, 110, 45], "size": 24, "font": font_name, "origin": [10, 40]}
+                        line = {"bbox": native["bbox"], "dir": [1, 0], "wmode": 0, "spans": [native]}
+                        data = {"blocks": [{"type": 0, "lines": [line]}]}
+                        span = extractor._spans(fitz, page, data, font_source)[0]
+                        self.assert_no_source_font(span)
+                        self.assertEqual(span["font_name"], font_name if font_source else None)
+                        self.assertEqual(span["text"], native["text"])
+                        self.assertEqual(span["bbox"], native["bbox"])
+                        self.assertEqual(span["line_bbox"], line["bbox"])
+                        self.assertEqual(span["line_direction"], line["dir"])
+                        self.assertEqual((span["block_index"], span["line_index"], span["span_index"]), (0, 0, 0))
+
+
+    def test_generated_native_ocr_layer_keeps_synthetic_calibration_missing(self):
+        if not self.dependencies["ocr"]["available"] or "eng" not in self.dependencies["ocr"]["languages"]:
+            self.skipTest("Native OCR-layer fixture requires the installed embedded OCR engine and English data")
+        source = self.root / "ocr-layer.pdf"
+        with fitz.open() as document:
+            page = document.new_page(width=360, height=100)
+            page.insert_text((20, 60), "SYNTHETIC OCR LAYER", fontsize=22)
+            pixmap = page.get_pixmap(dpi=150, alpha=False)
+            source.write_bytes(pixmap.pdfocr_tobytes(language="eng", tessdata=self.dependencies["ocr"]["tessdata"]))
+        output = extractor.extract(source, self.job, ocr="never", dpi=72)
+        self.assert_evidence(output)
+        self.assertIn("SYNTHETIC OCR LAYER", output["pages"][0]["text"])
+        for span in output["pages"][0]["spans"]:
+            self.assertIn("GlyphLessFont", span["font_name"])
+            self.assert_no_source_font(span)
+
+    def test_existing_extract_cli_saves_native_font_evidence(self):
+        source = self.root / "cli-font-evidence.pdf"
+        make_font_pdf(source)
+        cli = Path(extractor.__file__).with_name("translator.py")
+        initialized = subprocess.run([sys.executable, str(cli), "init", str(source), str(self.job), "--source-language", "en", "--target-language", "zh-CN"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        self.assertEqual(json.loads(initialized.stdout)["state"], "initialized")
+        for role in ("source", "terminology", "translation", "review"):
+            configured = subprocess.run([sys.executable, str(cli), "configure-model", str(self.job), role, "--provider", "openai", "--model", "gpt-5.2"], capture_output=True, text=True, timeout=60)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+        extracted = subprocess.run([sys.executable, str(cli), "extract", str(self.job), "--ocr", "never", "--dpi", "72"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(extracted.returncode, 0, extracted.stderr)
+        output = json.loads(extracted.stdout)
+        self.assert_evidence(output)
+        self.assertEqual({span["font_size"] for span in output["pages"][0]["spans"]}, {12.0, 21.0})
+        self.assertTrue(all(span["font_size_source"] == "native_pdf" for span in output["pages"][0]["spans"]))
+        job = json.loads((self.job / "job.json").read_text(encoding="utf-8"))
+        self.assertEqual((job["state"], job["round"]), ("extracted", 0))
+
 
     def test_margin_labels_are_candidates_not_approved_pagination(self):
         source = self.root / "page-labels.pdf"
@@ -193,8 +338,12 @@ class ExtractTests(unittest.TestCase):
                     self.assertTrue(page["ocr"]["performed"])
                     self.assertIn("SCANNED WORDS", page["ocr"]["text"])
                     self.assertTrue(page["ocr"]["spans"])
+                    for span in page["ocr"]["spans"]:
+                        self.assert_no_source_font(span)
+                        self.assertIsNone(span["font_name"])
                     if mixed:
                         self.assertIn("Native selectable heading", page["text"])
+                        self.assertTrue(all(span["font_size_source"] == "native_pdf" for span in page["spans"]))
                         self.assertNotIn("SCANNED WORDS", page["text"])
 
     def test_always_requests_ocr_even_with_selectable_text(self):
@@ -210,6 +359,8 @@ class ExtractTests(unittest.TestCase):
             self.assertFalse(page["ocr"]["needed"])
             self.assertTrue(page["ocr"]["performed"])
             self.assertIn("Native selectable heading", page["ocr"]["text"])
+            for span in page["ocr"]["spans"]:
+                self.assert_no_source_font(span)
 
     def test_blank_page_does_not_need_auto_ocr(self):
         source = self.root / "blank.pdf"
@@ -228,6 +379,9 @@ class ExtractTests(unittest.TestCase):
         self.assertIn("Native EPUB text", "".join(page["text"] for page in output["pages"]))
         self.assertTrue(any(asset["source"] == "epub:OPS/picture.png" for asset in output["assets"]))
         self.assertTrue(any("not original printed" in warning for warning in output["warnings"]))
+        native_spans = [span for page in output["pages"] for span in page["spans"]]
+        self.assertTrue(native_spans)
+        self.assertTrue(all(span["font_size_source"] == "reflow_layout" for span in native_spans))
         self.assertTrue(zipfile.is_zipfile(self.job / output["input"]["path"]))
 
     def test_mobi_uses_real_native_decoder(self):
@@ -289,6 +443,22 @@ class ExtractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ddjvu.*DjVuLibre"):
             extractor.extract(source, self.job, ocr="never", dpi=72)
 
+    def test_djvu_word_coordinates_do_not_invent_font_calibration(self):
+        raw = b'(page 0 0 600 400 (line 20 50 200 100 (word 20 50 90 100 "Native") (word 100 50 200 100 "words")))\n'
+        directory = self.job / "evidence"
+        directory.mkdir(parents=True)
+        evidence = extractor._Evidence(self.job, directory)
+        with patch.object(extractor, "_run", return_value=raw):
+            text, spans, saved = extractor._djvu_text("djvutxt", self.root / "source.djvu", 1, 300, 200, evidence)
+        self.assertEqual(text, "Native words")
+        self.assertEqual((self.job / saved).read_bytes(), raw)
+        self.assertEqual(spans[0]["bbox"], [10.0, 150.0, 45.0, 175.0])
+        for span in spans:
+            self.assert_no_source_font(span)
+            for key in ("font_name", "block_index", "line_index", "span_index", "line_bbox", "line_direction", "line_wmode"):
+                self.assertIsNone(span[key])
+
+
     def test_actual_djvu_decoder_when_encoder_is_available(self):
         decoder, encoder = shutil.which("ddjvu"), shutil.which("c44")
         if not decoder or not encoder:
@@ -318,6 +488,11 @@ class ExtractTests(unittest.TestCase):
             self.assertEqual(len(native_page["spans"]), 2)
             self.assertTrue((self.job / "hidden" / native_page["native_text_evidence"]).is_file())
             self.assertGreater(native_page["spans"][0]["bbox"][1], 0)
+            for span in native_page["spans"]:
+                self.assert_no_source_font(span)
+                self.assertIsNone(span["font_name"])
+                self.assertIsNone(span["block_index"])
+                self.assertIsNone(span["line_index"])
 
     def test_invalid_policy_and_source_formats_fail(self):
         source = self.root / "source.pdf"

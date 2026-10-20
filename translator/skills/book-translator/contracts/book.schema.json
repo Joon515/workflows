@@ -4,13 +4,25 @@
   "type": "object",
   "properties": {
     "version": {
-      "const": 1,
+      "const": 2,
       "type": "integer"
     },
     "title": {
       "type": "string",
       "minLength": 1,
       "pattern": "\\S"
+    },
+    "main_body_start": {
+      "description": "Immutable ID of the first nonblank main-body block, explicitly selected from source evidence.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+    },
+    "title_terms": {
+      "description": "Translator-selected semantic references into the canonical scalar title, ordered and nonoverlapping. Missing or empty selects no title terms; source-only manuscripts must not contain nonempty spans. Each displayed slice must equal the referenced term's source or target literally.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/titleTerm"
+      }
     },
     "source_pages": {
       "type": "array",
@@ -61,6 +73,7 @@
   "required": [
     "version",
     "title",
+    "main_body_start",
     "source_pages",
     "protected",
     "blocks",
@@ -70,8 +83,63 @@
   ],
   "additionalProperties": false,
   "$defs": {
+    "graphicFit": {
+      "description": "Reviewed output-only uniform artwork scale, never a change to source calibration or paper geometry.",
+      "type": "object",
+      "properties": {
+        "scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "min_scale": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "legibility_evidence": {"type": "string", "minLength": 1, "pattern": "\\S"}
+      },
+      "required": ["scale", "min_scale", "legibility_evidence"],
+      "additionalProperties": false
+    },
+    "titleTerm": {
+      "type": "object",
+      "properties": {
+        "term": {
+          "description": "An existing terminology entry ID; no title text is stored here.",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "start": {
+          "description": "Inclusive Unicode codepoint offset into title.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "description": "Exclusive Unicode codepoint offset into title, greater than start and no greater than the title length.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "term",
+        "start",
+        "end"
+      ],
+      "additionalProperties": false
+    },
     "inline": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "asset": {"type": "string", "minLength": 1},
+                "width_em": {"type": "number", "exclusiveMinimum": 0},
+                "height_em": {"type": "number", "exclusiveMinimum": 0},
+                "raise_em": {"type": "number"}
+              },
+              "required": ["asset", "width_em", "height_em", "raise_em"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["image"],
+          "additionalProperties": false
+        },
         {
           "type": "object",
           "properties": {
@@ -215,6 +283,65 @@
           "type": "string",
           "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
         },
+        "content_type": {
+          "enum": [
+            "prose",
+            "literal"
+          ]
+        },
+        "literal_reason": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "English justification identifying genuine non-prose content, never a prose translation exception."
+        },
+        "restoration": {
+          "description": "Immutable editorial reconstruction of damaged ordinary prose; the original fragment and damage image remain visible in the translated note.",
+          "type": "object",
+          "properties": {
+            "source_page": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"},
+            "original_fragment": {"type": "string", "minLength": 1, "pattern": "\\S"},
+            "replacement": {"type": "string", "minLength": 1, "pattern": "\\S"},
+            "status": {"enum": ["confirmed", "conjectural"]},
+            "evidence": {
+              "type": "string", "minLength": 1, "pattern": "\\S",
+              "description": "English rationale and precise source/witness locators; contextual conjecture must not claim recovery of missing ink."
+            },
+            "damage_asset": {"type": "string", "minLength": 1, "pattern": "\\S"}
+          },
+          "required": ["source_page", "original_fragment", "replacement", "status", "evidence", "damage_asset"],
+          "additionalProperties": false
+        },
+        "source_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "asset": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              },
+              "source_page": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S",
+                "description": "English source evidence including raster placement, original marker coordinates and note association."
+              }
+            },
+            "required": [
+              "asset",
+              "source_page",
+              "description"
+            ],
+            "additionalProperties": false
+          }
+        },
         "source": {
           "type": "array",
           "items": {
@@ -230,10 +357,34 @@
       },
       "required": [
         "id",
+        "content_type",
         "source",
         "target"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "content_type": {
+                "const": "literal"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "literal_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "literal_reason"
+              ]
+            }
+          }
+        }
+      ]
     },
     "block": {
       "oneOf": [
@@ -463,7 +614,10 @@
             "height": {
               "type": "number",
               "exclusiveMinimum": 0
-            }
+            },
+            "fit": {"$ref": "#/$defs/graphicFit"},
+            "source_em": {"type": "number", "exclusiveMinimum": 0, "description": "Verified source text em in the same source units as the image dimensions."},
+            "scale_evidence": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "English source-font calibration evidence including source units."}
           },
           "required": [
             "id",
@@ -473,7 +627,9 @@
             "kind",
             "asset",
             "width",
-            "height"
+            "height",
+            "source_em",
+            "scale_evidence"
           ],
           "additionalProperties": false
         },
@@ -566,7 +722,10 @@
               "type": "number",
               "minimum": 0.2,
               "maximum": 0.8
-            }
+            },
+            "fit": {"$ref": "#/$defs/graphicFit"},
+            "source_em": {"type": "number", "exclusiveMinimum": 0, "description": "Verified source text em in the same source units as the group canvas."},
+            "scale_evidence": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "English source-font calibration evidence including source units."}
           },
           "required": [
             "id",
@@ -578,7 +737,143 @@
             "images",
             "canvas_width",
             "canvas_height",
-            "text_fraction"
+            "text_fraction",
+            "source_em",
+            "scale_evidence"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              }
+            },
+            "source": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/inline"
+              }
+            },
+            "kind": {
+              "const": "list_item"
+            },
+            "list_type": {
+              "enum": [
+                "ordered",
+                "unordered"
+              ]
+            },
+            "list_level": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8
+            },
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
+              "description": "Original literal list marker; not duplicated in inline prose."
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "list_type",
+            "list_level",
+            "label"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+            },
+            "source_pages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+              },
+              "maxItems": 1
+            },
+            "source": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "page": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+                  }
+                },
+                "required": [
+                  "page"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "target": {
+              "type": "array",
+              "minItems": 0,
+              "maxItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "page": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+                  }
+                },
+                "required": [
+                  "page"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "kind": {
+              "const": "blank"
+            },
+            "blank_evidence": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
+              "description": "English source evidence establishing that this one source page is intentionally blank."
+            }
+          },
+          "required": [
+            "id",
+            "source_pages",
+            "source",
+            "target",
+            "kind",
+            "blank_evidence"
           ],
           "additionalProperties": false
         }

@@ -1,5 +1,5 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "book-translator",
-  "description": "A recoverable LaTeX book-translation workflow with source-layout evidence, protected content, terminology provenance, non-OpenAI translation admission and bounded review."
+  "description": "A recoverable LaTeX book-translation workflow with evidence-backed source restoration, protected content, terminology provenance, explicit user-selected role models and bounded review."
 }

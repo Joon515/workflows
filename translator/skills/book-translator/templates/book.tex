@@ -4,26 +4,30 @@
 \newcommand{\BTTop}{@@TOP@@}
 \newcommand{\BTBottom}{@@BOTTOM@@}
 \newcommand{\BTMarkEdge}{@@MARK_EDGE@@}
+\newcommand{\BTBeforeBody}{@@BEFORE_BODY@@}
 \usepackage{translator}
 \AddToHook{shipout/foreground}{%
   \global\advance\BTShipout by1
+  \typeout{BTPAGE|\number\value{page}|\thepage|\leftmark|\rightmark}%
 @@SOURCE_OVERLAYS@@
 }
 \begin{document}
 \begin{center}{\LARGE\bfseries @@TITLE@@\par}\end{center}
-\BTHeading{2}{Agent preface}
-\noindent\BTPosition{preface:start}@@AGENT_PREFACE@@\BTPosition{preface:end}\par
+\BTHeading{2}{preface}{Agent preface}{Agent preface}
+\BTParagraph{preface}{@@AGENT_PREFACE@@}
 \clearpage
 @@HUMAN_PREFACE@@
 @@BODY@@
 \clearpage
-\BTHeading{2}{Terminology}
+\BTHeading{1}{glossary}{@@GLOSSARY_TITLE@@}{@@GLOSSARY_TITLE@@}
+\BTPosition{glossary:start}
 \small
 \newlength{\BTTableWidth}
-\setlength{\BTTableWidth}{\dimexpr\textwidth-8\tabcolsep\relax}
-\begin{longtable}{@{}>{\raggedleft\arraybackslash}p{.07\BTTableWidth} >{\raggedright\arraybackslash}p{.18\BTTableWidth} >{\raggedright\arraybackslash}p{.20\BTTableWidth} >{\raggedright\arraybackslash}p{.45\BTTableWidth} >{\raggedleft\arraybackslash}p{.10\BTTableWidth}@{}}
-\textbf{No.}&\textbf{Source}&\textbf{Target}&\textbf{Authority and decision}&\textbf{Page}\\\hline
+\setlength{\BTTableWidth}{\dimexpr\textwidth-6\tabcolsep\relax}
+\begin{longtable}{@{}>{\raggedleft\arraybackslash\BTTableCell}p{.08\BTTableWidth} >{\raggedright\arraybackslash\BTTableCell}p{.32\BTTableWidth} >{\raggedright\arraybackslash\BTTableCell}p{.34\BTTableWidth} >{\raggedleft\arraybackslash\BTTableCell}p{.26\BTTableWidth}@{}}
+\textbf{@@NUMBER_HEADER@@}&\textbf{@@SOURCE_HEADER@@}&\textbf{@@TARGET_HEADER@@}&\textbf{@@FIRST_PAGE_HEADER@@}\\\hline
 \endhead
 @@TERMS@@
 \end{longtable}
+
 \end{document}
