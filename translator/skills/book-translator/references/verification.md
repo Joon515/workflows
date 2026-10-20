@@ -222,6 +222,8 @@ The native hook/controller bridge is configuration and observed-evidence enforce
 
 [OBSERVED] One ordinary build, without another source/translation task, aggregate replay or consumed finalization, produced PDF SHA256 2e4d88eb5cf2cd77d0b86888e23d59516e6e61aa332f419f2d224ba2c4cf1674. Content digest remained 2deaba33736cde0d72d1cd3c4ab6190811cadc2db6d63dbb4a1827f85e7b9ae7; verification SHA256 d647345f355ee13c3f5a69ec9f961cb1dc4a936b43a8d707f53a9e486bcbd06c records all 11 checks true and no errors. The entire renderer module passed 43 tests, including a consumer-PDF line-edge regression that also verifies a long term still wraps.
 
+[OBSERVED] Complete regression discovery after the marker correction ran 241 tests in 193.065 seconds: 240 passed and the same conditional missing-decoder test skipped. Expected OCR/corrupt-input diagnostics remained visible; no prior behavioral expectation was weakened to obtain this result.
+
 [OBSERVED] MAIN personally inspected all changed physical pages 2, 3 and 8 in Chromium. Marker 12 is raised directly beside the term closing parenthesis on its original line; the surrounding Chinese text, lists and formulas are clear. MAIN independently raster-compared every page against the previously inspected frozen PDF: only pages 2, 3 and 8 changed; pages 1, 4, 5, 6, 7, 9 and 10 are pixel-identical. The corrected exact PDF was then authorized for one fresh whole-role native review of all six source pages and all ten PDF pages, using the existing small-book path rather than repeating three worker contexts. That authorization is not a passing review or whole-book completion.
 
 
