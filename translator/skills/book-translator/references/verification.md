@@ -226,6 +226,8 @@ The native hook/controller bridge is configuration and observed-evidence enforce
 
 [OBSERVED] MAIN personally inspected all changed physical pages 2, 3 and 8 in Chromium. Marker 12 is raised directly beside the term closing parenthesis on its original line; the surrounding Chinese text, lists and formulas are clear. MAIN independently raster-compared every page against the previously inspected frozen PDF: only pages 2, 3 and 8 changed; pages 1, 4, 5, 6, 7, 9 and 10 are pixel-identical. The corrected exact PDF was then authorized for one fresh whole-role native review of all six source pages and all ten PDF pages, using the existing small-book path rather than repeating three worker contexts. That authorization is not a passing review or whole-book completion.
 
+[OBSERVED] The fresh whole-role native reviewer then completed all six source pages and all ten current PDF pages with 79 observed vision-exp child requests, returning pass, all eight checks true and no findings. It explicitly resolved the prior t012 marker finding. Native receipt provenance/review-bfdf225ff3554952a79417e40b3ebe30.json and submitted reviews/round-1.receipt.json bind that exact artifact. Supported review submission and accept succeeded without a rebuild or another source/translation task. MAIN independently ran the status CLI: approved at round 1, output_exists true; output.pdf and build/book.pdf both SHA256 2e4d88eb5cf2cd77d0b86888e23d59516e6e61aa332f419f2d224ba2c4cf1674, matching the personally inspected frozen PDF. This is an accepted ten-page excerpt, not completion or linguistic-quality proof for the separate 603-page book.
+
 
 ## Verification interpretation
 
