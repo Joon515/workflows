@@ -364,8 +364,65 @@ def _positions(aux: str) -> dict:
     return positions
 
 
+def _physical_text_lines(raw_lines: list[dict], em: float, left: float) -> list[dict]:
+    """Merge PDF fragments by their dominant body-glyph baseline, not span origin.
+
+    A span can start with an inferred space at a preceding subscript baseline;
+    even a full-size math operator can have a raised origin. Neither creates a
+    new prose line. Keep the owning line's nonblank glyph bounds, including its
+    inline scripts, while using only its body-baseline glyphs for hanging indents.
+    """
+    physical = []
+    extensions = []
+    for line in raw_lines:
+        by_baseline = {}
+        glyphs, full_size = [], []
+        for span in line["spans"]:
+            for char in span["chars"]:
+                if not char["c"].strip() or char["bbox"][0] < left - .3:
+                    continue
+                glyphs.append(char)
+                if abs(span["size"] - em) < .4:
+                    full_size.append(char)
+                    y = char["origin"][1]
+                    # Extension-font origins can be above all of their ink.
+                    # Such a glyph is not an independent prose baseline.
+                    if char["bbox"][1] >= y - .3:
+                        continue
+                    key = next((value for value in by_baseline if abs(value - y) < .3), y)
+                    by_baseline.setdefault(key, []).append(char)
+        if not by_baseline:
+            if full_size:
+                extensions.append((glyphs, full_size))
+            continue
+        y = max(by_baseline, key=lambda value: len(by_baseline[value]))
+        row = next((item for item in physical if abs(item["baseline"] - y) < .3), None)
+        if row is None:
+            row = {"baseline": y, "body": [], "glyphs": []}
+            physical.append(row)
+        row["body"].extend(full_size)
+        row["glyphs"].extend(glyphs)
+    # A line-start sum may be extracted separately from its following prose.
+    # Rejoin it by actual ink height; do not drop its bounds or hanging x.
+    for glyphs, full_size in extensions:
+        top = min(char["bbox"][1] for char in glyphs)
+        bottom = max(char["bbox"][3] for char in glyphs)
+        candidates = [row for row in physical
+                      if min(bottom, max(char["bbox"][3] for char in row["glyphs"])) >
+                      max(top, min(char["bbox"][1] for char in row["glyphs"])) + .5]
+        if candidates:
+            row = min(candidates, key=lambda item: abs(item["baseline"] - (top + bottom) / 2))
+        else:
+            row = {"baseline": full_size[0]["origin"][1], "body": [], "glyphs": []}
+            physical.append(row)
+        row["body"].extend(full_size)
+        row["glyphs"].extend(glyphs)
+    return sorted(physical, key=lambda item: item["baseline"])
+
+
 def _layout_evidence(document, manifest: dict, log: str, positions: dict, geometry: dict, fail) -> tuple[list, list]:
     """Check physical-side headers and real PDF paragraph/list glyph placement."""
+    import pymupdf
 
     normalize = lambda text: "".join(text.split())
     epoch = positions.get("mainbody:start")
@@ -377,9 +434,14 @@ def _layout_evidence(document, manifest: dict, log: str, positions: dict, geomet
     top = layout["top_mm"] * PT_PER_MM
     bottom = document[0].rect.height - layout["bottom_mm"] * PT_PER_MM
     lines = {}
+    glyph_lines = {}
     for number, page in enumerate(document, 1):
         lines[number] = [line for block in page.get_text("dict")["blocks"]
                          for line in block.get("lines", []) if line["spans"]]
+        # Font-wide ascenders put extension glyphs above their real outlines.
+        raw = page.get_text("rawdict", flags=(pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES) |
+                            pymupdf.TEXT_ACCURATE_BBOXES)
+        glyph_lines[number] = [line for block in raw["blocks"] for line in block.get("lines", [])]
     rows = {int(page): (folio, chapter.strip(), section.strip())
             for page, folio, chapter, section in re.findall(r"BTPAGE\|(\d+)\|([^|\n]*)\|([^|\n]*)\|([^\n]*)", log)}
     headings = []
@@ -484,16 +546,13 @@ def _layout_evidence(document, manifest: dict, log: str, positions: dict, geomet
         if not first_spans and start["y_from_bottom_pt"] != end["y_from_bottom_pt"]:
             fail("typography", f"Paragraph/list {key} has no actual PDF glyphs at its measured first baseline")
         continuation = []
+        physical_lines = _physical_text_lines(glyph_lines[number], em, left)
         if block["kind"] == "list_item" and start["page"] == end["page"]:
             last_baseline = document[number - 1].rect.height - end["y_from_bottom_pt"]
-            baselines = {}
-            for line in lines[number]:
-                for span in line["spans"]:
-                    y = span["origin"][1]
-                    if abs(span["size"] - em) < .4 and span["bbox"][0] >= left - .3 and baseline + .7 * em < y <= last_baseline + .4:
-                        baselines.setdefault(round(y, 1), []).append(span["origin"][0])
-            for values in baselines.values():
-                x = min(values)
+            for line in physical_lines:
+                if not baseline + .7 * em < line["baseline"] <= last_baseline + .4:
+                    continue
+                x = min(char["origin"][0] for char in line["body"])
                 continuation.append(x)
                 if abs(x - start["x_pt"]) > .5:
                     fail("typography", f"List {key} continuation does not hang beneath its text")
@@ -506,15 +565,11 @@ def _layout_evidence(document, manifest: dict, log: str, positions: dict, geomet
         line_boxes = []
         if start["page"] == end["page"]:
             last_baseline = document[number - 1].rect.height - end["y_from_bottom_pt"]
-            by_baseline = {}
-            for line in lines[number]:
-                for span in line["spans"]:
-                    y = span["origin"][1]
-                    if abs(span["size"] - em) < .4 and baseline - .3 <= y <= last_baseline + .3 and span["bbox"][0] >= left - .3:
-                        by_baseline.setdefault(round(y, 1), []).append(span["bbox"])
-            line_boxes = [[min(box[0] for box in boxes), min(box[1] for box in boxes),
-                           max(box[2] for box in boxes), max(box[3] for box in boxes)]
-                          for _, boxes in sorted(by_baseline.items())]
+            for line in physical_lines:
+                if baseline - .3 <= line["baseline"] <= last_baseline + .3:
+                    boxes = [char["bbox"] for char in line["glyphs"]]
+                    line_boxes.append([min(box[0] for box in boxes), min(box[1] for box in boxes),
+                                       max(box[2] for box in boxes), max(box[3] for box in boxes)])
             if any(following[1] < previous[3] - .5 for previous, following in zip(line_boxes, line_boxes[1:])):
                 fail("typography", f"Paragraph/list {key} actual PDF glyph lines overlap")
         typography.append({"id": block["id"], "kind": block["kind"], "font_em_pt": em, "start": start, "end": end,

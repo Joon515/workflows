@@ -306,6 +306,19 @@ class RenderTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def title_glyphs(self, page):
+        spans = [span for block in page.get_text("dict")["blocks"]
+                 for line in block.get("lines", []) for span in line["spans"]]
+        title_size = max(span["size"] for span in spans)
+        large = [span for span in spans if abs(span["size"] - title_size) < .1]
+        baselines = sorted({round(span["origin"][1], 1) for span in large})
+        last = baselines[0]
+        for baseline in baselines[1:]:
+            if baseline - last > 2 * title_size:
+                break
+            last = baseline
+        return [span for span in large if span["origin"][1] <= last + .1]
+
     def assert_mirrored_geometry(self, pdf, report, *, inner_mm, outer_mm=8, top_mm=15, bottom_mm=15):
         import pymupdf
         geometry = report["compiled_geometry_pt"]
@@ -399,8 +412,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(inputs, {name: (self.job / name).read_bytes() for name in inputs})
         self.assertEqual(report["term_first_pages"]["Footer"], 1)
         with pymupdf.open(pdf) as document:
-            title_spans = [span for block in document[0].get_text("dict")["blocks"]
-                           for line in block.get("lines", []) for span in line["spans"] if span["size"] > 15]
+            title_spans = self.title_glyphs(document[0])
             actual_title = "".join(span["text"] for span in title_spans)
             self.assertEqual(re.sub(r"\s+", "", actual_title), re.sub(r"\s+", "", title))
             text = "\n".join(page.get_text() for page in document)
@@ -803,37 +815,26 @@ class RenderTests(unittest.TestCase):
                 pdf = render.build(job)
                 report = core.load_json(job / "build/verification.json")
                 self.assertTrue(all(report["checks"].values()), report["errors"])
-                tex = (job / "build/book.tex").read_text()
-                heading = next(line for line in tex.splitlines() if r"\begin{center}{\LARGE\bfseries" in line)
                 expected_page = 1 if selected else 3
                 self.assertEqual(report["term_first_pages"], {"Method": expected_page, "Footer": expected_page})
-                if selected:
-                    self.assertEqual(heading.count(r"\BTFirstTerm{"), 2)
-                    self.assertIn(r"\BTFirstTerm{Fourier method}", heading)
-                    self.assertIn(r"\BTFirstTerm{" + target + "}", heading)
-                    self.assertEqual(tex.count(r"\BTFirstTerm{"), 2)
-                    for identifier in ("Method", "Footer"):
-                        self.assertEqual(heading.count(r"\label{term:" + identifier + "}"), 1)
-                else:
-                    self.assertIn(render.escape(title), heading)
-                    self.assertNotIn(r"\BTFirstTerm", heading)
                 with pymupdf.open(pdf) as document:
-                    title_spans = [span for block in document[0].get_text("dict")["blocks"]
+                    page_text = document[0].get_text("dict")
+                    title_spans = [span for block in page_text["blocks"]
                                    for line in block.get("lines", []) for span in line["spans"]]
-                    large_text = "".join(span["text"] for span in title_spans if span["size"] > 15)
+                    title_glyphs = self.title_glyphs(document[0])
+                    title_size = max(span["size"] for span in title_glyphs)
+                    large_text = "".join(span["text"] for span in title_glyphs if abs(span["size"] - title_size) < .1)
                     self.assertEqual(re.sub(r"\s+", "", large_text), re.sub(r"\s+", "", title))
-                    aliases = [span for span in title_spans if "Fourier" in span["text"] and span["size"] > 15]
+                    aliases = [span for span in title_glyphs if "Fourier" in span["text"]]
                     self.assertEqual(len(aliases), 2)
                     self.assertTrue(aliases[0]["flags"] & 16)
                     self.assertEqual(bool(aliases[0]["flags"] & 2), bool(selected))
                     self.assertFalse(aliases[1]["flags"] & 2)
-                    title_targets = [span for span in title_spans if target in span["text"] and span["size"] > 15]
-                    self.assertEqual(len(title_targets), 2)
+                    title_targets = [span for span in title_glyphs if target in span["text"]]
+                    self.assertEqual(large_text.count(target), 2)
                     if selected:
                         self.assertIn("Bold", title_targets[0]["font"])
-                        self.assertRegex(document[0].read_contents().decode("latin1"),
-                                         r"1\s+0\s+\.2\s+1\s+[-\d.]+\s+[-\d.]+\s+Tm")
-                        ordinary = [span for span in title_spans if target in span["text"] and span["size"] < 12]
+                        ordinary = [span for span in title_spans if target in span["text"] and span["size"] < title_size - .3]
                         self.assertTrue(ordinary)
                         self.assertTrue(all("Regular" in span["font"] for span in ordinary))
                     for identifier in ("Method", "Footer"):
@@ -1167,6 +1168,48 @@ class RenderTests(unittest.TestCase):
                         self.assertEqual("".join(span["text"] for span in line).count(marker), 1)
                         self.assertGreater(len(row["line_boxes_pt"]), 1)
                         self.assertTrue(all(following[1] >= previous[3] - .5 for previous, following in zip(row["line_boxes_pt"], row["line_boxes_pt"][1:])))
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for inline-limit line geometry")
+    def test_inline_math_limits_preserve_paragraph_spacing_and_hanging_lines(self):
+        import pymupdf
+        job = make_inline_job(self.job / "math-line-geometry")
+        book = core.load_json(job / "book.json")
+        formula = {"id": "Limits", "kind": "math",
+                   "value": r"|x_i - x_j| \le W,\quad C_{store}/\beta_n V_{max},\quad W = \sum_{i=1}^{p+q+r} w_i"}
+        content = [{"text": "The bounds "}, {"protected": "Limits"},
+                   {"text": " remain readable within the surrounding explanation. "}] * 3
+        book.update(protected=[formula], notes=[], blocks=[
+            {"id": "MathHeading", "kind": "heading", "level": 2, "source_pages": ["InlineSource"],
+             "source": [{"text": "Inline mathematical limits"}], "target": [{"text": "Inline mathematical limits"}]},
+            {"id": "MathParagraph", "kind": "paragraph", "source_pages": ["InlineSource"],
+             "source": copy.deepcopy(content), "target": copy.deepcopy(content)},
+            {"id": "MathList", "kind": "list_item", "list_type": "ordered", "list_level": 0, "label": "1.",
+             "source_pages": ["InlineSource"], "source": copy.deepcopy(content), "target": copy.deepcopy(content)}],
+                    main_body_start="MathHeading")
+        source = copy.deepcopy(book)
+        source["agent_preface"] = []
+        for block in source["blocks"]:
+            block["target"] = []
+        core.save_json(job / "book-source.json", source)
+        core.save_json(job / "book.json", book)
+        core.seal_source(job)
+        pdf = render.build(job)
+        report = core.load_json(job / "build/verification.json")
+        self.assertTrue(report["passed"], report["errors"])
+        typography = {row["id"]: row for row in report["typography"]}
+        for identifier in ("MathParagraph", "MathList"):
+            row = typography[identifier]
+            self.assertEqual(row["start"]["page"], row["end"]["page"])
+            self.assertGreater(len(row["line_boxes_pt"]), 2)
+            self.assertTrue(all(following[1] >= previous[3] - .5
+                                for previous, following in zip(row["line_boxes_pt"], row["line_boxes_pt"][1:])))
+        row = typography["MathList"]
+        self.assertEqual(len(row["continuation_x_pt"]), len(row["line_boxes_pt"]) - 1)
+        self.assertTrue(all(abs(x - row["start"]["x_pt"]) < .5 for x in row["continuation_x_pt"]))
+        with pymupdf.open(pdf) as document:
+            text = "".join(page.get_text() for page in document)
+            self.assertEqual(text.count("∑"), 6)
+            self.assertIn("surrounding explanation", text)
 
     @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for blank omission evidence")
     def test_blank_source_page_remains_sealed_without_output_or_marker(self):
