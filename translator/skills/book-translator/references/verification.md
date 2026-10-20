@@ -202,7 +202,7 @@ The native hook/controller bridge is configuration and observed-evidence enforce
 
 [OBSERVED] Before preparing the complete book for this workflow, its original job and untrusted manuscript were copied into evidence/debug-before-unit-repair-20261020. Original PDF, extraction and manuscript SHA256 values remained unchanged through model configuration and planning. The explicit selected model was recorded for all four roles, and all 603 pages were planned as 76 pending units; no old receipt was relabeled as current unit work. Planning is not proofreading, translation or book completion.
 
-## Actual hosted authoring and typography recovery
+## Actual hosted authoring and geometry-stage recovery
 
 [OBSERVED] The authorized six-page excerpt continued through ordinary native terminology (73 child requests) and three translation units (45, 25 and 35 child requests), all on opencode-go/deepseek-v4-flash-vision-exp. Their artifacts and exact native proofs were admitted without rerunning source work. Translation aggregate authoring was durable before the first actual composition attempt failed glyph-line overlap and hanging-indent checks; the job remained terminology_ready at round 0. The failed ten-page PDF SHA256 was 84a47a1687e3575acd1c5be931e1414c9d3bd92d660d36c879c069de438ddc2c. This was not a passing build or released translation.
 
@@ -213,6 +213,17 @@ The native hook/controller bridge is configuration and observed-evidence enforce
 [OBSERVED] The complete renderer module passed all 42 tests, including the new English inline-math paragraph/list regression and retained true-overlap and hanging-indent negative controls. Incidental TeX-size/matrix assumptions were removed rather than repinned; complete observed PDF title, alias, styling and reference behavior remain asserted. Complete regression discovery after the final typography repair ran 240 tests in 192.414 seconds: 239 passed and the same conditional missing-decoder test skipped. No OCR/corrupt-input diagnostics were suppressed.
 
 [OBSERVED] Native review was authorized only after this exact final PDF was frozen and MAIN approved its actual layout. Review and release outcomes are separate from typography approval; do not infer a passing review or output.pdf from the build result. The complete 603-page book remains a distinct, pending operational task until its own source, translation, review and visual verification complete.
+
+## Genuine native review and first-use marker attachment
+
+[OBSERVED] Three real native review units inspected the frozen ten-page PDF 4f518463e5dfd1d431787b75819a0f31dc11ba30cd38831dc82132a45d64b17a with 75, 81 and 55 child provider requests. Their aggregate requested changes for one minor typography finding: physical PDF page 3, paragraph u0001_b002, first-use marker 12 for term t012 had wrapped to the next line instead of remaining beside the term. All seven other review checks passed. No acceptance or output.pdf was produced. The original PDF, report, aggregate/native evidence and review units were preserved before any corrective build; the report was not relabeled as a passing review. Requested medium ceilings produced inspected effective low metadata, not max effort.
+
+[SOURCE] The canonical first-term macro now owns both term text and its marker, applying the CJK closing-punctuation no-break rule locally and boxing only the superscript in its surrounding font. Long terms remain breakable. All renderer callers use the two-argument macro; no alternate marker path, whole-term box, body-font change or relaxed geometry gate was added.
+
+[OBSERVED] One ordinary build, without another source/translation task, aggregate replay or consumed finalization, produced PDF SHA256 2e4d88eb5cf2cd77d0b86888e23d59516e6e61aa332f419f2d224ba2c4cf1674. Content digest remained 2deaba33736cde0d72d1cd3c4ab6190811cadc2db6d63dbb4a1827f85e7b9ae7; verification SHA256 d647345f355ee13c3f5a69ec9f961cb1dc4a936b43a8d707f53a9e486bcbd06c records all 11 checks true and no errors. The entire renderer module passed 43 tests, including a consumer-PDF line-edge regression that also verifies a long term still wraps.
+
+[OBSERVED] MAIN personally inspected all changed physical pages 2, 3 and 8 in Chromium. Marker 12 is raised directly beside the term closing parenthesis on its original line; the surrounding Chinese text, lists and formulas are clear. MAIN independently raster-compared every page against the previously inspected frozen PDF: only pages 2, 3 and 8 changed; pages 1, 4, 5, 6, 7, 9 and 10 are pixel-identical. The corrected exact PDF was then authorized for one fresh whole-role native review of all six source pages and all ten PDF pages, using the existing small-book path rather than repeating three worker contexts. That authorization is not a passing review or whole-book completion.
+
 
 ## Verification interpretation
 

@@ -306,6 +306,61 @@ class RenderTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for term-marker attachment")
+    def test_first_use_superscript_stays_with_wrapping_term_tail(self):
+        import pymupdf
+        job = make_inline_job(self.job / "term-marker-attachment")
+        book = core.load_json(job / "book.json")
+        book.update(protected=[], notes=[], main_body_start="MarkerHeading", blocks=[
+            {"id": "MarkerHeading", "kind": "heading", "level": 2, "source_pages": ["InlineSource"],
+             "source": [{"text": "Synthetic marker attachment"}], "target": [{"text": "Synthetic marker attachment"}]}])
+        terms = []
+        for index, prefix_length in enumerate((17, 18, 19, 20, 21, 0)):
+            identifier = "Marker" + str(index)
+            target = ("\u8fd9\u662f\u5408\u6210\u4e13\u7528\u672f\u8bed\uff08VDSM\uff09" if prefix_length else "\u4e59" * 50 + "\u672b")
+            prefix = "A " * prefix_length
+            terms.append({"id": identifier, "number": index + 12, "source": "Synthetic marker case " + str(index),
+                          "target": target, "authority": "Synthetic typography fixture", "authority_locator": "Fixture only",
+                          "rationale": "Exercise line-edge marker attachment without boxing the term.", "protected_ids": []})
+            book["blocks"].append({"id": identifier, "kind": "paragraph", "source_pages": ["InlineSource"],
+                                   "source": [{"text": prefix + target + " Marker remains attached."}],
+                                   "target": [{"text": prefix}, {"term": identifier}, {"text": " Marker remains attached."}]})
+        source = copy.deepcopy(book)
+        source["agent_preface"] = []
+        for block in source["blocks"]:
+            block["target"] = []
+        core.save_json(job / "book-source.json", source)
+        core.save_json(job / "book.json", book)
+        core.save_json(job / "terms.json", {"version": 1, "terms": terms})
+        core.seal_source(job)
+        pdf = render.build(job)
+        report = core.load_json(job / "build/verification.json")
+        self.assertTrue(report["passed"], report["errors"])
+        typography = {row["id"]: row for row in report["typography"]}
+        with pymupdf.open(pdf) as document:
+            for term in terms:
+                with self.subTest(term=term["id"]):
+                    row = typography[term["id"]]
+                    self.assertEqual(row["start"]["page"], row["end"]["page"])
+                    page = document[row["start"]["page"] - 1]
+                    first = page.rect.height - row["start"]["y_from_bottom_pt"]
+                    last = page.rect.height - row["end"]["y_from_bottom_pt"]
+                    em = row["font_em_pt"]
+                    chars = [(char, span) for block in page.get_text("rawdict")["blocks"]
+                             for line in block.get("lines", []) for span in line["spans"] for char in span["chars"]
+                             if first - .3 <= char["origin"][1] <= last + .3 and "Bold" in span["font"]]
+                    tails = [char for char, span in chars if char["c"] == term["target"][-1] and abs(span["size"] - em) < .1]
+                    self.assertEqual(len(tails), 1)
+                    tail = tails[0]
+                    markers = [span for block in page.get_text("dict")["blocks"]
+                               for line in block.get("lines", []) for span in line["spans"]
+                               if span["text"] == str(term["number"]) and span["size"] < em - .5
+                               and -.3 < span["origin"][0] - tail["origin"][0] < 2 * em
+                               and .1 < tail["origin"][1] - span["origin"][1] < em]
+                    self.assertEqual(len(markers), 1, "The superscript must be raised beside the term tail, never on the next line")
+                    if term is terms[-1]:
+                        self.assertGreater(len({round(char["origin"][1], 1) for char, _ in chars}), 1)
+
     def title_glyphs(self, page):
         spans = [span for block in page.get_text("dict")["blocks"]
                  for line in block.get("lines", []) for span in line["spans"]]

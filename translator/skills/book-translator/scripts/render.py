@@ -116,7 +116,7 @@ class _Renderer:
         if identifier in self.seen_terms:
             return text
         self.seen_terms.add(identifier)
-        return (r"\BTFirstTerm{" + text + r"}\textsuperscript{" + str(term["number"]) +
+        return (r"\BTFirstTerm{" + text + "}{" + str(term["number"]) +
                 r"}\BTPosition{term:" + identifier + r"}\label{term:" + identifier + "}")
 
     def title_text(self) -> str:

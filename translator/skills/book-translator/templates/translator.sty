@@ -6,7 +6,9 @@
 \RequirePackage[bottom,splitrule]{footmisc}
 \RequirePackage{zref-savepos,zref-abspage}
 \setCJKfamilyfont{BTTerm}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolSong-Bold.otf,BoldItalicFont=FandolSong-Bold.otf,FakeSlant=0.2]{FandolSong-Bold.otf}
-\newcommand{\BTFirstTerm}[1]{\textbf{\textit{\CJKfamily{BTTerm}#1}}}
+\newcommand{\BTFirstTerm}[2]{%
+  \begingroup\xeCJKsetup{CheckFullRight=true}\sbox{\BTTempBox}{\textsuperscript{#2}}%
+  \textbf{\textit{\CJKfamily{BTTerm}#1\nobreak\usebox{\BTTempBox}}}\endgroup}
 \setlength{\parindent}{2em}
 \setlength{\parskip}{3pt}
 \setlength{\emergencystretch}{1em}
