@@ -179,7 +179,7 @@ def _source_model_change(previous: dict, current: dict) -> dict:
     return selected
 
 
-def _translation_replan_context(plan: dict, previous: dict) -> None:
+def _translation_replan_context(plan: dict, previous: dict, *, allow_same_bound: bool = False) -> None:
     unchanged = ("role", "job_path", "job_sha256", "base_state", "base_round", "revision", "selected_model",
                  "source_file_sha256", "source_digest", "baseline", "extraction_sha256", "page_ids", "pages",
                  "max_context_pages", "draft", "build", "pdf_page_ids", "readiness", "review_artifacts")
@@ -187,9 +187,10 @@ def _translation_replan_context(plan: dict, previous: dict) -> None:
             or plan.get("base_state") not in {"terminology_ready", "changes_requested"}
             or plan.get("revision") is not False or plan.get("source_digest") is None
             or type(plan.get("pages_per_unit")) is not int or type(previous.get("pages_per_unit")) is not int
-            or not 1 <= plan["pages_per_unit"] < previous["pages_per_unit"] <= 8
+            or not 1 <= plan["pages_per_unit"] <= previous["pages_per_unit"] <= 8
+            or (plan["pages_per_unit"] == previous["pages_per_unit"] and not allow_same_bound)
             or any(plan.get(name) != previous.get(name) for name in unchanged)):
-        raise ValueError("Pending translation replan changed bound book/model/readiness inputs or did not reduce its target")
+        raise ValueError("Translation plan changed bound book/model/readiness inputs or its permitted page-bound relation")
 
 
 def _plan_inputs(job: Path, plan: dict) -> None:
@@ -219,6 +220,8 @@ def _plan_inputs(job: Path, plan: dict) -> None:
             raise ValueError("Invalid pending translation replan link")
         previous = _checked(job, pending_replan["plan"], pending_replan["plan_sha256"])
         _translation_replan_context(plan, previous)
+    if plan.get("translation_reopen") is not None:
+        _translation_reopen_inputs(job, plan)
 
 
 
@@ -383,16 +386,30 @@ def _assign_ownership(draft: dict, declarations: dict, unit_specs: list, page_or
     return block_owners, note_owners, protected_users, metadata_owner
 
 
+def _translation_ownership(draft: dict, declarations: dict, plan: dict, page_order: dict) -> tuple:
+    expected = [{"unit_id": spec["unit_id"], "owned_pages": spec["owned_pages"], "owned_block_ids": [],
+                 "owned_note_ids": [], "owned_protected_ids": []} for spec in plan["units"]]
+    ownership = _assign_ownership(draft, declarations, expected, page_order)
+    if (ownership[3] != plan["metadata_owner"]
+            or any(any(check[key] != original[key] for key in
+                       ("owned_block_ids", "owned_note_ids", "owned_protected_ids"))
+                   for check, original in zip(expected, plan["units"]))):
+        raise ValueError("Active translation plan differs from canonical block/note/protected ownership")
+    return ownership
+
+
 def _prepare_pending_translation(job: Path, pages_per_unit: int, max_context_pages: int,
-                                 readiness: dict) -> tuple[dict, dict, dict]:
+                                 readiness: dict, *, reduce_pending: bool = True) -> tuple[dict, dict, dict]:
     path, previous, digest = _current_plan(job, "translation")
     _stable_context(job, previous)
     if (previous["revision"] or previous["source_digest"] is None
             or previous["base_state"] not in {"terminology_ready", "changes_requested"}
             or previous.get("readiness") != readiness or previous["max_context_pages"] != max_context_pages):
         raise ValueError("Pending translation replanning requires unchanged stage readiness and context")
-    if type(previous["pages_per_unit"]) is not int or not 1 <= pages_per_unit < previous["pages_per_unit"] <= 8:
-        raise ValueError("Pending translation replanning must strictly reduce pages_per_unit")
+    if (type(previous["pages_per_unit"]) is not int or not 1 <= pages_per_unit <= previous["pages_per_unit"] <= 8
+            or (reduce_pending and pages_per_unit == previous["pages_per_unit"])
+            or (not reduce_pending and pages_per_unit != previous["pages_per_unit"])):
+        raise ValueError("Pending replanning must strictly reduce its bound; reopening must keep the active page bound")
     specs = previous["units"]
     ids = [spec["unit_id"] for spec in specs]
     owned = [page for spec in specs for page in spec["owned_pages"]]
@@ -417,13 +434,116 @@ def _prepare_pending_translation(job: Path, pages_per_unit: int, max_context_pag
                 "path": spec["checkpoint"], "sha256": _hash(checkpoint_path)}}
         else:
             _packet_inputs(job, packet)
-    if len(carried) == len(specs):
+    if reduce_pending and len(carried) == len(specs):
         raise ValueError("No pending translation units remain to replan")
     return {"plan": _relative(job, path), "plan_sha256": digest}, previous, carried
 
 
+def _translation_reopen_ids(value) -> list[str]:
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(unit, str) or not unit.strip() for unit in value)
+            or len(set(value)) != len(value)):
+        raise ValueError("Translation reopening requires unique nonblank string unit IDs")
+    return list(value)
+
+
+def _translation_reopen_inputs(job: Path, plan: dict) -> None:
+    link = plan["translation_reopen"]
+    if (not isinstance(link, dict) or set(link) != {"plan", "plan_sha256", "reopened", "prior_checkpoints"}
+            or plan.get("pending_replan") is not None):
+        raise ValueError("Invalid explicit translation reopening link")
+    reopened = _translation_reopen_ids(link["reopened"])
+    previous = _checked(job, link["plan"], link["plan_sha256"])
+    _translation_replan_context(plan, previous, allow_same_bound=True)
+    ignored_plan = {"plan_id", "units", "pending_replan", "translation_reopen"}
+    if (plan["pages_per_unit"] != previous["pages_per_unit"] or plan["base_state"] != "terminology_ready"
+            or plan["base_round"] != 0 or plan["plan_id"] == previous["plan_id"]
+            or {key: value for key, value in plan.items() if key not in ignored_plan}
+                != {key: value for key, value in previous.items() if key not in ignored_plan}
+            or [spec["unit_id"] for spec in plan["units"]] != [spec["unit_id"] for spec in previous["units"]]
+            or not isinstance(link["prior_checkpoints"], dict) or set(link["prior_checkpoints"]) != set(reopened)):
+        raise ValueError("Translation reopening changed its bound, authority, scope or immutable inputs")
+    originals = {spec["unit_id"]: spec for spec in previous["units"]}
+    if not set(reopened) <= set(originals):
+        raise ValueError("Translation reopening names an unknown prior unit")
+    directory = _path(job, f"units/translation/{plan['plan_id']}")
+    for spec in plan["units"]:
+        original = originals[spec["unit_id"]]
+        ignored = {"carried_checkpoint"}
+        if spec["unit_id"] in reopened:
+            ignored |= {"result", "assets_dir", "checkpoint"}
+            reference = link["prior_checkpoints"][spec["unit_id"]]
+            if (not isinstance(reference, dict) or set(reference) != {"path", "sha256"}
+                    or reference["path"] != original["checkpoint"] or "carried_checkpoint" in spec):
+                raise ValueError("Reopened translation unit lacks its exact original checkpoint reference")
+            prior = _checked(job, reference["path"], reference["sha256"])
+            if (prior.get("kind") != "book-unit-checkpoint" or prior.get("completed") is not True
+                    or prior.get("role") != "translation" or prior.get("unit_id") != spec["unit_id"]
+                    or any(prior.get(key) != original[key] for key in ("packet", "packet_sha256", "result"))):
+                raise ValueError("Reopened translation origin is not its completed original unit")
+            paths = {"result": directory / "results" / f"{spec['unit_id']}.json",
+                     "assets_dir": directory / "assets" / spec["unit_id"],
+                     "checkpoint": directory / "checkpoints" / f"{spec['unit_id']}.json"}
+            if any(spec[key] == original[key] or spec[key] != _relative(job, path) for key, path in paths.items()):
+                raise ValueError("Only reopened translation units may receive fresh assigned output paths")
+        elif original.get("carried_checkpoint") is not None and spec.get("carried_checkpoint") != original["carried_checkpoint"]:
+            raise ValueError("Unaffected translation checkpoint reference changed")
+        if ({key: value for key, value in spec.items() if key not in ignored}
+                != {key: value for key, value in original.items() if key not in ignored}):
+            raise ValueError("Translation reopening changed IDs, packet, ownership or unaffected output paths")
+
+
+def _reopen_translation(job: Path, pages_per_unit: int, max_context_pages: int,
+                        readiness: dict, reopen_units: list[str]) -> dict:
+    reopened = _translation_reopen_ids(reopen_units)
+    data = _job(job)
+    if (data["state"] != "terminology_ready" or data["round"] != 0 or data["round"] >= data["max_rounds"]
+            or any(event.get("event") in {"translation_content_authored", "stage_translation"} for event in data["history"])):
+        raise ValueError("Translation reopening requires initial prebuild terminology_ready round 0 without complete authoring")
+    pointer, previous, carried = _prepare_pending_translation(
+        job, pages_per_unit, max_context_pages, readiness, reduce_pending=False)
+    if any(event.get("unit_plan") == pointer["plan"] for event in data["history"]):
+        raise ValueError("Translation plan already consumed; completed authoring cannot be reopened here")
+    if not set(reopened) <= set(carried):
+        raise ValueError("Only known completed translation checkpoints may be explicitly reopened")
+    draft = core.load_json(job / "book-source.json")
+    declarations = {name: {item["id"]: item for item in draft[name]} for name in ("blocks", "notes", "protected")}
+    _translation_ownership(draft, declarations, previous, {page: index for index, page in enumerate(previous["page_ids"])})
+    identifier = uuid.uuid4().hex
+    directory = _path(job, f"units/translation/{identifier}")
+    if directory.exists():
+        raise ValueError("Fresh translation reopening directory already exists")
+    specs = []
+    for original in previous["units"]:
+        if original["unit_id"] in reopened:
+            spec = {key: value for key, value in original.items() if key != "carried_checkpoint"}
+            spec.update(result=_relative(job, directory / "results" / f"{spec['unit_id']}.json"),
+                        assets_dir=_relative(job, directory / "assets" / spec["unit_id"]),
+                        checkpoint=_relative(job, directory / "checkpoints" / f"{spec['unit_id']}.json"))
+        else:
+            spec = dict(carried.get(original["unit_id"], original))
+        specs.append(spec)
+    plan = {key: value for key, value in previous.items() if key not in {"pending_replan", "translation_reopen"}}
+    plan.update(plan_id=identifier, units=specs,
+                translation_reopen={**pointer, "reopened": reopened,
+                                    "prior_checkpoints": {unit: carried[unit]["carried_checkpoint"] for unit in reopened}})
+    _translation_reopen_inputs(job, plan)
+    destination = directory / "plan.json"
+    _write_once(destination, plan)
+    new_pointer = {"plan": _relative(job, destination), "plan_sha256": _hash(destination)}
+    _stable_context(job, previous)
+    _plan_inputs(job, plan)
+    origins = {}
+    for spec in specs:
+        if spec.get("carried_checkpoint") is not None:
+            _member_checkpoint(job, plan, new_pointer["plan"], new_pointer["plan_sha256"], spec, origins)
+    core.save_json(job / "units/translation/active.json", new_pointer)
+    return {**new_pointer, "role": "translation", "units": [spec["unit_id"] for spec in specs], "pages": len(plan["page_ids"])}
+
+
 def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
-                max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False) -> dict:
+                max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False,
+                reopen_units: list[str] | None = None) -> dict:
     """Snapshot bounded page evidence and untrusted draft slices without admission.
 
     A complete block belongs to its first source page's unit. Notes follow their
@@ -439,6 +559,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         raise ValueError("Controller must supply admitted readiness bindings for translation/review planning")
     if replan_pending and (role != "translation" or draft_path is not None or revise):
         raise ValueError("Pending replanning requires translation without draft import or revision")
+    if reopen_units is not None and (role != "translation" or draft_path is not None or revise or replan_pending):
+        raise ValueError("Translation reopening requires translation without pending resize, draft import or revision")
     data = _job(job)
     if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
            for name in ("source", "terminology", "translation", "review")):
@@ -456,6 +578,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         core.validate_document("terms", core.load_json(job / "terms.json"))
         if not (job / "handoff.md").read_text(encoding="utf-8").strip():
             raise ValueError("Translation units require a substantive terminology handoff")
+    if reopen_units is not None:
+        return _reopen_translation(job, pages_per_unit, max_context_pages, readiness, reopen_units)
     pending_replan, previous, carried = None, None, {}
     if replan_pending:
         pending_replan, previous, carried = _prepare_pending_translation(job, pages_per_unit, max_context_pages, readiness)
@@ -509,14 +633,7 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
     else:
         if page_ids != previous["page_ids"]:
             raise ValueError("Original page inventory changed before pending replanning")
-        expected = [{"unit_id": spec["unit_id"], "owned_pages": spec["owned_pages"], "owned_block_ids": [],
-                     "owned_note_ids": [], "owned_protected_ids": []} for spec in previous["units"]]
-        old_ownership = _assign_ownership(draft, declarations, expected, page_order)
-        if (old_ownership[3] != previous["metadata_owner"]
-                or any(any(check[key] != original[key] for key in
-                           ("owned_block_ids", "owned_note_ids", "owned_protected_ids"))
-                       for check, original in zip(expected, previous["units"]))):
-            raise ValueError("Active translation plan differs from canonical block/note/protected ownership")
+        old_ownership = _translation_ownership(draft, declarations, previous, page_order)
         completed_pages = {page for spec in carried.values() for page in spec["owned_pages"]}
         new_groups = []
         for offset in range(0, len(page_ids), pages_per_unit):
@@ -634,8 +751,13 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         for spec in previous["units"]:
             if spec["unit_id"] in carried:
                 continue
-            expected_packet = packet_for(spec, previous["plan_id"], previous["pages"], old_ownership)
-            if _checked(job, spec["packet"], spec["packet_sha256"]) != expected_packet:
+            actual_packet = _checked(job, spec["packet"], spec["packet_sha256"])
+            expected_packet = packet_for(spec, actual_packet["plan_id"], previous["pages"], old_ownership)
+            if previous.get("translation_reopen") is not None and actual_packet["plan_id"] != previous["plan_id"]:
+                # The validated parent/packet hashes bind these historical read-only labels.
+                for field in ("context_block_owners", "context_note_owners"):
+                    expected_packet[field] = actual_packet[field]
+            if actual_packet != expected_packet:
                 raise ValueError("Pending packet differs from canonical source/context/terminology inputs")
     packets = []
     for spec in unit_specs:
@@ -1050,12 +1172,28 @@ def _member_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, 
             if (origin_plan.get("kind") != "book-unit-plan"
                     or any(origin_plan.get(name) != plan.get(name) for name in unchanged)):
                 raise ValueError("Carried source checkpoint belongs to different book inputs or coverage")
-        elif plan["role"] == "translation" and plan.get("pending_replan") is not None:
-            _translation_replan_context(plan, origin_plan)
+        elif plan["role"] == "translation" and (plan.get("pending_replan") is not None or plan.get("translation_reopen") is not None):
+            reopening = plan.get("translation_reopen") is not None
+            link = plan["translation_reopen"] if reopening else plan["pending_replan"]
+            parent_key = (link["plan"], link["plan_sha256"])
+            if parent_key not in origin_plans:
+                origin_plans[parent_key] = _checked(job, *parent_key)
+            parent = origin_plans[parent_key]
+            _translation_replan_context(plan, parent, allow_same_bound=reopening)
+            if reopening and plan["pages_per_unit"] != parent["pages_per_unit"]:
+                raise ValueError("Translation reopening changed its immediate parent's page bound")
+            parent_spec = next((item for item in parent["units"] if item["unit_id"] == spec["unit_id"]), None)
+            if (parent_spec is None
+                    or {name: value for name, value in spec.items() if name != "carried_checkpoint"}
+                        != {name: value for name, value in parent_spec.items() if name != "carried_checkpoint"}
+                    or (parent_spec.get("carried_checkpoint") is not None and parent_spec["carried_checkpoint"] != reference)
+                    or (parent_spec.get("carried_checkpoint") is None and (origin_name, origin_digest) != parent_key)):
+                raise ValueError("Carried translation checkpoint is not linked through the exact parent scope/origin")
+            _translation_replan_context(plan, origin_plan, allow_same_bound=reopening)
             if (origin_plan["metadata_owner"] == spec["unit_id"]) != (plan["metadata_owner"] == spec["unit_id"]):
                 raise ValueError("Carried translation metadata ownership changed")
         else:
-            raise ValueError("Carried checkpoints require source continuation or explicit pending translation replanning")
+            raise ValueError("Carried checkpoints require source continuation or explicit translation plan transition")
         origin_spec = next((item for item in origin_plan["units"] if item["unit_id"] == spec["unit_id"]), None)
         ignored = {"carried_checkpoint"}
         if (origin_spec is None

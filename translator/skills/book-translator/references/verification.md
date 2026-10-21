@@ -335,6 +335,31 @@ The new checkpoint is units/translation/b290ccc2611743db9e7c3350fabeff82/checkpo
 
 This transition does not correct known prebuild first-use annotation defects in carried completed content; work/prebuild-translation-attention.json retains that separate issue. Neither the replan nor this bounded native authoring evidence establishes complete-book assembly/build, semantic review, acceptance, release or general model-quality improvement.
 
+## Preassembly translation reopening and native replacements
+
+[OBSERVED] MAIN's read-only prebuild check found that historical completed u0002 lacked the canonical term 17 annotation at the genuine earliest occurrence in toc0015 on original page p0007. Historical completed u0010 used a noncanonical target form in b00536 and b00539. The separate work/prebuild-translation-attention.json record retains these original findings. Ordinary text matching a source term does not register a first-use token, and the later pending occurrence cannot stand in for the missed earliest use. These observations motivated targeted correction, not removal of the genuine term or manufacture of an easier later first use.
+
+[INFERENCE] The canonical [translation reopening contract](format.md#reopening-completed-preassembly-translation) provides a targeted successor plan with unchanged IDs/packets/ownership and fresh selected-unit outputs, preserving original completions and nontarget progress. It requires full selected-unit native authoring/verification and actual checkpointing; pending-only resizing remains a separate carry-all-completed transition.
+
+[OBSERVED] Native authoring also exposed a refusal by u0039 to save partial progress; MAIN persisted only one translation row for u0037. An incremental draft in its own assigned writable location can retain work safely without satisfying or weakening the full-unit contract. Neither that one row nor permission to save drafts proves recovery, complete authoring, checkpoint admission or model effectiveness. The operational procedure now permits incremental own drafts while withholding completion/admission until the full valid scope is present.
+
+[OBSERVED] MAIN ran the actual plan-units JOB translation --pages-per-unit 3 --reopen u0002 u0010 command in 72.86 seconds. It returned units/translation/af2fdffa6159483582ae0419beb5a137/plan.json, SHA256 e510e626bec440c5834416f90f8706acdbe27d052b2d8bc774fc0922589fbcff. Before reopening, 49 completed checkpoints covered 255 original pages. Post-transition read-only checks confirmed that all 155 before-hashed old input/plan/checkpoint/result/packet/historical-draft files remained byte-identical. Evidence is work/translation-explicit-reopen-smoke.json in the book job.
+
+[OBSERVED] Exactly 47 nontarget completed units retained their original carry references, and all 116 nontarget pending specifications/paths remained unchanged. All 165 unit IDs, their order, immutable packets, ownership and title/preface metadata authority were preserved. Only u0002 and u0010 received fresh result/assets/checkpoint paths; their prior-checkpoint path/hash links validated. Each selected unit retained its original six-page ownership under the current three-page target bound. translation_reopen replaced the active pending_replan annotation while preserving parent-plan history. State remained terminology_ready at round 0. This establishes the exercised real-book reopening/preservation transition, not corrected translation.
+
+[OBSERVED] MAIN ran complete regression discovery with BOOK_TRANSLATOR_REAL_OMP_CHECK=1 in the previously recorded isolated OCR/DjVu environment: 246 tests in 227.922 seconds, 245 passed and one conditional test skipped. Regression success is not evidence that the two actual content defects are fixed.
+
+[OBSERVED] Ordinary native full-unit corrections on openai-codex/gpt-6-luna at Medium effort returned all 250 blocks and six owned-page image inspections for u0002, and all 35 blocks and six owned-page image inspections for u0010. MAIN validated both complete results and admitted fresh unit checkpoints. An exact old/new target-row comparison found changes only in u0002/toc0015 and u0010/b00536 plus b00539; every other target row remained unchanged. All 155 before-hashed historical files remained byte-identical after authoring as well as after reopening. The job remained terminology_ready at round 0.
+
+The fresh checkpoints are under units/translation/af2fdffa6159483582ae0419beb5a137/checkpoints/:
+
+| Unit | Checkpoint SHA256 | Result SHA256 |
+|---|---|---|
+| u0002 | 8ca88beb2c0b28be8d57859600e2eee2889bd569fa36292140784c5db3d9a69b | 8c806adc84fd3f4678c9a78c9707a6cfe448c01474cffa5c525b7e14e1b07ab5 |
+| u0010 | cceda3f568fef34ce4624c37fd5c8edc6a7d0684e59ad78bb68ce68adfa54e5f | 8fcb229b02e06b008a0a26fcc5a1a6dee37ef9ee54d01fde979197ec5b1add81 |
+
+[OBSERVED] The genuine earliest explicit Sea of Gates annotation is now at toc0015 on original page p0007, not at a fabricated or convenient later occurrence. This records the actual selected-unit native authoring, targeted row changes and checkpoint admission. Printed first-use folios and the resulting PDF have NOT YET been built or reviewed. No complete-book assembly/build, independent semantic review, release, general translation-quality improvement or cure for the earlier incomplete/garbled-output behavior is claimed.
+
 ## Verification interpretation
 
 Schema/semantic tests cover selected data boundaries and state transitions; they cannot establish all protected-span discovery, OCR fidelity, translation accuracy or truthfulness of model-supplied research/review. Mechanical PDF checks are not a substitute for visual and semantic review. Synthetic fixtures are development data, not evidence of a real book translated by an admitted model. Runtime identity resolution without a prompt is not inference evidence.

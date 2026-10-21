@@ -48,6 +48,8 @@ Replace every descriptive path/ID and include the actual complete scope, command
 
 Source I/O: the authoritative text is the complete parsed JSON payload, not a shortened tool preview. Parsing JSON and then printing an entire long dictionary or line can still hide its contents. Inspect long text tokens in bounded, unescaped Unicode chunks of at most 160 codepoints, labeling the token/index, start/end offsets and total length, or read the full saved artifact through explicit ranges. That bound leaves room for labels under the current 768-byte preview limit even for multibyte Unicode. Check every needed chunk and the surrounding nontext token positions. Never infer missing source, invent an ellipsis or treat preview clipping as book damage; verify the full payload before stopping on a claimed source-data omission. Report a genuine missing-data blocker only when the underlying complete payload, rather than its display, is actually incomplete.
 
+Incremental authoring: workers may persist their own incomplete drafts in the currently assigned writable result/assets paths while completing a unit. Preserve such unadmitted progress for native continuation instead of requiring all writing to wait until the whole unit is finished. Do not overwrite any checkpointed artifact, canonical file or sibling output. A saved partial row set or inspection list is not an admissible result: do not checkpoint or report completion until every owned block/note, required metadata and inspection is present and the entire result satisfies the canonical contract. An actual successful native exit alone does not supply missing scope.
+
 Wait using native task facilities until settlement. Persist the ACTUAL settled child's flat SingleResult metadata, not an outer batch envelope or worker-written status and not values reconstructed from the model choice. Inspect the actual native result identity and completion status before invoking:
 
 ```sh
@@ -129,6 +131,25 @@ When an existing active domain translation plan needs a smaller pending scope, u
 
 4. Read the returned immutable plan and each new pending packet for exact IDs, result paths, assets directories, checkpoint paths, complete owned blocks and bounded read-only neighbors. Never guess replacement IDs from old IDs or page numbers. Put the full new assignment and paths in ordinary native task text. Do not redispatch carried completed units, re-author their title/preface or promote old pending drafts as new results.
 5. Continue native tasks and checkpoint only the new pending scope. Carried checkpoints keep their original paths/hashes, ownership and actual task/model origins, including ownership above the new N but never above eight pages. Only complete aggregate assembly/build may advance a round; the replan itself resets no round/cap and permits no partial release.
+
+### Correcting completed preassembly translation units
+
+Use the canonical [translation reopening contract](format.md#reopening-completed-preassembly-translation) for an explicitly identified defect in completed translation before global assembly. It does not revise sealed source, terminology or completed history and is not a smaller-unit replan.
+
+1. Settle all tasks using the old translation plan. Read actual unit-status, the active plan and the defect evidence; retain linked feedback and all old artifacts. Select only explicit completed IDs requiring correction. Keep the active pages_per_unit unchanged; do not combine --reopen with --replan-pending, --draft or --revise.
+2. Confirm the eligible terminology_ready, round-zero, unassembled context and unchanged book/model/readiness bindings through the controller, then request the selected IDs:
+
+   ```sh
+   python3 <skill>/scripts/translator.py plan-units <job> translation --pages-per-unit "$CURRENT_N" --reopen "$COMPLETED_ID"
+   # Append other explicit completed IDs as separate arguments, if needed.
+   python3 <skill>/scripts/translator.py unit-status <job> translation
+   ```
+
+3. Read the returned successor plan, not a guessed path or cached assignment. IDs, packets, ownership, metadata authority and seam context are unchanged, but each selected unit now has fresh result/assets/checkpoint paths. Nontarget completed units remain carried; nontarget pending paths/drafts remain unchanged and unadmitted. Never rewrite the old selected completion or hand-edit its hashes.
+4. Put the complete selected-unit scope, new writable paths, exact packet, defect evidence and terminology/first-use feedback in ordinary native task text for the unchanged chosen translation model. The worker must return and verify the entire unit, with every required page inspection and the owner's metadata where applicable. It may save incremental own drafts, but a single corrected row or otherwise partial result is not checkpointable completion.
+5. Wait for actual native settlement, inspect its actual identity/status and checkpoint the full valid replacement using the unchanged unit ID and new active paths. Continue all other pending work normally. Do not count the old selected checkpoint as its replacement, rerun nontarget completed units, reset rounds or release a partial book. Complete assembly/build and subsequent whole-book review remain mandatory.
+
+For first-use defects, correct the genuine earliest occurrence using the existing canonical term ID and approved translation, then check later occurrences for consistency. Adding a convenient later token merely to satisfy the used-term check does not repair first use; removing a genuine glossary entry does not repair annotation. Preserve source structure, token order and protected content throughout.
 
 ### Continuing or correcting unsealed source work
 

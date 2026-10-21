@@ -416,14 +416,16 @@ def role_readiness(job: Path, role: str, *, revise: bool = False) -> tuple[dict,
 
 
 def plan_units(job: Path, role: str, pages_per_unit: int, *, draft: Path | None = None, revise: bool = False,
-               replan_pending: bool = False) -> dict:
+               replan_pending: bool = False, reopen_units: list[str] | None = None) -> dict:
     job = Path(job).resolve(strict=True)
     if replan_pending and (role != "translation" or draft is not None or revise):
         raise ValueError("Pending replanning requires translation without draft import or revision")
+    if reopen_units is not None and (role != "translation" or draft is not None or revise or replan_pending):
+        raise ValueError("Translation reopening requires translation without pending resize, draft import or revision")
     _, _, _, seal, bindings = role_readiness(job, role, revise=revise)
     return importlib.import_module("units").create_plan(
         job, role, pages_per_unit=pages_per_unit, draft_path=draft, revise=revise,
-        readiness={"source_digest": seal, "bindings": bindings}, replan_pending=replan_pending)
+        readiness={"source_digest": seal, "bindings": bindings}, replan_pending=replan_pending, reopen_units=reopen_units)
 
 
 def validate_checkpoint(job: Path, receipt: dict, role: str) -> None:
@@ -827,6 +829,7 @@ def parser() -> argparse.ArgumentParser:
                 action.add_argument("--draft", type=Path)
                 action.add_argument("--revise", action="store_true")
                 action.add_argument("--replan-pending", action="store_true")
+                action.add_argument("--reopen", dest="reopen_units", nargs="+", metavar="UNIT_ID")
         elif name == "review":
             action.add_argument("report", type=Path)
     return result
@@ -886,7 +889,7 @@ def main(argv=None) -> int:
                         output = import_checkpoints(job, args.role, args.plan)
                     elif args.command == "plan-units":
                         output = plan_units(job, args.role, args.pages_per_unit, draft=args.draft, revise=args.revise,
-                                            replan_pending=args.replan_pending)
+                                            replan_pending=args.replan_pending, reopen_units=args.reopen_units)
                     elif args.command == "assemble-units":
                         output = assemble_units(job, args.role)
                     elif args.command == "finalize-translation":

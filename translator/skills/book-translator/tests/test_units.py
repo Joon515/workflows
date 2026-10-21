@@ -155,9 +155,10 @@ class UnitContractTests(unittest.TestCase):
         workflow.assemble_units(job, "source")
         workflow.seal_job(job)
 
-    def admit_terminology(self, job):
-        core.save_json(job / "terms.json", {"version": 1, "terms": []})
-        (job / "handoff.md").write_text("Synthetic fixture: no governed terminology entries.\n", encoding="utf-8")
+    def admit_terminology(self, job, terms=None):
+        core.save_json(job / "terms.json", terms if terms is not None else {"version": 1, "terms": []})
+        handoff = "Synthetic fixture: governed terminology entries inspected." if terms is not None else "Synthetic fixture: no governed terminology entries."
+        (job / "handoff.md").write_text(handoff + "\n", encoding="utf-8")
         task = domain_fixtures.save_task_result(self.root / "coordinator-results", "terminology", PROVIDER, MODEL)
         workflow.checkpoint_role(job, "terminology", task)
 
@@ -175,7 +176,7 @@ class UnitContractTests(unittest.TestCase):
         self.admit_translation(job, self.plan(job, "translation"), pdf_pages)
         return job
 
-    def pending_translation_job(self, page_count=18, spans=None):
+    def pending_translation_job(self, page_count=18, spans=None, terms=None):
         job = self.new_job(page_count=page_count)
         pages = [page["id"] for page in core.extraction_inventory(job)["pages"]]
         spans = dict(spans if spans is not None else ((3, 4), (6, 7), (9, 10), (12, 13), (15, 16)))
@@ -210,7 +211,7 @@ class UnitContractTests(unittest.TestCase):
             self.finish(job, prepared, output)
         workflow.assemble_units(job, "source")
         workflow.seal_job(job)
-        self.admit_terminology(job)
+        self.admit_terminology(job, terms=terms)
         return job, self.plan(job, "translation", pages_per_unit=6)
 
     def test_pending_translation_resize_preserves_completed_progress_and_one_round(self):
@@ -501,6 +502,317 @@ class UnitContractTests(unittest.TestCase):
             self.assertEqual((job / completed["checkpoint"]).read_bytes(), old_checkpoint)
             self.assertEqual((job / "job.json").read_bytes(), before_job)
             previous = {name: reference[name] for name in ("plan", "plan_sha256")}
+
+    def test_translation_reopen_corrects_nested_metadata_owner_without_losing_siblings(self):
+        terms = domain_fixtures.terms()
+        terms["terms"][0].update(id="OriginalTerm", source="Original", target="Corrected original")
+        job, original = self.pending_translation_job(terms=terms)
+        for spec in original["units"][:2]:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            if spec["unit_id"] == original["metadata_owner"]:
+                for token in output["blocks"][0]["target"]:
+                    if "text" in token:
+                        token["text"] = "Original with incorrect earlier prose and no governed annotation."
+            self.finish(job, prepared, output)
+        resized_reference = workflow.plan_units(job, "translation", 3, replan_pending=True)
+        resized = core.load_json(job / resized_reference["plan"])
+        selected, unaffected, *pending = resized["units"]
+        self.assertEqual(selected["unit_id"], resized["metadata_owner"])
+        self.assertEqual(len(selected["owned_pages"]), 6)
+        _, pending_binding, _, pending_draft = self.prepare(job, "translation", pending[0]["unit_id"])
+        pending_draft["blocks"] = pending_draft["blocks"][:1]
+        pending_draft["blocks"][0]["target"] = [{"text": "UNADMITTED RETAINED PENDING DRAFT"}]
+        core.save_json(job / pending_binding["result"], pending_draft)
+        for spec in (selected, pending[0]):
+            assets = job / spec["assets_dir"]
+            assets.mkdir(parents=True, exist_ok=True)
+            (assets / "unconsumed.txt").write_text("Historical task-owned data, not completion.\n", encoding="utf-8")
+        active = job / "units/translation/active.json"
+        previous = core.load_json(active)
+        before_job = (job / "job.json").read_bytes()
+        before_files = {path: path.read_bytes() for path in job.rglob("*") if path.is_file() and path != active}
+        before_tasks = {path: path.read_bytes() for path in (self.root / "coordinator-results").glob("*.json")}
+        prior_checkpoint = {"path": selected["checkpoint"], "sha256": workflow.digest_file(job / selected["checkpoint"])}
+        old_selected_result = core.load_json(job / selected["result"])
+        old_selected_checkpoint = core.load_json(job / selected["checkpoint"])
+
+        reference = workflow.plan_units(job, "translation", 3, reopen_units=[selected["unit_id"]])
+        reopened = core.load_json(job / reference["plan"])
+        self.assertEqual(reopened["translation_reopen"], {
+            **previous, "reopened": [selected["unit_id"]], "prior_checkpoints": {selected["unit_id"]: prior_checkpoint}})
+        self.assertEqual([spec["unit_id"] for spec in reopened["units"]], [spec["unit_id"] for spec in resized["units"]])
+        for field in ("job_sha256", "base_state", "base_round", "revision", "selected_model", "source_file_sha256",
+                      "source_digest", "baseline", "extraction_sha256", "page_ids", "pages", "pages_per_unit",
+                      "max_context_pages", "metadata_owner", "readiness"):
+            self.assertEqual(reopened[field], resized[field], field)
+        replacement = reopened["units"][0]
+        changed_paths = {"result", "assets_dir", "checkpoint"}
+        unchanged = lambda spec: {name: value for name, value in spec.items() if name not in changed_paths | {"carried_checkpoint"}}
+        self.assertEqual(unchanged(replacement), unchanged(selected))
+        self.assertNotIn("carried_checkpoint", replacement)
+        for field in changed_paths:
+            self.assertNotEqual(replacement[field], selected[field], field)
+        self.assertFalse((job / replacement["checkpoint"]).exists())
+        self.assertFalse((job / replacement["result"]).exists())
+        self.assertEqual(reopened["units"][1:], resized["units"][1:])
+        self.assertEqual(units.status(job, "translation")["admitted"], [unaffected["unit_id"]])
+        self.assertEqual(units.status(job, "translation")["pending"], [selected["unit_id"]] + [spec["unit_id"] for spec in pending])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        for path, content in (before_files | before_tasks).items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+        self.assertEqual(workflow.digest_file(job / "book.json") if (job / "book.json").is_file() else None,
+                         resized["baseline"]["book.json"])
+        for spec in pending:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            self.finish(job, prepared, output)
+        _, binding, packet, corrected = self.prepare(job, "translation", selected["unit_id"])
+        self.assertEqual(binding["packet"], selected["packet"])
+        self.assertEqual(binding["packet_sha256"], selected["packet_sha256"])
+        self.assertTrue(packet["metadata_owner"])
+        corrected["metadata"]["title"] = "Corrected metadata-owner title"
+        corrected["blocks"][0]["target"] = [
+            {"page": packet["owned_pages"][0]}, {"term": "OriginalTerm"},
+            {"text": " with corrected translated prose."}, {"protected": "SharedName"},
+        ]
+        core.save_json(job / binding["result"], corrected)
+        self.assertEqual(units.status(job, "translation")["pending"], [selected["unit_id"]])
+        with self.assertRaisesRegex(ValueError, "Every planned unit"):
+            workflow.assemble_units(job, "translation")
+        self.assertEqual(workflow.digest_file(job / "book.json") if (job / "book.json").is_file() else None,
+                         resized["baseline"]["book.json"])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "translation", PROVIDER, MODEL)
+        checkpoint = workflow.checkpoint_unit(job, "translation", selected["unit_id"], task)
+        self.assertNotEqual(checkpoint["task"]["id"], old_selected_checkpoint["task"]["id"])
+        self.assertTrue(units.status(job, "translation")["complete"])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        with patch("render.build", side_effect=synthetic_build):
+            result = workflow.assemble_units(job, "translation")
+        self.assertEqual((result["state"], result["round"]), ("translated", 1))
+        current = workflow.load_job(job)
+        workflow.translation_ready(job, current)
+        book = core.validate_book(job, translated=True)
+        self.assertEqual(book["title"], corrected["metadata"]["title"])
+        first = next(block for block in book["blocks"] if block["id"] == corrected["blocks"][0]["id"])
+        self.assertEqual(first["target"], corrected["blocks"][0]["target"])
+        self.assertNotEqual(first["target"], old_selected_result["blocks"][0]["target"])
+        self.assertEqual(core.load_json(job / selected["result"]), old_selected_result)
+        unaffected_result = core.load_json(job / unaffected["result"])
+        for category in ("blocks", "notes"):
+            assembled = {item["id"]: item for item in book[category]}
+            for item in unaffected_result[category]:
+                self.assertEqual(assembled[item["id"]]["target"], item["target"])
+        stages = [event for event in current["history"] if event["event"] == "stage_translation"]
+        self.assertEqual(len(stages), 1)
+        aggregate = core.load_json(job / stages[0]["receipt"])
+        self.assertIn(unaffected["carried_checkpoint"], aggregate["unit_checkpoints"])
+        self.assertNotIn(prior_checkpoint, aggregate["unit_checkpoints"])
+        self.assertIn({"path": replacement["checkpoint"], "sha256": workflow.digest_file(job / replacement["checkpoint"])},
+                      aggregate["unit_checkpoints"])
+        pending_results = {job / spec["result"] for spec in pending}
+        for path, content in (before_files | before_tasks).items():
+            if path != job / "job.json" and path not in pending_results:
+                self.assertEqual(path.read_bytes(), content, str(path))
+        final_pointer = active.read_bytes()
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "translation", 3, reopen_units=[selected["unit_id"]])
+        self.assertEqual(active.read_bytes(), final_pointer)
+        self.assertEqual(workflow.load_job(job)["round"], 1)
+
+    def test_translation_reopen_refuses_invalid_selectors_flags_and_stale_inputs(self):
+        job, plan = self.pending_translation_job()
+        for spec in plan["units"][:2]:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            self.finish(job, prepared, output)
+        selected, unaffected, pending = plan["units"]
+        active = job / "units/translation/active.json"
+        before_active = active.read_bytes()
+        before_job = (job / "job.json").read_bytes()
+        before_tree = {path: path.read_bytes() if path.is_file() else None for path in job.rglob("*")}
+        invalid = ([], [""], [" "], [None], [1], selected["unit_id"], ["u9999"],
+                   [pending["unit_id"]], [selected["unit_id"], pending["unit_id"]], [selected["unit_id"]] * 2)
+        for selectors in invalid:
+            with self.subTest(selectors=selectors), self.assertRaises(ValueError):
+                workflow.plan_units(job, "translation", 6, reopen_units=selectors)
+            self.assertEqual(active.read_bytes(), before_active)
+            self.assertEqual((job / "job.json").read_bytes(), before_job)
+            self.assertEqual({path: path.read_bytes() if path.is_file() else None for path in job.rglob("*")}, before_tree)
+        for size, options in ((3, {}), (7, {}), (True, {}), (6, {"replan_pending": True}),
+                              (6, {"draft": job / "draft.json"}), (6, {"revise": True})):
+            with self.subTest(size=size, options=options), self.assertRaises(ValueError):
+                workflow.plan_units(job, "translation", size, reopen_units=[selected["unit_id"]], **options)
+            self.assertEqual(active.read_bytes(), before_active)
+            self.assertEqual((job / "job.json").read_bytes(), before_job)
+            self.assertEqual({path: path.read_bytes() if path.is_file() else None for path in job.rglob("*")}, before_tree)
+        for role, other_job in (("source", self.new_job()), ("review", self.translated_job())):
+            other_plan = self.plan(other_job, role, pages_per_unit=2)
+            prepared, _, _, output = self.prepare(other_job, role, other_plan["units"][0]["unit_id"])
+            self.finish(other_job, prepared, output)
+            other_active = other_job / f"units/{role}/active.json"
+            other_pointer = other_active.read_bytes()
+            other_metadata = (other_job / "job.json").read_bytes()
+            with self.subTest(eligible_nontranslation_role=role), self.assertRaises(ValueError):
+                workflow.plan_units(other_job, role, 2, reopen_units=[other_plan["units"][0]["unit_id"]])
+            self.assertEqual(other_active.read_bytes(), other_pointer)
+            self.assertEqual((other_job / "job.json").read_bytes(), other_metadata)
+        active.unlink()
+        try:
+            with self.assertRaises(ValueError):
+                workflow.plan_units(job, "translation", 6, reopen_units=[selected["unit_id"]])
+            self.assertFalse(active.exists())
+        finally:
+            active.write_bytes(before_active)
+        packet = core.load_json(job / pending["packet"])
+        changed_files = ["job.json", workflow.load_job(job)["source_file"], "book-source.json", "source.sha256",
+                         "terms.json", "handoff.md", "extraction.json", "note-evidence.png", selected["packet"],
+                         selected["checkpoint"], selected["result"], unaffected["checkpoint"], unaffected["result"],
+                         pending["packet"], packet["pages"][0]["evidence"], packet["pages"][0]["image"],
+                         core.load_json(active)["plan"]]
+        for name in changed_files:
+            path = job / name
+            content = path.read_bytes()
+            try:
+                if name in (selected["checkpoint"], unaffected["checkpoint"]):
+                    core.save_json(path, {**json.loads(content), "completed": False})
+                else:
+                    path.write_bytes(content + b"\n ")
+                with self.subTest(changed=name), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "translation", 6, reopen_units=[selected["unit_id"]])
+                self.assertEqual(active.read_bytes(), before_active)
+            finally:
+                path.write_bytes(content)
+        for changes in ({"state": "changes_requested"}, {"round": 1}, {"round": workflow.load_job(job)["max_rounds"]},
+                        {"models": {**workflow.load_job(job)["models"],
+                                    "translation": {"provider": "openai-codex", "model": "gpt-6-luna"}}}):
+            try:
+                core.save_json(job / "job.json", {**json.loads(before_job), **changes})
+                with self.subTest(job_changes=changes), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "translation", 6, reopen_units=[selected["unit_id"]])
+                self.assertEqual(active.read_bytes(), before_active)
+            finally:
+                (job / "job.json").write_bytes(before_job)
+        plan_path = job / core.load_json(active)["plan"]
+        old_plan = plan_path.read_bytes()
+        try:
+            core.save_json(plan_path, {**plan, "kind": "historical-nondomain-plan"})
+            core.save_json(active, {"plan": plan_path.relative_to(job).as_posix(), "plan_sha256": workflow.digest_file(plan_path)})
+            unsupported_pointer = active.read_bytes()
+            with self.assertRaises(ValueError):
+                workflow.plan_units(job, "translation", 6, reopen_units=[selected["unit_id"]])
+            self.assertEqual(active.read_bytes(), unsupported_pointer)
+        finally:
+            plan_path.write_bytes(old_plan)
+            active.write_bytes(before_active)
+        prepared, _, _, output = self.prepare(job, "translation", pending["unit_id"])
+        self.finish(job, prepared, output)
+        with patch("render.build", side_effect=RuntimeError("Synthetic build failure")), self.assertRaisesRegex(RuntimeError, "Synthetic build failure"):
+            workflow.assemble_units(job, "translation")
+        authored = (job / "job.json").read_bytes()
+        self.assertEqual(workflow.load_job(job)["history"][-1]["event"], "translation_content_authored")
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("terminology_ready", 0))
+        with self.assertRaises(ValueError):
+            units.create_plan(job, "translation", pages_per_unit=6, readiness=plan["readiness"], reopen_units=[selected["unit_id"]])
+        self.assertEqual(active.read_bytes(), before_active)
+        self.assertEqual((job / "job.json").read_bytes(), authored)
+        with patch("render.build", side_effect=synthetic_build):
+            result = workflow.finalize_translation(job)
+        self.assertEqual((result["state"], result["round"]), ("translated", 1))
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "translation", 6, reopen_units=[selected["unit_id"]])
+        self.assertEqual(active.read_bytes(), before_active)
+        self.assertEqual(workflow.load_job(job)["round"], 1)
+
+    def test_translation_reopen_accepts_multiple_completed_selectors_without_pending_work(self):
+        job = self.new_job(page_count=4)
+        self.admit_source(job)
+        self.admit_terminology(job)
+        candidate = core.load_json(job / "book-source.json")
+        for block in candidate["blocks"]:
+            block["target"] = copy.deepcopy(block["source"])
+        candidate["agent_preface"] = [{"text": "Synthetic unadmitted baseline candidate, not an authored checkpoint."}]
+        core.save_json(job / "book.json", candidate)
+        core.validate_book(job, translated=True)
+        candidate_bytes = (job / "book.json").read_bytes()
+        self.assertFalse(any(event["event"] in {"translation_content_authored", "stage_translation"}
+                             for event in workflow.load_job(job)["history"]))
+        plan = self.plan(job, "translation", pages_per_unit=2)
+        for spec in plan["units"]:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            self.finish(job, prepared, output)
+        before_job = (job / "job.json").read_bytes()
+        initial = {spec["unit_id"]: {"path": spec["checkpoint"], "sha256": workflow.digest_file(job / spec["checkpoint"])}
+                   for spec in plan["units"]}
+        first, second = plan["units"]
+        single_reference = workflow.plan_units(job, "translation", 2, reopen_units=[first["unit_id"]])
+        single = core.load_json(job / single_reference["plan"])
+        self.assertEqual(single["units"][1], {**second, "carried_checkpoint": initial[second["unit_id"]]})
+        self.assertEqual(units.status(job, "translation")["admitted"], [second["unit_id"]])
+        self.assertEqual(units.status(job, "translation")["pending"], [first["unit_id"]])
+        prepared, _, _, output = self.prepare(job, "translation", first["unit_id"])
+        self.finish(job, prepared, output)
+        plan = single
+        previous = core.load_json(job / "units/translation/active.json")
+        old = {spec["unit_id"]: {"path": spec["checkpoint"], "sha256": workflow.digest_file(job / spec["checkpoint"])}
+               for spec in plan["units"]}
+        selectors = [spec["unit_id"] for spec in reversed(plan["units"])]
+        reference = workflow.plan_units(job, "translation", 2, reopen_units=selectors)
+        reopened = core.load_json(job / reference["plan"])
+        history = reopened["translation_reopen"]
+        self.assertEqual({name: history[name] for name in ("plan", "plan_sha256")}, previous)
+        self.assertEqual(Counter(history["reopened"]), Counter(selectors))
+        self.assertEqual(history["prior_checkpoints"], old)
+        self.assertEqual([spec["unit_id"] for spec in reopened["units"]], [spec["unit_id"] for spec in plan["units"]])
+        self.assertEqual(units.status(job, "translation")["admitted"], [])
+        self.assertEqual(units.status(job, "translation")["pending"], [spec["unit_id"] for spec in plan["units"]])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        self.assertEqual((job / "book.json").read_bytes(), candidate_bytes)
+        resized_reference = workflow.plan_units(job, "translation", 1, replan_pending=True)
+        resized = core.load_json(job / resized_reference["plan"])
+        self.assertEqual(resized["pending_replan"], {name: reference[name] for name in ("plan", "plan_sha256")})
+        self.assertEqual([spec["unit_id"] for spec in resized["units"]], ["u0003", "u0004", "u0005", "u0006"])
+        self.assertEqual([spec["owned_pages"] for spec in resized["units"]], [[page] for page in plan["page_ids"]])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        self.assertEqual((job / "book.json").read_bytes(), candidate_bytes)
+        self.admit_translation(job, resized)
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("translated", 1))
+        for member in list(initial.values()) + list(old.values()):
+            self.assertEqual(workflow.digest_file(job / member["path"]), member["sha256"])
+
+    def test_translation_reopen_keeps_historical_context_until_fresh_pending_resize(self):
+        job, original = self.pending_translation_job()
+        completed = original["units"][1]
+        prepared, _, _, output = self.prepare(job, "translation", completed["unit_id"])
+        self.finish(job, prepared, output)
+        historical_packet = (job / completed["packet"]).read_bytes()
+        self.assertEqual(json.loads(historical_packet)["context_block_owners"]["cross6"], "u0001")
+        resized_reference = workflow.plan_units(job, "translation", 3, replan_pending=True)
+        resized = core.load_json(job / resized_reference["plan"])
+        self.assertNotIn("u0001", [spec["unit_id"] for spec in resized["units"]])
+        pending = resized["units"][0]
+        _, binding, _, draft = self.prepare(job, "translation", pending["unit_id"])
+        draft["blocks"] = draft["blocks"][:1]
+        core.save_json(job / binding["result"], draft)
+        preserved = {job / name: (job / name).read_bytes() for name in
+                     (completed["packet"], completed["result"], completed["checkpoint"], pending["result"])}
+        before_job = (job / "job.json").read_bytes()
+        reopened_reference = workflow.plan_units(job, "translation", 3, reopen_units=[completed["unit_id"]])
+        reopened = core.load_json(job / reopened_reference["plan"])
+        selected = next(spec for spec in reopened["units"] if spec["unit_id"] == completed["unit_id"])
+        self.assertEqual((job / selected["packet"]).read_bytes(), historical_packet)
+        self.assertEqual(len(selected["owned_pages"]), 6)
+        fresh_reference = workflow.plan_units(job, "translation", 2, replan_pending=True)
+        fresh = core.load_json(job / fresh_reference["plan"])
+        owner = next(spec for spec in fresh["units"] if original["page_ids"][5] in spec["owned_pages"])
+        neighbor = next(spec for spec in fresh["units"] if original["page_ids"][6] in spec["owned_pages"])
+        _, _, packet, _ = self.prepare(job, "translation", neighbor["unit_id"])
+        self.assertEqual(packet["context_block_owners"]["cross6"], owner["unit_id"])
+        self.assertNotEqual(owner["unit_id"], "u0001")
+        self.assertEqual(Counter(page for spec in fresh["units"] for page in spec["owned_pages"]), Counter(original["page_ids"]))
+        self.assertTrue(all(1 <= len(spec["owned_pages"]) <= 2 for spec in fresh["units"]))
+        self.assertEqual(units.status(job, "translation")["admitted"], [])
+        self.assertEqual((job / "job.json").read_bytes(), before_job)
+        for path, content in preserved.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
 
     def test_extraction_lineage_and_complete_small_source_inventory(self):
         job = self.new_job()
