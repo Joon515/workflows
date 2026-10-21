@@ -1,6 +1,10 @@
 task:
   agentModelOverrides:
-    book-source: opencode-go/deepseek-v4-flash-vision-exp:low
-    book-terminology: opencode-go/deepseek-v4-flash-vision-exp:low
-    book-translation: opencode-go/deepseek-v4-flash-vision-exp:low
-    book-review: opencode-go/deepseek-v4-flash-vision-exp:low
+    book-source: openai-codex/gpt-6-luna:medium
+    book-terminology: openai-codex/gpt-6-luna:low
+    book-translation: openai-codex/gpt-6-luna:low
+    book-review: openai-codex/gpt-6-luna:low
+retry:
+  fallbackChains:
+    "openai-codex/gpt-6-luna:low": []
+    "openai-codex/gpt-6-luna:medium": []

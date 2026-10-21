@@ -112,6 +112,20 @@ python3 <skill>/scripts/translator.py unit-status <job> <role>
 
 Import validates only receipt-bound completed legacy results, creates a sibling domain book-plan.json and hash-referenced historical-origin checkpoints, then updates the active plan pointer. Original job, legacy plan/packet/result/receipt/evidence bytes remain unchanged. Failed, unreceipted or merely present results are not completed imports; they remain pending. Import neither calls a model nor invents current native settlement/authentication evidence. Continue the pending IDs using ordinary native tasks, never overwrite historical completed work or reset rounds.
 
+### Changing future role choices during unsealed source work
+
+When the current user explicitly changes ALL FOUR FUTURE role choices during an active source plan, use the dedicated domain transition rather than hand-editing job.json, re-running initial configure-model against the plan or relabeling completed authorship:
+
+```sh
+python3 <skill>/scripts/translator.py continue-source <job> --provider "$NEW_PROVIDER" --model "$NEW_MODEL"
+python3 <skill>/scripts/translator.py unit-status <job> source
+```
+
+This requires an active domain source plan at extracted state, round 0, unsealed and nonrevision, with a different new source model. It validates current inputs and complete checkpoints first, records the authorized provider/model for all four future roles, snapshots exact old/new job bytes and switches to a new continuation plan. It is book bookkeeping only, not another execution layer. The coordinator must separately bind the new exact model through standard native OMP configuration before dispatch; native reasoning effort remains separate from the recorded provider/model ID. Workers act from their clear rendered assignments, not raw parent JSON or hidden model introspection.
+
+Read returned status and the new plan. Keep carried completed IDs, their original checkpoint paths/hashes, and their original model/task/history unchanged; do not redo them or mark them as authored by the new model. The continuation reuses immutable packets/ownership, assigns pending units fresh result/assets/checkpoint paths, and preserves old plans, results, assets, checkpoints, receipts and failed drafts. Use those fresh paths for ordinary native tasks, wait for actual settlement and checkpoint each new result against its new selected model. Mere existing result files are not carried completion. Only the canonical job record and active pointer are intentionally switched after validation; coverage, source sealing, round caps and all downstream release gates remain unchanged. The exact continuation-plan bindings and return fields are in format.md.
+
+
 For corrected sealed source, retain correction scope/feedback. Long books use plan-units JOB source --pages-per-unit N --revise and ordinary native source tasks/checkpoint-unit; eligible small whole-role source uses checkpoint-role JOB source --task-result PATH --revise. Checkpointing/assembly does not replace the old seal, state or round. Ordinary source validation still rejects changed source against the old seal until the coordinator deliberately runs seal-source JOB --reseal. Changed resealing invalidates downstream book checkpoints/build/review approval and archives journal-owned old reviews; unchanged resealing cannot reset the cap. Do not remove the seal or reset state/history to bypass revision.
 
 Pretranslation terminology revision remains terminology_ready at round 0 with current source/terms/handoff/checkpoint bindings. Retain linked read-only feedback, dispatch the selected terminology role and checkpoint-role JOB terminology --task-result PATH --revise. Preserve prior checkpoints/history. This is not round-N PDF review, consumes/resets no pair and cannot revise terminology after a completed translation round. Do not silently hand-edit checkpointed terminology to bypass that boundary.

@@ -743,6 +743,42 @@ def accept_job(job: Path) -> Path:
     return output
 
 
+def continue_source(job: Path, provider: str, model: str) -> dict:
+    """Change future model intent while retaining completed initial source content."""
+    job = Path(job).resolve(strict=True)
+    selector = core.admit_model(provider, model)
+    data, _, previous_selector, _, _ = role_readiness(job, "source")
+    selected = {"provider": provider, "model": model}
+    future = {**data, "models": {role: dict(selected) for role in ROLES},
+              "history": data["history"] + [{"event": "source_model_continued",
+                  "at": datetime.now(timezone.utc).isoformat(), "selector": selector,
+                  "previous_selector": previous_selector}]}
+    validate_job_record(future)
+    reference = importlib.import_module("units").continue_source(job, future)
+    previous_job = contained(job, reference["previous_job"]["path"])
+    snapshot = contained(job, reference["job_snapshot"]["path"])
+    if digest_file(job / "job.json") != reference["previous_job"]["sha256"]:
+        raise ValueError("Source continuation job changed before publication")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".source-model-", dir=job, delete=False) as stream:
+            temporary = Path(stream.name)
+        shutil.copyfile(snapshot, temporary)
+        os.replace(temporary, job / "job.json")
+        try:
+            core.save_json(job / "units/source/active.json",
+                           {key: reference[key] for key in ("plan", "plan_sha256")})
+        except Exception:
+            shutil.copyfile(previous_job, temporary)
+            os.replace(temporary, job / "job.json")
+            raise
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+    return {**reference, "selector": selector, "models": future["models"],
+            "state": future["state"], "round": future["round"]}
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
@@ -754,7 +790,7 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--source-language", required=True)
     init.add_argument("--target-language", required=True)
     init.add_argument("--max-rounds", type=int, default=3)
-    for name in ("extract", "seal-source", "validate", "render", "build", "configure-model", "checkpoint-role", "checkpoint-unit", "import-checkpoints", "finalize-translation", "plan-units", "unit-status", "assemble-units", "review", "accept", "status"):
+    for name in ("extract", "seal-source", "validate", "render", "build", "configure-model", "continue-source", "checkpoint-role", "checkpoint-unit", "import-checkpoints", "finalize-translation", "plan-units", "unit-status", "assemble-units", "review", "accept", "status"):
         action = sub.add_parser(name)
         action.add_argument("job", type=Path)
         if name == "extract":
@@ -765,8 +801,9 @@ def parser() -> argparse.ArgumentParser:
             action.add_argument("--reseal", action="store_true")
         elif name == "validate":
             action.add_argument("--source", action="store_true")
-        elif name == "configure-model":
-            action.add_argument("stage", choices=ROLES)
+        elif name in {"configure-model", "continue-source"}:
+            if name == "configure-model":
+                action.add_argument("stage", choices=ROLES)
             action.add_argument("--provider", required=True)
             action.add_argument("--model", required=True)
         elif name == "checkpoint-role":
@@ -833,6 +870,8 @@ def main(argv=None) -> int:
                         output = seal_job(job, args.reseal)
                     elif args.command == "configure-model":
                         output = configure_model(job, args.stage, args.provider, args.model)
+                    elif args.command == "continue-source":
+                        output = continue_source(job, args.provider, args.model)
                     elif args.command == "checkpoint-role":
                         output = checkpoint_role(job, args.role, args.task_result, revise=args.revise)
                     elif args.command == "checkpoint-unit":

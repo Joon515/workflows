@@ -510,6 +510,95 @@ class UnitContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact original source page union"):
             units.assemble_units(job, "source")
         self.assertFalse((job / "book-source.json").exists())
+    
+    def test_source_continuation_preserves_completed_origin_and_reissues_pending_work(self):
+        job = self.new_job()
+        plan = self.plan(job)
+        completed, pending = plan["units"]
+        prepared, _, _, output = self.prepare(job, "source", completed["unit_id"])
+        self.finish(job, prepared, output)
+        _, binding, packet, draft = self.prepare(job, "source", pending["unit_id"])
+        core.save_json(job / binding["result"], draft)
+        fallback_task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", PROVIDER, MODEL)
+        fallback = core.load_json(fallback_task)
+        fallback["resolvedModelIsFallback"] = True
+        core.save_json(fallback_task, fallback)
+        with self.assertRaises(ValueError):
+            workflow.checkpoint_unit(job, "source", pending["unit_id"], fallback_task)
+        self.assertFalse((job / pending["checkpoint"]).exists())
+        original_job = workflow.load_job(job)
+        original_job_bytes = (job / "job.json").read_bytes()
+        active_path = job / "units/source/active.json"
+        original_active = active_path.read_bytes()
+        preserved = {name: (job / name).read_bytes() for spec in plan["units"]
+                     for name in (spec["packet"], spec["result"])}
+        preserved[completed["checkpoint"]] = (job / completed["checkpoint"]).read_bytes()
+        next_model = {"provider": "openai-codex", "model": "gpt-6-luna"}
+    
+        for artifact in (job / "job.json", job / original_job["source_file"]):
+            original = artifact.read_bytes()
+            try:
+                if artifact.name == "job.json":
+                    metadata = core.load_json(artifact)
+                    metadata["title"] = "Changed source-plan context"
+                    core.save_json(artifact, metadata)
+                else:
+                    artifact.write_bytes(original + b"\nchanged original source")
+                before = {path.relative_to(job).as_posix(): path.read_bytes()
+                          for path in job.rglob("*") if path.is_file()}
+                with self.subTest(artifact=artifact.name), self.assertRaises(ValueError):
+                    workflow.continue_source(job, **next_model)
+                self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes()
+                                  for path in job.rglob("*") if path.is_file()}, before)
+            finally:
+                artifact.write_bytes(original)
+        transition = workflow.continue_source(job, **next_model)
+        self.assertEqual(transition["carried"], [completed["unit_id"]])
+        self.assertEqual(transition["selector"], "openai-codex/gpt-6-luna")
+        self.assertEqual(transition["models"], {role: next_model for role in workflow.ROLES})
+        self.assertEqual((job / transition["previous_job"]["path"]).read_bytes(), original_job_bytes)
+        self.assertEqual(workflow.digest_file(job / transition["previous_job"]["path"]), transition["previous_job"]["sha256"])
+        self.assertEqual((job / transition["job_snapshot"]["path"]).read_bytes(), (job / "job.json").read_bytes())
+        self.assertEqual(workflow.digest_file(job / transition["job_snapshot"]["path"]), transition["job_snapshot"]["sha256"])
+        current = workflow.load_job(job)
+        self.assertTrue(all(selection == next_model for selection in current["models"].values()))
+        self.assertEqual((current["state"], current["round"], current["max_rounds"]),
+                         (original_job["state"], original_job["round"], original_job["max_rounds"]))
+        self.assertNotEqual(active_path.read_bytes(), original_active)
+        reference = core.load_json(active_path)
+        continued = core.load_json(job / reference["plan"])
+        self.assertEqual(continued["units"][0]["carried_checkpoint"], {"path": completed["checkpoint"], "sha256": workflow.digest_file(job / completed["checkpoint"])})
+        progress = units.status(job, "source")
+        self.assertEqual(progress["admitted"], [completed["unit_id"]])
+        self.assertEqual(progress["pending"], [pending["unit_id"]])
+        for previous, replacement in zip(plan["units"], continued["units"]):
+            for key in ("unit_id", "packet", "packet_sha256", "owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"):
+                self.assertEqual(replacement[key], previous[key], key)
+        replacement = continued["units"][1]
+        for key in ("result", "assets_dir", "checkpoint"):
+            self.assertNotEqual(replacement[key], pending[key], key)
+            self.assertFalse((job / replacement[key]).exists())
+        for name, content in preserved.items():
+            self.assertEqual((job / name).read_bytes(), content, name)
+        binding = units.unit_binding(job, "source", pending["unit_id"])
+        packet = core.load_json(job / binding["packet"])
+        core.save_json(job / binding["result"], unit_output(packet, binding))
+        stale_task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", PROVIDER, MODEL)
+        with self.assertRaises(ValueError):
+            workflow.checkpoint_unit(job, "source", pending["unit_id"], stale_task)
+        self.assertFalse((job / replacement["checkpoint"]).exists())
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", **next_model)
+        workflow.checkpoint_unit(job, "source", pending["unit_id"], task)
+        workflow.assemble_units(job, "source")
+        aggregate = workflow.latest_role_receipt(job, workflow.load_job(job), "source")
+        self.assertIn({"path": completed["checkpoint"], "sha256": workflow.digest_file(job / completed["checkpoint"])}, aggregate["unit_checkpoints"])
+        members = [core.load_json(job / member["path"]) for member in aggregate["unit_checkpoints"]]
+        self.assertEqual([member["task"]["resolvedModelIdentity"] for member in members],
+                         [PROVIDER + "/" + MODEL, next_model["provider"] + "/" + next_model["model"]])
+        self.assertEqual((job / completed["checkpoint"]).read_bytes(), preserved[completed["checkpoint"]])
+        workflow.seal_job(job)
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("source_ready", 0))
+        self.assertEqual(len(core.load_json(job / "book-source.json")["source_pages"]), 2)
 
     
 

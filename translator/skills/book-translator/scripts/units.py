@@ -153,6 +153,27 @@ def _current_plan(job: Path, role: str) -> tuple[Path, dict, str]:
     return _path(job, active["plan"]), plan, active["plan_sha256"]
 
 
+def _source_model_change(previous: dict, current: dict) -> dict:
+    """Permit only one explicit future-model change during initial source work."""
+    core.validate_document("job", current)
+    selected = current["models"].get("source")
+    if (previous.get("state") != "extracted" or current.get("state") != "extracted"
+            or previous.get("round") != 0 or current.get("round") != 0
+            or not isinstance(selected, dict)
+            or any(current["models"].get(role) != selected for role in ("source", "terminology", "translation", "review"))
+            or selected == previous["models"].get("source")
+            or {key: value for key, value in previous.items() if key not in {"models", "history"}}
+                != {key: value for key, value in current.items() if key not in {"models", "history"}}
+            or len(current["history"]) != len(previous["history"]) + 1
+            or current["history"][:-1] != previous["history"]):
+        raise ValueError("Source continuation may change only all four future model choices at extracted round 0")
+    selector = core.admit_model(**selected)
+    event = current["history"][-1]
+    if event.get("event") != "source_model_continued" or event.get("selector") != selector:
+        raise ValueError("Source continuation requires its explicit model-choice history event")
+    return selected
+
+
 def _plan_inputs(job: Path, plan: dict) -> None:
     if plan.get("job_path") != str(job):
         raise ValueError("Unit plan belongs to a different absolute job")
@@ -161,6 +182,18 @@ def _plan_inputs(job: Path, plan: dict) -> None:
     draft = plan.get("draft")
     if draft is not None:
         _checked(job, draft["snapshot"], draft["snapshot_sha256"])
+    continuation = plan.get("continuation")
+    if continuation is not None:
+        if plan["role"] != "source" or plan["revision"] or plan["source_digest"] is not None:
+            raise ValueError("Model continuation applies only to initial unsealed source units")
+        previous_plan = _checked(job, continuation["plan"], continuation["plan_sha256"])
+        previous = continuation["previous_job"]
+        future = continuation["job_snapshot"]
+        previous_job = _checked(job, previous["path"], previous["sha256"])
+        future_job = _checked(job, future["path"], future["sha256"])
+        if (previous_plan.get("job_sha256") != previous["sha256"] or plan["job_sha256"] != future["sha256"]
+                or _source_model_change(previous_job, future_job) != plan["selected_model"]):
+            raise ValueError("Source continuation job snapshots do not match their immutable plans")
 
 
 
@@ -838,6 +871,99 @@ def import_checkpoints(job, role: str, plan_path) -> dict:
     return {**status(job, role), "imported": [spec["unit_id"] for spec, _ in imported]}
 
 
+def _member_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, spec: dict,
+                       origin_plans: dict) -> tuple[dict, dict]:
+    reference = spec.get("carried_checkpoint")
+    checkpoint_path = _path(job, spec["checkpoint"])
+    if reference is None:
+        checkpoint = core.load_json(checkpoint_path)
+        origin_plan, origin_name, origin_digest, origin_spec = plan, plan_name, plan_digest, spec
+    else:
+        if (plan["role"] != "source" or plan["base_state"] != "extracted" or plan["base_round"] != 0
+                or plan["revision"] or plan["source_digest"] is not None
+                or not isinstance(reference, dict) or set(reference) != {"path", "sha256"}
+                or reference["path"] != spec["checkpoint"]):
+            raise ValueError("Carried checkpoints are restricted to unchanged initial source scope")
+        checkpoint = _checked(job, reference["path"], reference["sha256"])
+        origin_name, origin_digest = checkpoint["plan"], checkpoint["plan_sha256"]
+        key = (origin_name, origin_digest)
+        if key not in origin_plans:
+            origin_plans[key] = _checked(job, origin_name, origin_digest)
+        origin_plan = origin_plans[key]
+        unchanged = ("role", "job_path", "base_state", "base_round", "revision", "source_file_sha256", "source_digest",
+                     "baseline", "extraction_sha256", "page_ids", "pages_per_unit", "max_context_pages", "metadata_owner", "draft")
+        if (origin_plan.get("kind") != "book-unit-plan"
+                or any(origin_plan.get(name) != plan.get(name) for name in unchanged)):
+            raise ValueError("Carried source checkpoint belongs to different book inputs or coverage")
+        origin_spec = next((item for item in origin_plan["units"] if item["unit_id"] == spec["unit_id"]), None)
+        ignored = {"carried_checkpoint"}
+        if (origin_spec is None
+                or {name: value for name, value in spec.items() if name not in ignored}
+                    != {name: value for name, value in origin_spec.items() if name not in ignored}):
+            raise ValueError("Carried source unit ownership, packet or output paths changed")
+    expected = _content_checkpoint(job, origin_plan, origin_name, origin_digest, origin_spec)
+    if checkpoint.get("completed") is not True or any(checkpoint.get(key) != value for key, value in expected.items()):
+        raise ValueError("Unit checkpoint differs from its complete current result/context")
+    _checkpoint_origin(job, checkpoint, origin_plan)
+    return checkpoint, core.load_json(_path(job, spec["result"]))
+
+
+def continue_source(job, future_job: dict) -> dict:
+    """Prepare a content-only source continuation; the controller publishes its intent."""
+    job = Path(job).resolve(strict=True)
+    plan_path, previous, previous_digest = _current_plan(job, "source")
+    data = _stable_context(job, previous)
+    if previous["revision"] or previous["source_digest"] is not None or (job / "source.sha256").exists():
+        raise ValueError("Source continuation requires an initial unsealed source plan")
+    selected = _source_model_change(data, future_job)
+    if previous.get("draft") is not None:
+        for name, digest in previous["draft"]["assets"].items():
+            if _hash(_path(job, name)) != digest:
+                raise ValueError("Imported untrusted draft asset identity changed")
+    carried = {}
+    origin_plans = {}
+    previous_name = _relative(job, plan_path)
+    for spec in previous["units"]:
+        checkpoint_path = _path(job, spec["checkpoint"])
+        if checkpoint_path.exists() or spec.get("carried_checkpoint") is not None:
+            _member_checkpoint(job, previous, previous_name, previous_digest, spec, origin_plans)
+            carried[spec["unit_id"]] = {"path": spec["checkpoint"], "sha256": _hash(checkpoint_path)}
+    old_bytes = (job / "job.json").read_bytes()
+    if hashlib.sha256(old_bytes).hexdigest() != previous["job_sha256"]:
+        raise ValueError("Source continuation job changed during validation")
+    identifier = uuid.uuid4().hex
+    directory = _path(job, f"units/source/{identifier}")
+    directory.mkdir(parents=True, exist_ok=False)
+    previous_job_path = directory / "previous-job.json"
+    previous_job_path.write_bytes(old_bytes)
+    future_job_path = directory / "job-snapshot.json"
+    _write_once(future_job_path, future_job)
+    previous_job = {"path": _relative(job, previous_job_path), "sha256": _hash(previous_job_path)}
+    job_snapshot = {"path": _relative(job, future_job_path), "sha256": _hash(future_job_path)}
+    specs = []
+    for old_spec in previous["units"]:
+        spec = dict(old_spec)
+        reference = carried.get(spec["unit_id"])
+        if reference is not None:
+            spec["carried_checkpoint"] = reference
+        else:
+            spec.pop("carried_checkpoint", None)
+            spec.update(result=_relative(job, directory / "results" / f"{spec['unit_id']}.json"),
+                        assets_dir=_relative(job, directory / "assets" / spec["unit_id"]),
+                        checkpoint=_relative(job, directory / "checkpoints" / f"{spec['unit_id']}.json"))
+        specs.append(spec)
+    plan = {**previous, "plan_id": identifier, "job_sha256": job_snapshot["sha256"], "selected_model": selected,
+            "units": specs, "continuation": {"plan": previous_name, "plan_sha256": previous_digest,
+                                             "previous_job": previous_job, "job_snapshot": job_snapshot}}
+    destination = directory / "plan.json"
+    _write_once(destination, plan)
+    return {"role": "source", "plan": _relative(job, destination), "plan_sha256": _hash(destination),
+            "revision": False, "base_state": "extracted", "base_round": 0, "pages": len(plan["page_ids"]),
+            "admitted": list(carried), "pending": [spec["unit_id"] for spec in specs if spec["unit_id"] not in carried],
+            "complete": len(carried) == len(specs), "carried": list(carried),
+            "previous_job": previous_job, "job_snapshot": job_snapshot}
+
+
 def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[list, list]:
     checkpoints, outputs = [], []
     _plan_inputs(job, plan)
@@ -861,15 +987,11 @@ def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[l
         pdf_owned = [page for item in plan["units"] for page in item["pdf_pages"]]
         if Counter(pdf_owned) != Counter(plan["pdf_page_ids"]):
             raise ValueError("Review unit plan lacks exact complete physical PDF page ownership")
+    origin_plans = {}
     for spec in plan["units"]:
-        checkpoint_path = _path(job, spec["checkpoint"])
-        checkpoint = core.load_json(checkpoint_path)
-        expected = _content_checkpoint(job, plan, plan_name, plan_digest, spec)
-        if checkpoint.get("completed") is not True or any(checkpoint.get(key) != value for key, value in expected.items()):
-            raise ValueError("Unit checkpoint differs from its complete current result/context")
-        _checkpoint_origin(job, checkpoint, plan)
-        checkpoints.append({"path": spec["checkpoint"], "sha256": _hash(checkpoint_path)})
-        outputs.append(core.load_json(_path(job, spec["result"])))
+        _, output = _member_checkpoint(job, plan, plan_name, plan_digest, spec, origin_plans)
+        checkpoints.append({"path": spec["checkpoint"], "sha256": _hash(_path(job, spec["checkpoint"]))})
+        outputs.append(output)
     return checkpoints, outputs
 
 
