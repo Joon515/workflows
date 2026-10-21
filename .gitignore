@@ -1,2 +1,5 @@
-ref_repo/
-tmp/
+# Optional local upstream checkouts.
+/ref_repo/
+
+# Local scratch files and translation jobs.
+/tmp/

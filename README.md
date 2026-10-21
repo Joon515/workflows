@@ -34,7 +34,8 @@ Shared AI conversations 是待核验假设，不是独立证据。规模、relea
 - `omp-workflow/`：独立分发的 workflow package；具体 activation、覆盖范围和 verification 见其 README。
 - `translator/`：独立分发的书籍翻译 workflow package；包含转换脚本、LaTeX 模板和 omp 阶段协议。
 - `ref/`：经典 software engineering 参考书。
-- `ref_repo/`：optional upstream checkouts，已由 `.gitignore` 排除；交付 package 不依赖它们。
+- `ref_repo/`：仓库根目录的 optional upstream checkouts，由 `.gitignore` 的 `/ref_repo/` 排除；交付 package 不依赖它们。
+- `tmp/`：仓库根目录的本地临时文件与翻译 jobs，由 `/tmp/` 排除；根规则不会屏蔽 workflow 内部的同名目录。
 - [AGENTS.md](AGENTS.md)：本仓库的 English management guidance，不随 workflow 复制到目标项目。
 
 格式依据：[Agent Plugins specification](https://agent-plugins.org/specification)、[Agent Skills specification](https://agentskills.io/specification)、[AGENTS.md convention](https://agents.md/)。
