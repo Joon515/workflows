@@ -270,6 +270,17 @@ The native hook/controller bridge is configuration and observed-evidence enforce
 [OBSERVED] The complete workflow/unit modules passed 68 tests in 18.874 seconds, including mixed-model continuation through source assembly/sealing. Full discovery passed 236 tests in 188.756 seconds: 235 passed, one conditional missing-decoder case skipped. After restoring native tool defaults, all six copy/startup/project-agent activation scenarios passed with zero model prompts or forwarded credentials.
 
 
+## Native task instructions versus effort metadata
+
+[SOURCE] In the pinned native runtime, task text is the child instruction channel. solutionSpace describes work open-endedness for the optional auto-thinking classifier; it is not a second worker-message or implementation channel. The authoritative source anchors and caller guidance are in [omp-contract.md](omp-contract.md). Required paths, recipes, boundaries and feedback now live in each item task; solutionSpace remains present only as the native API effort hint. No new execution adapter or tool-inventory copy was added.
+
+[OBSERVED] A current-session Luna source assignment had the working Python/PIL image recipe only in solutionSpace. Its actual settled task/assignment fields contained no PIL recipe, and the worker instead reported browser/computer preview failures. This was a coordinator instruction-placement error, not evidence that native Python image display or Bash was unavailable. Continuing that same native worker with the recipe in a visible message produced image inspection, completed source reconstruction and a valid content checkpoint without a new session/client or repeated completed-unit work.
+
+[OBSERVED] A subsequent ordinary native source task for u0053 put the recipe directly in task text. The actual SingleResult task field contained PIL, and the worker used it to inspect and correct the assigned first four pages while explicitly leaving the remaining four pending. A same-worker continuation then completed all eight pages, validated the result and produced the source content checkpoint. Partial output and zero native exit status alone were not treated as source completion. This exercised instruction delivery and book-data progress, not independent perception or whole-book translation quality.
+
+[OBSERVED] English agent-facing content and relative Markdown links, including heading anchors, passed across the thirteen documentation assets checked for this correction. The change updates guidance only; no book schema, validator, authentication, retry or model-dispatch implementation was changed. The complete 603-page book remains in source preparation until every source unit is complete and the aggregate is separately validated and sealed.
+
+
 ## Verification interpretation
 
 Schema/semantic tests cover selected data boundaries and state transitions; they cannot establish all protected-span discovery, OCR fidelity, translation accuracy or truthfulness of model-supplied research/review. Mechanical PDF checks are not a substitute for visual and semantic review. Synthetic fixtures are development data, not evidence of a real book translated by an admitted model. Runtime identity resolution without a prompt is not inference evidence.

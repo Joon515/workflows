@@ -31,20 +31,20 @@ python3 <skill>/scripts/translator.py extract <job> --ocr auto --language eng
 
 Roles run in order: source, terminology, translation, review. More than eight source pages requires bounded units for source/translation/review; terminology remains whole-role against complete sealed source. Smaller eligible jobs may use whole-role authoring. Exact book/result/metadata fields live only in [format.md](format.md).
 
-For units, plan once, inspect unit-status and read the selected pending unit's immutable packet and assigned result/assets paths. Supply ordinary native task fields, for example:
+For units, plan once, inspect unit-status and read the selected pending unit's immutable packet and assigned result/assets paths. The coordinator must put ALL worker instructions, absolute paths, commands/recipes, complete scope, feedback and write boundaries in per-item task text. Supply all required native API fields; solutionSpace is only a short open-endedness/auto-effort description. The authoritative explanation is [native task field semantics](omp-contract.md#native-task-field-semantics). For example:
 
 ```text
 task({
-  context: "Resolved job and skill paths; selected role/model; canonical instructions; relevant feedback",
+  context: "Book-source reconstruction of one bounded unit",
   tasks: [{
     agent: "book-source",
-    task: "Complete returned unit ID using its exact packet; write only its assigned result/assets",
-    solutionSpace: "Exact packet/result paths; owned scope and read-only seam context; no canonical/sibling writes"
+    task: "For job /absolute/book-job, source unit RETURNED_UNIT_ID: read /absolute/package/skills/book-translator/references/format.md and /absolute/package/skills/book-translator/stages/source.md, then the exact returned packet /absolute/PACKET_PATH.json. Complete every owned page and use its read-only seam context. Follow all required inspection commands/recipes and feedback written here. Write only /absolute/RESULT_PATH.json and assets in /absolute/ASSETS_DIR; never canonical or sibling files. Include the complete assignment-specific inspection recipe and feedback in this task text before dispatch.",
+    solutionSpace: "Bounded reconstruction with limited editorial judgment"
   }]
 })
 ```
 
-Replace the descriptive example with the actual paths, IDs, complete scope and constraints. Use book-terminology, book-translation or book-review for the other roles. No hidden dispatch token, preparation step or translator-specific model parameter is involved. Workers complete the entire assigned scope, never samples. In unit mode only the controller merges canonical book-source.json, book.json or the whole-book review report. Eligible small whole-role workers receive their specific canonical output paths; terminology writes terms.json and handoff.md.
+Replace every descriptive path/ID and include the actual complete scope, commands/recipes, feedback and constraints in task itself before dispatch. Do not leave them solely in context or solutionSpace and do not instruct the worker to recover them from raw parent tool JSON. Use book-terminology, book-translation or book-review for the other roles. No hidden dispatch token, preparation step or translator-specific model parameter is involved. Workers complete the entire assigned scope, never samples. In unit mode only the controller merges canonical book-source.json, book.json or the whole-book review report. Eligible small whole-role workers receive their specific canonical output paths; terminology writes terms.json and handoff.md.
 
 Wait using native task facilities until settlement. Persist the ACTUAL settled child's flat SingleResult metadata, not an outer batch envelope or worker-written status and not values reconstructed from the model choice. Inspect the actual native result identity and completion status before invoking:
 

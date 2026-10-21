@@ -24,7 +24,7 @@ The shipped templates use conventional `model: "@task"` frontmatter. **Before so
 
 Native OMP owns the current registry/authentication, model resolution, retries, fallback, task settlement and session/task journals. Existing OpenCode Go, OAuth, custom and keyless/local providers remain native; the package creates no private registry, credential forwarder, provider capture or separate model launcher. Registration, authentication, actual request success and translation quality are separate facts. Catalogue presence does not promise service availability or free requests. User authorization must cover source disclosure and any paid use.
 
-Supply ordinary native task context and per-item agent/task/solutionSpace with complete scope, paths, feedback and write boundaries. After actual native settlement, check the ACTUAL flat SingleResult identity/status and record book progress through checkpoint-unit or checkpoint-role. A model mismatch/fallback/error/abort is not silently accepted or relabeled as the requested model. Native policy remains unchanged. Checkpoint identity is descriptive native operator metadata/book progress, **not independently proved engine authentication**, endpoint identity, image perception or translation quality.
+Supply the required ordinary native API fields, but put ALL worker instructions, absolute job/skill/packet/result paths, commands/recipes, complete scope, feedback and write boundaries in per-item task text. solutionSpace is only a short open-endedness/auto-effort description, not a worker instruction channel; see the authoritative [native task field semantics](skills/book-translator/references/omp-contract.md#native-task-field-semantics). After actual native settlement, check the ACTUAL flat SingleResult identity/status and record book progress through checkpoint-unit or checkpoint-role. A model mismatch/fallback/error/abort is not silently accepted or relabeled as the requested model. Native policy remains unchanged. Checkpoint identity is descriptive native operator metadata/book progress, **not independently proved engine authentication**, endpoint identity, image perception or translation quality.
 
 ## Default layout
 
@@ -87,7 +87,7 @@ Source, translation and review with more than eight source pages require bounded
 python3 "$skill/scripts/translator.py" plan-units /path/book-job source --pages-per-unit 4
 # Optional untrusted source reading aid: --draft /path/existing-source-draft.json
 python3 "$skill/scripts/translator.py" unit-status /path/book-job source
-# Native book-source tasks use actual pending IDs/packets and ordinary context/task/solutionSpace.
+# Native tasks put all instructions/absolute paths/recipes/bounds/feedback in item task; supply context and short auto-effort solutionSpace separately.
 # Wait for native settlement; persist each ACTUAL flat SingleResult, then:
 python3 "$skill/scripts/translator.py" checkpoint-unit /path/book-job source UNIT_ID --task-result /path/actual-single-result.json
 python3 "$skill/scripts/translator.py" assemble-units /path/book-job source
