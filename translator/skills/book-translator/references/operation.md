@@ -67,7 +67,7 @@ python3 <skill>/scripts/translator.py unit-status <job> <role>
 python3 <skill>/scripts/translator.py assemble-units <job> <role>
 ```
 
-The exact planner is plan-units JOB ROLE --pages-per-unit N [--draft PATH] [--revise], with integer N from 1 through 8. Choose smaller units for dense content; never evade the bound with a giant unit. Draft source import is only a reading aid: every imported page starts pending. Fresh extraction without a draft yields an unreviewed OCR/native-text page skeleton, not ready source. Every assigned page requires actual visual inspection and page-specific evidence. Preserve original files and historical job/provenance bytes.
+The ordinary planner is plan-units JOB ROLE --pages-per-unit N [--draft PATH] [--revise], with integer N from 1 through 8. Choose smaller units for dense content; never evade the bound with a giant unit. Existing pending translation may be reduced only through the explicit [pending translation replan contract](format.md#repartitioning-pending-translation) and procedure below. Draft source import is only a reading aid: every imported page starts pending. Fresh extraction without a draft yields an unreviewed OCR/native-text page skeleton, not ready source. Every assigned page requires actual visual inspection and page-specific evidence. Preserve original files and historical job/provenance bytes.
 
 Planning binds stage readiness and unchanged context. Checkpointing validates each unit's own completed result and metadata against that plan without replaying an entire model transcript. It neither merges canonical files nor seals source, builds a partial book, advances state/round, submits review or accepts. After interruption resume pending work from durable status/results/checkpoints, not conversation memory. Do not redispatch checkpointed work or claim a partial result is complete.
 
@@ -113,6 +113,22 @@ python3 <skill>/scripts/translator.py unit-status <job> <role>
 ```
 
 Import validates only receipt-bound completed legacy results, creates a sibling domain book-plan.json and hash-referenced historical-origin checkpoints, then updates the active plan pointer. Original job, legacy plan/packet/result/receipt/evidence bytes remain unchanged. Failed, unreceipted or merely present results are not completed imports; they remain pending. Import neither calls a model nor invents current native settlement/authentication evidence. Continue the pending IDs using ordinary native tasks, never overwrite historical completed work or reset rounds.
+
+### Reducing pending translation units
+
+When an existing active domain translation plan needs a smaller pending scope, use the canonical [pending translation replan contract](format.md#repartitioning-pending-translation), not initial planning, hand-edited ownership or another execution wrapper. The change stays in the same eligible translation state/round with unchanged job/model/sealed-source/terminology/handoff/readiness/baseline bindings. It is translation-only, requires a strict reduction of the current pending page bound and refuses --draft, --revise or no pending work.
+
+1. Settle every assignment using the old translation plan through ordinary native task facilities. Inspect actual native status/identity and checkpoint any fully completed admissible result before replanning. Preserve failed or partial drafts and journals without manufacturing completion. Do not leave workers writing old paths during the transition.
+2. Read current unit-status and the active plan to distinguish completed ownership from pending pages. Choose the lower N without changing source structure or treating read-only seam context as writable scope.
+3. Run the existing planner with the explicit flag, then read its returned plan and actual status:
+
+   ```sh
+   python3 <skill>/scripts/translator.py plan-units <job> translation --pages-per-unit <smaller-N> --replan-pending
+   python3 <skill>/scripts/translator.py unit-status <job> translation
+   ```
+
+4. Read the returned immutable plan and each new pending packet for exact IDs, result paths, assets directories, checkpoint paths, complete owned blocks and bounded read-only neighbors. Never guess replacement IDs from old IDs or page numbers. Put the full new assignment and paths in ordinary native task text. Do not redispatch carried completed units, re-author their title/preface or promote old pending drafts as new results.
+5. Continue native tasks and checkpoint only the new pending scope. Carried checkpoints keep their original paths/hashes, ownership and actual task/model origins, including ownership above the new N but never above eight pages. Only complete aggregate assembly/build may advance a round; the replan itself resets no round/cap and permits no partial release.
 
 ### Continuing or correcting unsealed source work
 

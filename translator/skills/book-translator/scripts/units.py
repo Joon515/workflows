@@ -179,6 +179,19 @@ def _source_model_change(previous: dict, current: dict) -> dict:
     return selected
 
 
+def _translation_replan_context(plan: dict, previous: dict) -> None:
+    unchanged = ("role", "job_path", "job_sha256", "base_state", "base_round", "revision", "selected_model",
+                 "source_file_sha256", "source_digest", "baseline", "extraction_sha256", "page_ids", "pages",
+                 "max_context_pages", "draft", "build", "pdf_page_ids", "readiness", "review_artifacts")
+    if (plan.get("role") != "translation" or previous.get("kind") != "book-unit-plan"
+            or plan.get("base_state") not in {"terminology_ready", "changes_requested"}
+            or plan.get("revision") is not False or plan.get("source_digest") is None
+            or type(plan.get("pages_per_unit")) is not int or type(previous.get("pages_per_unit")) is not int
+            or not 1 <= plan["pages_per_unit"] < previous["pages_per_unit"] <= 8
+            or any(plan.get(name) != previous.get(name) for name in unchanged)):
+        raise ValueError("Pending translation replan changed bound book/model/readiness inputs or did not reduce its target")
+
+
 def _plan_inputs(job: Path, plan: dict) -> None:
     if plan.get("job_path") != str(job):
         raise ValueError("Unit plan belongs to a different absolute job")
@@ -200,6 +213,12 @@ def _plan_inputs(job: Path, plan: dict) -> None:
                 or _source_model_change(previous_job, future_job) != plan["selected_model"]
                 or continuation.get("reopened", []) != future_job["history"][-1].get("reopened", [])):
             raise ValueError("Source continuation job snapshots do not match their immutable plans")
+    pending_replan = plan.get("pending_replan")
+    if pending_replan is not None:
+        if not isinstance(pending_replan, dict) or set(pending_replan) != {"plan", "plan_sha256"}:
+            raise ValueError("Invalid pending translation replan link")
+        previous = _checked(job, pending_replan["plan"], pending_replan["plan_sha256"])
+        _translation_replan_context(plan, previous)
 
 
 
@@ -309,89 +328,21 @@ def _review_ownership(job: Path, specs: list, block_owners: dict, note_owners: d
 
 
 
-def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
-                max_context_pages: int = 4, readiness: dict | None = None) -> dict:
-    """Snapshot bounded page evidence and untrusted draft slices without admission.
-
-    A complete block belongs to its first source page's unit. Notes follow their
-    callout owner; shared protected declarations have one owner and read-only
-    copies elsewhere. Crossing blocks stay intact with bounded context pages.
-    """
-    job = Path(job).resolve(strict=True)
-    if role not in _ROLES or type(pages_per_unit) is not int or not 1 <= pages_per_unit <= 8:
-        raise ValueError("Choose source/translation/review and pages_per_unit between 1 and 8")
-    if type(max_context_pages) is not int or not 0 <= max_context_pages <= 4:
-        raise ValueError("max_context_pages must be between 0 and 4")
-    if role != "source" and (not isinstance(readiness, dict) or not isinstance(readiness.get("bindings"), dict)):
-        raise ValueError("Controller must supply admitted readiness bindings for translation/review planning")
-    data = _job(job)
-    if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
-           for name in ("source", "terminology", "translation", "review")):
-        raise ValueError("Every exact role model must be configured before unit planning")
-    sealed = (job / "source.sha256").is_file()
-    if role == "source":
-        if (revise and not sealed) or (not revise and (data["state"] != "extracted" or sealed)):
-            raise ValueError("Source units require extracted/unsealed state or explicit sealed revision")
-    elif role == "translation" and (revise or data["state"] not in {"terminology_ready", "changes_requested"} or data["round"] >= data["max_rounds"]):
-        raise ValueError("Translation units require an eligible pending translation round")
-    elif role == "review" and (revise or data["state"] != "translated" or data["round"] < 1):
-        raise ValueError("Review units require a current translated round")
-    if role in {"translation", "review"}:
-        core.validate_book(job, translated=role == "review")
-        core.validate_document("terms", core.load_json(job / "terms.json"))
-        if not (job / "handoff.md").read_text(encoding="utf-8").strip():
-            raise ValueError("Translation units require a substantive terminology handoff")
-    extraction = core.extraction_inventory(job)
-    if extraction is None:
-        raise ValueError("Unit planning requires controller-admitted complete extraction evidence")
-    extraction_digest = next(event["extraction_sha256"] for event in reversed(data["history"]) if event.get("event") == "extracted")
-    pages = extraction["pages"]
-    page_ids = [page["id"] for page in pages]
-    page_order = {name: index for index, name in enumerate(page_ids)}
-    identifier = uuid.uuid4().hex
-    directory = _path(job, f"units/{role}/{identifier}")
-    directory.mkdir(parents=True, exist_ok=False)
-    baseline = _baseline(job)
-    review_artifacts = {}
-    if role == "review":
-        for suffix in ("json", "receipt.json"):
-            name = f"reviews/round-{data['round']}.{suffix}"
-            path = _path(job, name)
-            review_artifacts[name] = _hash(path) if path.is_file() else None
-    draft_info = None
-    build = _review_build(job) if role == "review" else None
-    if role in {"translation", "review"}:
-        draft = core.load_json(job / ("book.json" if role == "review" else "book-source.json"))
-    else:
-        selected_draft = Path(draft_path).resolve(strict=True) if draft_path else job / "book-source.json"
-        if selected_draft.is_file():
-            draft, draft_info = _import_draft(job, directory, selected_draft)
-        else:
-            draft = {"title": data["title"], "main_body_start": None, "source_pages": [],
-                     "blocks": [], "notes": [], "protected": []}
-            for page in pages:
-                text = page.get("ocr", {}).get("text") or page.get("text", "")
-                source = [{"page": page["id"]}]
-                if text:
-                    source.append({"text": text})
-                draft["blocks"].append({"id": f"draft_{page['id']}", "kind": "paragraph",
-                    "source_pages": [page["id"]], "source": source, "target": []})
-    if role != "source" and [page["id"] for page in draft["source_pages"]] != page_ids:
-        raise ValueError("Sealed source inventory differs from complete original extraction page order")
-    declarations = {}
-    for category in ("blocks", "notes", "protected"):
-        declarations[category] = {item["id"]: item for item in draft[category]}
-        if len(declarations[category]) != len(draft[category]):
-            raise ValueError(f"Draft {category} IDs are duplicated; resolve ownership before planning")
-    owners = {}
-    unit_specs = []
-    for offset in range(0, len(pages), pages_per_unit):
-        owned = page_ids[offset:offset + pages_per_unit]
-        unit_id = f"u{len(unit_specs) + 1:04d}"
-        unit_specs.append({"unit_id": unit_id, "owned_pages": owned, "owned_block_ids": [],
-                           "owned_note_ids": [], "owned_protected_ids": []})
-        owners.update({page: unit_id for page in owned})
-    specifications = {item["unit_id"]: item for item in unit_specs}
+def _assign_ownership(draft: dict, declarations: dict, unit_specs: list, page_order: dict) -> tuple:
+    owners, specifications = {}, {}
+    for spec in unit_specs:
+        if spec["unit_id"] in specifications:
+            raise ValueError("Unit IDs must be unique")
+        specifications[spec["unit_id"]] = spec
+        owned = spec["owned_pages"]
+        if not owned or len(owned) > 8 or any(page not in page_order or page in owners for page in owned):
+            raise ValueError("Unit ownership does not cover the exact original source page union")
+        positions = [page_order[page] for page in owned]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            raise ValueError("Unit owned pages must be contiguous in original source order")
+        owners.update({page: spec["unit_id"] for page in owned})
+    if set(owners) != set(page_order):
+        raise ValueError("Unit ownership does not cover the exact original source page union")
     block_owners = {}
     for block in draft["blocks"]:
         covered = block.get("source_pages", [])
@@ -426,11 +377,180 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             raise ValueError(f"Draft references missing protected declaration {name}")
     for item in draft["protected"]:
         users = protected_users.get(item["id"], {unit_specs[0]["unit_id"]})
-        specifications[min(users)]["owned_protected_ids"].append(item["id"])
+        first_owner = min(users, key=lambda unit_id: page_order[specifications[unit_id]["owned_pages"][0]])
+        specifications[first_owner]["owned_protected_ids"].append(item["id"])
     metadata_owner = block_owners.get(draft.get("main_body_start"), unit_specs[0]["unit_id"])
+    return block_owners, note_owners, protected_users, metadata_owner
+
+
+def _prepare_pending_translation(job: Path, pages_per_unit: int, max_context_pages: int,
+                                 readiness: dict) -> tuple[dict, dict, dict]:
+    path, previous, digest = _current_plan(job, "translation")
+    _stable_context(job, previous)
+    if (previous["revision"] or previous["source_digest"] is None
+            or previous["base_state"] not in {"terminology_ready", "changes_requested"}
+            or previous.get("readiness") != readiness or previous["max_context_pages"] != max_context_pages):
+        raise ValueError("Pending translation replanning requires unchanged stage readiness and context")
+    if type(previous["pages_per_unit"]) is not int or not 1 <= pages_per_unit < previous["pages_per_unit"] <= 8:
+        raise ValueError("Pending translation replanning must strictly reduce pages_per_unit")
+    specs = previous["units"]
+    ids = [spec["unit_id"] for spec in specs]
+    owned = [page for spec in specs for page in spec["owned_pages"]]
+    if (len(set(ids)) != len(ids) or any(not unit.startswith("u") or not unit[1:].isascii() or not unit[1:].isdigit() for unit in ids)
+            or len(set(previous["page_ids"])) != len(previous["page_ids"])
+            or Counter(owned) != Counter(previous["page_ids"])
+            or set(previous["pages"]) != set(previous["page_ids"])):
+        raise ValueError("Active translation plan lacks exact unique unit/page ownership")
+    carried, origin_plans = {}, {}
+    for spec in specs:
+        packet = _checked(job, spec["packet"], spec["packet_sha256"])
+        _packet_scope(packet)
+        if (packet.get("role") != "translation" or packet.get("source_file_sha256") != previous["source_file_sha256"]
+                or any(packet.get(key) != spec[key] for key in
+                       ("unit_id", "owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"))
+                or any(previous["pages"].get(page["page_id"]) != page for page in packet["pages"])):
+            raise ValueError("Active translation packet differs from its planned ownership/evidence")
+        checkpoint_path = _path(job, spec["checkpoint"])
+        if checkpoint_path.exists() or spec.get("carried_checkpoint") is not None:
+            _member_checkpoint(job, previous, _relative(job, path), digest, spec, origin_plans)
+            carried[spec["unit_id"]] = {**spec, "carried_checkpoint": {
+                "path": spec["checkpoint"], "sha256": _hash(checkpoint_path)}}
+        else:
+            _packet_inputs(job, packet)
+    if len(carried) == len(specs):
+        raise ValueError("No pending translation units remain to replan")
+    return {"plan": _relative(job, path), "plan_sha256": digest}, previous, carried
+
+
+def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
+                max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False) -> dict:
+    """Snapshot bounded page evidence and untrusted draft slices without admission.
+
+    A complete block belongs to its first source page's unit. Notes follow their
+    callout owner; shared protected declarations have one owner and read-only
+    copies elsewhere. Crossing blocks stay intact with bounded context pages.
+    """
+    job = Path(job).resolve(strict=True)
+    if role not in _ROLES or type(pages_per_unit) is not int or not 1 <= pages_per_unit <= 8:
+        raise ValueError("Choose source/translation/review and pages_per_unit between 1 and 8")
+    if type(max_context_pages) is not int or not 0 <= max_context_pages <= 4:
+        raise ValueError("max_context_pages must be between 0 and 4")
+    if role != "source" and (not isinstance(readiness, dict) or not isinstance(readiness.get("bindings"), dict)):
+        raise ValueError("Controller must supply admitted readiness bindings for translation/review planning")
+    if replan_pending and (role != "translation" or draft_path is not None or revise):
+        raise ValueError("Pending replanning requires translation without draft import or revision")
+    data = _job(job)
+    if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
+           for name in ("source", "terminology", "translation", "review")):
+        raise ValueError("Every exact role model must be configured before unit planning")
+    sealed = (job / "source.sha256").is_file()
+    if role == "source":
+        if (revise and not sealed) or (not revise and (data["state"] != "extracted" or sealed)):
+            raise ValueError("Source units require extracted/unsealed state or explicit sealed revision")
+    elif role == "translation" and (revise or data["state"] not in {"terminology_ready", "changes_requested"} or data["round"] >= data["max_rounds"]):
+        raise ValueError("Translation units require an eligible pending translation round")
+    elif role == "review" and (revise or data["state"] != "translated" or data["round"] < 1):
+        raise ValueError("Review units require a current translated round")
+    if role in {"translation", "review"}:
+        core.validate_book(job, translated=role == "review")
+        core.validate_document("terms", core.load_json(job / "terms.json"))
+        if not (job / "handoff.md").read_text(encoding="utf-8").strip():
+            raise ValueError("Translation units require a substantive terminology handoff")
+    pending_replan, previous, carried = None, None, {}
+    if replan_pending:
+        pending_replan, previous, carried = _prepare_pending_translation(job, pages_per_unit, max_context_pages, readiness)
+    extraction = core.extraction_inventory(job)
+    if extraction is None:
+        raise ValueError("Unit planning requires controller-admitted complete extraction evidence")
+    extraction_digest = next(event["extraction_sha256"] for event in reversed(data["history"]) if event.get("event") == "extracted")
+    pages = extraction["pages"]
+    page_ids = [page["id"] for page in pages]
+    page_order = {name: index for index, name in enumerate(page_ids)}
+    identifier = uuid.uuid4().hex
+    directory = _path(job, f"units/{role}/{identifier}")
+    if not replan_pending:
+        directory.mkdir(parents=True, exist_ok=False)
+    baseline = _baseline(job)
+    review_artifacts = {}
+    if role == "review":
+        for suffix in ("json", "receipt.json"):
+            name = f"reviews/round-{data['round']}.{suffix}"
+            path = _path(job, name)
+            review_artifacts[name] = _hash(path) if path.is_file() else None
+    draft_info = None
+    build = _review_build(job) if role == "review" else None
+    if role in {"translation", "review"}:
+        draft = core.load_json(job / ("book.json" if role == "review" else "book-source.json"))
+    else:
+        selected_draft = Path(draft_path).resolve(strict=True) if draft_path else job / "book-source.json"
+        if selected_draft.is_file():
+            draft, draft_info = _import_draft(job, directory, selected_draft)
+        else:
+            draft = {"title": data["title"], "main_body_start": None, "source_pages": [],
+                     "blocks": [], "notes": [], "protected": []}
+            for page in pages:
+                text = page.get("ocr", {}).get("text") or page.get("text", "")
+                source = [{"page": page["id"]}]
+                if text:
+                    source.append({"text": text})
+                draft["blocks"].append({"id": f"draft_{page['id']}", "kind": "paragraph",
+                    "source_pages": [page["id"]], "source": source, "target": []})
+    if role != "source" and [page["id"] for page in draft["source_pages"]] != page_ids:
+        raise ValueError("Sealed source inventory differs from complete original extraction page order")
+    declarations = {}
+    for category in ("blocks", "notes", "protected"):
+        declarations[category] = {item["id"]: item for item in draft[category]}
+        if len(declarations[category]) != len(draft[category]):
+            raise ValueError(f"Draft {category} IDs are duplicated; resolve ownership before planning")
+    unit_specs = []
+    if previous is None:
+        groups = [(f"u{index + 1:04d}", page_ids[offset:offset + pages_per_unit])
+                  for index, offset in enumerate(range(0, len(pages), pages_per_unit))]
+    else:
+        if page_ids != previous["page_ids"]:
+            raise ValueError("Original page inventory changed before pending replanning")
+        expected = [{"unit_id": spec["unit_id"], "owned_pages": spec["owned_pages"], "owned_block_ids": [],
+                     "owned_note_ids": [], "owned_protected_ids": []} for spec in previous["units"]]
+        old_ownership = _assign_ownership(draft, declarations, expected, page_order)
+        if (old_ownership[3] != previous["metadata_owner"]
+                or any(any(check[key] != original[key] for key in
+                           ("owned_block_ids", "owned_note_ids", "owned_protected_ids"))
+                       for check, original in zip(expected, previous["units"]))):
+            raise ValueError("Active translation plan differs from canonical block/note/protected ownership")
+        completed_pages = {page for spec in carried.values() for page in spec["owned_pages"]}
+        new_groups = []
+        for offset in range(0, len(page_ids), pages_per_unit):
+            run = []
+            for page in page_ids[offset:offset + pages_per_unit]:
+                if page in completed_pages:
+                    if run:
+                        new_groups.append(run)
+                        run = []
+                else:
+                    run.append(page)
+            if run:
+                new_groups.append(run)
+        next_id = max(int(spec["unit_id"][1:]) for spec in previous["units"]) + 1
+        groups = [(spec["unit_id"], spec["owned_pages"]) for spec in carried.values()]
+        groups.extend((f"u{next_id + index:04d}", owned) for index, owned in enumerate(new_groups))
+        groups.sort(key=lambda group: page_order[group[1][0]])
+    for unit_id, owned in groups:
+        unit_specs.append({"unit_id": unit_id, "owned_pages": owned, "owned_block_ids": [],
+                           "owned_note_ids": [], "owned_protected_ids": []})
+    ownership = _assign_ownership(draft, declarations, unit_specs, page_order)
+    block_owners, note_owners, protected_users, metadata_owner = ownership
+    if previous is not None:
+        for index, spec in enumerate(unit_specs):
+            if spec["unit_id"] not in carried:
+                continue
+            original = carried[spec["unit_id"]]
+            if (any(spec[key] != original[key] for key in ("owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"))
+                    or (previous["metadata_owner"] == spec["unit_id"]) != (metadata_owner == spec["unit_id"])):
+                raise ValueError("Pending replanning changed completed unit ownership or metadata authority")
+            unit_specs[index] = original
     pdf_page_ids = _review_ownership(job, unit_specs, block_owners, note_owners, metadata_owner) if role == "review" else []
-    page_records = {}
-    for page in pages:
+    page_records = previous["pages"] if previous is not None else {}
+    for page in ([] if previous is not None else pages):
         image = page.get("image")
         if not image or not _path(job, image).is_file():
             raise ValueError(f"Source page {page['id']} lacks a readable inspection image")
@@ -440,7 +560,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             "evidence": _relative(job, destination), "evidence_sha256": _hash(destination),
             "image": image, "image_sha256": _hash(_path(job, image)),
             "raster_region_count": len(page.get("image_regions", []))}
-    for spec in unit_specs:
+    def packet_for(spec, packet_plan_id, records, packet_ownership):
+        block_owners, note_owners, protected_users, metadata_owner = packet_ownership
         blocks = [declarations["blocks"][name] for name in spec["owned_block_ids"]]
         notes = [declarations["notes"][name] for name in spec["owned_note_ids"]]
         context_blocks = [block for block in draft["blocks"] if block["id"] not in spec["owned_block_ids"]
@@ -476,9 +597,9 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             raise ValueError(f"Unit {spec['unit_id']} needs {len(context)} context pages, exceeding declared bound {max_context_pages}; explicitly replan")
         referenced = references | set(spec["owned_protected_ids"])
         packet = {"version": 1, "kind": "book-unit-packet", "role": role, "unit_id": spec["unit_id"],
-            "plan_id": identifier, "source_file_sha256": data["source_sha256"],
+            "plan_id": packet_plan_id, "source_file_sha256": data["source_sha256"],
             "owned_pages": spec["owned_pages"], "context_pages": sorted(context, key=page_order.__getitem__),
-            "pages": [page_records[name] for name in spec["owned_pages"] + sorted(context, key=page_order.__getitem__)],
+            "pages": [records[name] for name in spec["owned_pages"] + sorted(context, key=page_order.__getitem__)],
             "owned_block_ids": spec["owned_block_ids"], "owned_note_ids": spec["owned_note_ids"],
             "owned_protected_ids": spec["owned_protected_ids"],
             "shared_protected_ids": sorted(name for name in referenced if len(protected_users.get(name, set())) > 1),
@@ -507,6 +628,23 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             packet.update(build=build, pdf="build/book.pdf", pdf_pages=spec["pdf_pages"],
                           context_pdf_pages=spec["context_pdf_pages"], source_unit_id=spec["source_unit_id"])
             packet["round"] = data["round"]
+        return packet
+
+    if previous is not None:
+        for spec in previous["units"]:
+            if spec["unit_id"] in carried:
+                continue
+            expected_packet = packet_for(spec, previous["plan_id"], previous["pages"], old_ownership)
+            if _checked(job, spec["packet"], spec["packet_sha256"]) != expected_packet:
+                raise ValueError("Pending packet differs from canonical source/context/terminology inputs")
+    packets = []
+    for spec in unit_specs:
+        if spec["unit_id"] in carried:
+            continue
+        packet = packet_for(spec, identifier, page_records, ownership)
+        _packet_scope(packet)
+        packets.append((spec, packet))
+    for spec, packet in packets:
         packet_path = directory / "packets" / f"{spec['unit_id']}.json"
         _write_once(packet_path, packet)
         spec.update(packet=_relative(job, packet_path), packet_sha256=_hash(packet_path),
@@ -523,9 +661,18 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             "page_ids": page_ids, "pages": page_records, "metadata_owner": metadata_owner,
             "draft": draft_info, "build": build, "pdf_page_ids": pdf_page_ids, "readiness": readiness,
             "review_artifacts": review_artifacts, "units": unit_specs}
+    if pending_replan is not None:
+        plan["pending_replan"] = pending_replan
     destination = directory / "plan.json"
     _write_once(destination, plan)
     pointer = {"plan": _relative(job, destination), "plan_sha256": _hash(destination)}
+    if previous is not None:
+        _stable_context(job, previous)
+        _plan_inputs(job, plan)
+        origins = {}
+        for spec in unit_specs:
+            if spec.get("carried_checkpoint") is not None:
+                _member_checkpoint(job, plan, pointer["plan"], pointer["plan_sha256"], spec, origins)
     core.save_json(_path(job, f"units/{role}/active.json"), pointer)
     return {**pointer, "role": role, "units": [item["unit_id"] for item in unit_specs], "pages": len(page_ids)}
 
@@ -885,28 +1032,36 @@ def _member_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, 
         checkpoint = core.load_json(checkpoint_path)
         origin_plan, origin_name, origin_digest, origin_spec = plan, plan_name, plan_digest, spec
     else:
-        if (plan["role"] != "source" or plan["base_state"] != "extracted" or plan["base_round"] != 0
-                or plan["revision"] or plan["source_digest"] is not None
-                or not isinstance(reference, dict) or set(reference) != {"path", "sha256"}
+        if (not isinstance(reference, dict) or set(reference) != {"path", "sha256"}
                 or reference["path"] != spec["checkpoint"]):
-            raise ValueError("Carried checkpoints are restricted to unchanged initial source scope")
+            raise ValueError("Invalid carried checkpoint reference")
         checkpoint = _checked(job, reference["path"], reference["sha256"])
         origin_name, origin_digest = checkpoint["plan"], checkpoint["plan_sha256"]
         key = (origin_name, origin_digest)
         if key not in origin_plans:
             origin_plans[key] = _checked(job, origin_name, origin_digest)
         origin_plan = origin_plans[key]
-        unchanged = ("role", "job_path", "base_state", "base_round", "revision", "source_file_sha256", "source_digest",
-                     "baseline", "extraction_sha256", "page_ids", "pages_per_unit", "max_context_pages", "metadata_owner", "draft")
-        if (origin_plan.get("kind") != "book-unit-plan"
-                or any(origin_plan.get(name) != plan.get(name) for name in unchanged)):
-            raise ValueError("Carried source checkpoint belongs to different book inputs or coverage")
+        if plan["role"] == "source":
+            if (plan["base_state"] != "extracted" or plan["base_round"] != 0
+                    or plan["revision"] or plan["source_digest"] is not None):
+                raise ValueError("Carried checkpoints are restricted to unchanged initial source scope")
+            unchanged = ("role", "job_path", "base_state", "base_round", "revision", "source_file_sha256", "source_digest",
+                         "baseline", "extraction_sha256", "page_ids", "pages_per_unit", "max_context_pages", "metadata_owner", "draft")
+            if (origin_plan.get("kind") != "book-unit-plan"
+                    or any(origin_plan.get(name) != plan.get(name) for name in unchanged)):
+                raise ValueError("Carried source checkpoint belongs to different book inputs or coverage")
+        elif plan["role"] == "translation" and plan.get("pending_replan") is not None:
+            _translation_replan_context(plan, origin_plan)
+            if (origin_plan["metadata_owner"] == spec["unit_id"]) != (plan["metadata_owner"] == spec["unit_id"]):
+                raise ValueError("Carried translation metadata ownership changed")
+        else:
+            raise ValueError("Carried checkpoints require source continuation or explicit pending translation replanning")
         origin_spec = next((item for item in origin_plan["units"] if item["unit_id"] == spec["unit_id"]), None)
         ignored = {"carried_checkpoint"}
         if (origin_spec is None
                 or {name: value for name, value in spec.items() if name not in ignored}
                     != {name: value for name, value in origin_spec.items() if name not in ignored}):
-            raise ValueError("Carried source unit ownership, packet or output paths changed")
+            raise ValueError("Carried unit ownership, packet or output paths changed")
     expected = _content_checkpoint(job, origin_plan, origin_name, origin_digest, origin_spec)
     if checkpoint.get("completed") is not True or any(checkpoint.get(key) != value for key, value in expected.items()):
         raise ValueError("Unit checkpoint differs from its complete current result/context")
@@ -992,6 +1147,10 @@ def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[l
     if any(not 1 <= len(spec["owned_pages"]) <= 8 or len(set(spec["owned_pages"])) != len(spec["owned_pages"])
            for spec in plan["units"]):
         raise ValueError("Unit source-page scope exceeds its declared bound")
+    if plan.get("pending_replan") is not None and any(
+            "carried_checkpoint" not in spec and len(spec["owned_pages"]) > plan["pages_per_unit"]
+            for spec in plan["units"]):
+        raise ValueError("New pending translation unit exceeds the reduced page bound")
     if plan["role"] == "review":
         if any(len(spec["pdf_pages"]) > 8 or len(spec["context_pdf_pages"]) > 2 for spec in plan["units"]):
             raise ValueError("Review plan exceeds bounded physical PDF page scope")
