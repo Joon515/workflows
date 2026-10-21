@@ -46,7 +46,9 @@ task({
 
 Replace every descriptive path/ID and include the actual complete scope, commands/recipes, feedback and constraints in task itself before dispatch. Do not leave them solely in context or solutionSpace and do not instruct the worker to recover them from raw parent tool JSON. Use book-terminology, book-translation or book-review for the other roles. No hidden dispatch token, preparation step or translator-specific model parameter is involved. Workers complete the entire assigned scope, never samples. In unit mode only the controller merges canonical book-source.json, book.json or the whole-book review report. Eligible small whole-role workers receive their specific canonical output paths; terminology writes terms.json and handoff.md.
 
-Source I/O: the authoritative text is the complete parsed JSON payload, not a shortened tool preview. Parsing JSON and then printing an entire long dictionary or line can still hide its contents. Inspect long text tokens in bounded, unescaped Unicode chunks of at most 160 codepoints, labeling the token/index, start/end offsets and total length, or read the full saved artifact through explicit ranges. That bound leaves room for labels under the current 768-byte preview limit even for multibyte Unicode. Check every needed chunk and the surrounding nontext token positions. Never infer missing source, invent an ellipsis or treat preview clipping as book damage; verify the full payload before stopping on a claimed source-data omission. Report a genuine missing-data blocker only when the underlying complete payload, rather than its display, is actually incomplete.
+Long-line/source I/O: authoritative content is the complete file or parsed JSON payload, not a shortened rendered tool preview. This applies equally to source tokens, handoff prose and other long lines. Parsing JSON and then printing an entire long dictionary or line can still hide its contents. Inspect long text tokens or prose lines in bounded, unescaped Unicode chunks of at most 160 codepoints, labeling the token/index or file/line, start/end offsets and total length, or read the full saved artifact through explicit ranges. That bound leaves room for labels under the current 768-byte preview limit even for multibyte Unicode. Check every needed chunk and, for source JSON, the surrounding nontext token positions. Never infer missing source, invent an ellipsis or treat preview clipping as book damage; verify the full payload before stopping on a claimed source-data omission. Edit existing files surgically; never reconstruct untouched file content from rendered previews. Obtain complete parsed/raw string chunks before editing, then reload the written file and inspect its actual complete diff so only intended changes remain. Legitimate ellipses are allowed; neither an ellipsis glyph nor a particular line length is a corruption test. Report a genuine missing-data blocker only when the underlying complete payload, rather than its display, is actually incomplete.
+
+Native image inspection: use ordinary native read on the EXACT packet PNG paths, or use the ORIGINAL Python Eval prelude display(Image.open(path)) after importing Image from PIL. NEVER import display from IPython.display or shadow/rebind the native display helper: that replacement returns IPython handles rather than the native image payload in this environment. A successful call, printed Image object or handle is not actual pixel inspection. If the helper was shadowed, ordinary native read on each exact packet PNG is the direct recovery path; do not invent a tool wrapper or require an IPython installation. Keep the working recipe and actual paths in the coordinator's per-item task text, and record inspection only for images actually opened and inspected.
 
 Incremental authoring: workers may persist their own incomplete drafts in the currently assigned writable result/assets paths while completing a unit. Preserve such unadmitted progress for native continuation instead of requiring all writing to wait until the whole unit is finished. Do not overwrite any checkpointed artifact, canonical file or sibling output. A saved partial row set or inspection list is not an admissible result: do not checkpoint or report completion until every owned block/note, required metadata and inspection is present and the entire result satisfies the canonical contract. An actual successful native exit alone does not supply missing scope.
 
@@ -150,6 +152,38 @@ Use the canonical [translation reopening contract](format.md#reopening-completed
 5. Wait for actual native settlement, inspect its actual identity/status and checkpoint the full valid replacement using the unchanged unit ID and new active paths. Continue all other pending work normally. Do not count the old selected checkpoint as its replacement, rerun nontarget completed units, reset rounds or release a partial book. Complete assembly/build and subsequent whole-book review remain mandatory.
 
 For first-use defects, correct the genuine earliest occurrence using the existing canonical term ID and approved translation, then check later occurrences for consistency. Adding a convenient later token merely to satisfy the used-term check does not repair first use; removing a genuine glossary entry does not repair annotation. Preserve source structure, token order and protected content throughout.
+
+### Revising selected sealed source and rebasing translation
+
+Use the canonical [source revision and translation rebase contract](format.md#targeted-sealed-source-revision) when source-image evidence requires a legitimate sealed-source correction before initial translation assembly. A target-only rewrite, removed seal, hand-edited hash or false old handoff is not a source correction.
+
+1. Settle all old source/translation assignments through ordinary native facilities. Preserve actual settlement metadata, completed artifacts and unadmitted drafts. Read the actual source/translation status and explicit image-backed correction evidence; select full source units, not sampled blocks. Retain the current source and translation page bounds and exact returned IDs.
+2. Request the targeted sealed-source revision and read its returned plan/archive:
+
+   ```sh
+   python3 <skill>/scripts/translator.py plan-units <job> source --pages-per-unit "$CURRENT_SOURCE_N" --revise --reopen "$SOURCE_UNIT_ID"
+   # Append other explicit source unit IDs as separate arguments if required.
+   python3 <skill>/scripts/translator.py unit-status <job> source
+   ```
+
+3. Read the returned source revision plan and hash-bound archive references. Confirm old job/source/seal/terminology/handoff, source aggregate/member origins and translation plan/checkpoints are retained. Use only the fresh selected source packet/result/assets/checkpoint paths. Dispatch full source correction on the selected native source model; inspect every owned image and preserve read-only/shared scope. Checkpoint actual full results. Do not rerun unselected material or manufacture new revision authorship for its carried canonical projection.
+4. After complete source assembly validates ownership, inventory, definitions, assets and core structure, deliberately reseal and validate the new source:
+
+   ```sh
+   python3 <skill>/scripts/translator.py assemble-units <job> source
+   python3 <skill>/scripts/translator.py seal-source <job> --reseal
+   python3 <skill>/scripts/translator.py validate <job> --source
+   ```
+
+5. At source_ready, dispatch fresh ordinary native book-terminology against the complete new sealed source. Require byte-identical entire terms.json and still-valid protected references. Ask for an honest new English handoff with current source facts and an explicit policy-compatibility judgment for proposed reuse, including metadata/preface consequences. Preserve its real new native origin; do not pass --revise or relabel the old terminology task. Checkpoint it with checkpoint-role JOB terminology --task-result ACTUAL_RESULT.
+6. Read the admitted new terminology receipt and the exact handoff bytes it binds. Passing the new handoff SHA256 explicitly asserts your semantic-compatibility judgment; if you judge the policy incompatible or unresolved, do not accept. Code checks identity/current receipt/entire terms bytes and source footprints, not the meaning or style of English handoff prose. A changed terms file blocks this rebase. Request the explicit bridge using the actual returned source revision plan path and current translation bound:
+
+   ```sh
+   python3 <skill>/scripts/translator.py plan-units <job> translation --pages-per-unit "$CURRENT_N" --rebase-source "$SOURCE_REVISION_PLAN" --accept-policy-compatibility "$NEW_HANDOFF_SHA256"
+   python3 <skill>/scripts/translator.py unit-status <job> translation
+   ```
+
+7. Read the returned typed bridge, actual status and exact current packets/output paths. Inspect full owned/read-only footprint comparisons and affected reasons, not only changed-block leads. Carry only explicitly admitted unchanged scope with original checkpoint/model/task origins UNDER THE OLD CONTEXT. Reuse is the new operator/model claim, not old execution under new instructions. Dispatch all returned pending work with corrected source/current policy; old drafts/results are reading aids, never automatic completions. Finish ordinary native checkpointing and complete aggregate assembly/build/review without partial release or round reset. Do not swap archived files into live canonical paths or weaken ordinary input checks to make a carry pass.
 
 ### Continuing or correcting unsealed source work
 

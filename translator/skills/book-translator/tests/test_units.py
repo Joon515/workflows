@@ -176,7 +176,7 @@ class UnitContractTests(unittest.TestCase):
         self.admit_translation(job, self.plan(job, "translation"), pdf_pages)
         return job
 
-    def pending_translation_job(self, page_count=18, spans=None, terms=None):
+    def pending_translation_job(self, page_count=18, spans=None, terms=None, draft_update=None, source_update=None):
         job = self.new_job(page_count=page_count)
         pages = [page["id"] for page in core.extraction_inventory(job)["pages"]]
         spans = dict(spans if spans is not None else ((3, 4), (6, 7), (9, 10), (12, 13), (15, 16)))
@@ -204,15 +204,79 @@ class UnitContractTests(unittest.TestCase):
                 })
             draft["blocks"].append({"id": identifier, "kind": "paragraph", "source_pages": covered,
                                     "source": source, "target": []})
+        if draft_update is not None:
+            draft_update(draft, pages)
         core.save_json(job / "draft.json", draft)
         source_plan = self.plan(job, draft=job / "draft.json", pages_per_unit=6)
         for spec in source_plan["units"]:
             prepared, _, _, output = self.prepare(job, "source", spec["unit_id"])
+            if source_update is not None:
+                source_update(spec, output)
             self.finish(job, prepared, output)
         workflow.assemble_units(job, "source")
         workflow.seal_job(job)
         self.admit_terminology(job, terms=terms)
         return job, self.plan(job, "translation", pages_per_unit=6)
+
+    def source_rebase_job(self):
+        terms = domain_fixtures.terms()
+        terms["terms"][0].update(id="OriginalTerm", source="Original Literal Name", target="Verified Literal Name",
+                                 protected_ids=["SharedName"])
+
+        def faulty_source(draft, pages):
+            draft["blocks"][0]["source"] = [{"page": pages[0]}, {"text": "Original "}, {"protected": "SharedName"}]
+            blocks = []
+            for block in draft["blocks"]:
+                blocks.append(block)
+                if block["id"] == "paragraph20":
+                    blocks.append({"id": "phantom20", "kind": "paragraph", "source_pages": [pages[19]],
+                                   "source": [{"text": "Phantom OCR prose absent from the intended source structure."}], "target": []})
+                if block["id"] == "paragraph21":
+                    duplicate = copy.deepcopy(block)
+                    duplicate.update(id="duplicate21", source=[token for token in duplicate["source"] if "page" not in token])
+                    blocks.append(duplicate)
+                if block["id"] == "paragraph22":
+                    block["source"].append({"protected": "Formula"})
+            draft["blocks"] = blocks
+            draft["protected"].append({"id": "Formula", "kind": "math", "value": "x + x"})
+
+        def original_source_result(spec, output):
+            if spec["unit_id"] == "u0003":
+                block = next(item for item in output["blocks"] if item["id"] == "paragraph14")
+                block["id"] = "u0003_canonical14"
+                next(token for token in block["source"] if "text" in token)["text"] = "Canonical prose verified during original native source work. "
+
+        job, original = self.pending_translation_job(page_count=42, spans=tuple((page, page + 1) for page in range(6, 42, 6)),
+                                                     terms=terms, draft_update=faulty_source, source_update=original_source_result)
+        for index in (0, 2, 4):
+            spec = original["units"][index]
+            prepared, _, packet, output = self.prepare(job, "translation", spec["unit_id"])
+            if index == 0:
+                output["blocks"][0]["target"] = [{"page": packet["owned_pages"][0]}, {"term": "OriginalTerm"}]
+            elif index == 2:
+                next(token for token in output["blocks"][0]["target"] if "text" in token)["text"] = "Incorrect seam interpretation retained until explicit operator reopening. "
+            self.finish(job, prepared, output)
+        reference = workflow.plan_units(job, "translation", 3, replan_pending=True)
+        pending = core.load_json(job / reference["plan"])
+        drafts = {}
+        for spec in [item for item in pending["units"] if not (job / item["checkpoint"]).exists()][:4]:
+            _, binding, _, output = self.prepare(job, "translation", spec["unit_id"])
+            output["blocks"] = output["blocks"][:1]
+            output["blocks"][0]["target"] = [{"text": "UNADMITTED HISTORICAL TRANSLATION DRAFT"}]
+            core.save_json(job / binding["result"], output)
+            drafts[spec["result"]] = (job / spec["result"]).read_bytes()
+        return job, original, pending, drafts
+
+    def corrected_source_revision(self, packet, binding):
+        output = unit_output(packet, binding)
+        output["blocks"] = [block for block in output["blocks"] if block["id"] not in {"phantom20", "duplicate21"}]
+        math = next(block for block in output["blocks"] if block["id"] == "paragraph22")
+        math.update(kind="display_math", source=[token for token in math["source"] if "page" in token], protected_id="Formula")
+        next(item for item in output["protected"] if item["id"] == "Formula")["value"] = "x^2"
+        cross = next(block for block in output["blocks"] if block["id"] == "cross24")
+        next(token for token in cross["source"] if "text" in token)["text"] = "Verified corrected crossing paragraph. "
+        next(note for note in output["notes"] if note["id"] == "note24")["source"][0]["text"] = "Verified corrected crossing note. "
+        return output
 
     def test_pending_translation_resize_preserves_completed_progress_and_one_round(self):
         for completed_index, changes_requested in ((0, False), (1, False), (0, True)):
@@ -813,6 +877,325 @@ class UnitContractTests(unittest.TestCase):
         self.assertEqual((job / "job.json").read_bytes(), before_job)
         for path, content in preserved.items():
             self.assertEqual(path.read_bytes(), content, str(path))
+
+    def test_source_revision_rebases_only_exact_source_compatible_translation_progress(self):
+        job, original, pending, drafts = self.source_rebase_job()
+        source_active = job / "units/source/active.json"
+        translation_active = job / "units/translation/active.json"
+        old_source_pointer = core.load_json(source_active)
+        old_target_pointer = core.load_json(translation_active)
+        source_plan = core.load_json(job / old_source_pointer["plan"])
+        old_source = core.load_json(job / "book-source.json")
+        old_job = workflow.load_job(job)
+        old_terms = (job / "terms.json").read_bytes()
+        old_seal = (job / "source.sha256").read_bytes()
+        old_handoff_sha = workflow.digest_file(job / "handoff.md")
+        old_files = {path: path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        old_completed = {spec["unit_id"]: {"path": spec["checkpoint"], "sha256": workflow.digest_file(job / spec["checkpoint"])}
+                         for spec in pending["units"] if (job / spec["checkpoint"]).is_file()}
+        self.assertEqual(set(old_completed), {"u0001", "u0003", "u0005"})
+        self.assertEqual(len(drafts), 4)
+        self.assertEqual(pending["pages_per_unit"], 3)
+        for identifier in old_completed:
+            self.assertEqual(len(next(spec for spec in pending["units"] if spec["unit_id"] == identifier)["owned_pages"]), 6)
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "translation", 3, rebase_source=job / old_source_pointer["plan"],
+                                accept_policy_compatibility=old_handoff_sha)
+        for size, options in ((3, {"revise": True, "reopen_units": ["u0004"]}),
+                              (6, {"reopen_units": ["u0004"]}), (6, {"revise": True, "reopen_units": []}),
+                              (6, {"revise": True, "reopen_units": ["u9999"]}),
+                              (6, {"revise": True, "reopen_units": ["u0004", "u0004"]})):
+            with self.subTest(source_request=(size, options)), self.assertRaises(ValueError):
+                workflow.plan_units(job, "source", size, **options)
+            self.assertEqual(core.load_json(source_active), old_source_pointer)
+            self.assertEqual(core.load_json(translation_active), old_target_pointer)
+            self.assertEqual((job / "job.json").read_bytes(), old_files[job / "job.json"])
+
+        source_member = next(spec for spec in source_plan["units"] if spec["unit_id"] == "u0003")
+        for path in (job / "source.sha256", job / source_member["result"], job / "note-evidence.png"):
+            content = path.read_bytes()
+            try:
+                path.write_bytes(content + b"\n ")
+                with self.subTest(source_entry_tamper=path.relative_to(job).as_posix()), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0004"])
+                self.assertEqual(core.load_json(source_active), old_source_pointer)
+                self.assertEqual(core.load_json(translation_active), old_target_pointer)
+                self.assertEqual((job / "job.json").read_bytes(), old_files[job / "job.json"])
+            finally:
+                path.write_bytes(content)
+        revision_reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0004"])
+        revision_path = job / revision_reference["plan"]
+        revision = core.load_json(revision_path)
+        base_reference = revision["source_revision"]["base"]
+        base = core.load_json(job / base_reference["path"])
+        self.assertEqual(base["kind"], "source-revision-base")
+        self.assertEqual(base["source_plan"], old_source_pointer)
+        self.assertEqual(base["target_plan"], old_target_pointer)
+        self.assertEqual({item["unit_id"]: {"path": item["path"], "sha256": item["sha256"]}
+                          for item in base["target_checkpoints"]}, old_completed)
+        self.assertEqual(base["target_drafts"], {name: workflow.digest_file(job / name) for name in drafts})
+        for name, canonical in (("job", "job.json"), ("source", "book-source.json"), ("seal", "source.sha256"),
+                                ("terms", "terms.json"), ("handoff", "handoff.md")):
+            reference = base[name]
+            self.assertEqual((job / reference["path"]).read_bytes(), old_files[job / canonical], name)
+            self.assertEqual(workflow.digest_file(job / reference["path"]), reference["sha256"], name)
+        self.assertEqual(units.status(job, "source")["pending"], ["u0004"])
+        self.assertEqual([spec["unit_id"] for spec in revision["units"]], [spec["unit_id"] for spec in source_plan["units"]])
+        projection_spec = next(spec for spec in revision["units"] if spec["unit_id"] == "u0003")
+        original_spec = next(spec for spec in source_plan["units"] if spec["unit_id"] == "u0003")
+        self.assertEqual(projection_spec["source_carry"]["checkpoint"], {
+            "path": original_spec["checkpoint"], "sha256": workflow.digest_file(job / original_spec["checkpoint"])})
+        projection = core.load_json(job / projection_spec["result"])
+        self.assertEqual(projection["kind"], "source-unit-projection")
+        canonical_blocks = [block for block in old_source["blocks"] if block["source_pages"][0] in original_spec["owned_pages"]]
+        self.assertEqual(projection["blocks"], canonical_blocks)
+        self.assertEqual(projection_spec["owned_block_ids"], [block["id"] for block in canonical_blocks])
+        self.assertNotEqual(projection_spec["owned_block_ids"], original_spec["owned_block_ids"])
+        self.assertIn("u0003_canonical14", projection_spec["owned_block_ids"])
+        self.assertEqual(projection["notes"], [note for note in old_source["notes"] if note["id"] in original_spec["owned_note_ids"]])
+        self.assertEqual(projection["protected"], [])
+        self.assertNotEqual(projection["protected"], core.load_json(job / original_spec["result"])["protected"])
+        for spec in revision["units"]:
+            if spec["unit_id"] == "u0004":
+                continue
+            previous = next(item for item in source_plan["units"] if item["unit_id"] == spec["unit_id"])
+            self.assertEqual(spec["checkpoint"], previous["checkpoint"])
+            self.assertEqual(spec["source_carry"]["checkpoint"], {"path": previous["checkpoint"],
+                             "sha256": workflow.digest_file(job / previous["checkpoint"])})
+            self.assertEqual(spec["source_carry"]["projection"]["path"], spec["result"])
+        self.assertEqual((job / "job.json").read_bytes(), old_files[job / "job.json"])
+        self.assertEqual((job / "book-source.json").read_bytes(), old_files[job / "book-source.json"])
+        self.assertEqual((job / "source.sha256").read_bytes(), old_seal)
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "translation", 3, rebase_source=revision_path, accept_policy_compatibility=old_handoff_sha)
+        self.assertEqual(core.load_json(translation_active), old_target_pointer)
+        prepared, binding, packet, _ = self.prepare(job, "source", "u0004")
+        selected = next(spec for spec in revision["units"] if spec["unit_id"] == "u0004")
+        self.assertEqual(packet["blocks"], [block for block in old_source["blocks"] if block["id"] in selected["owned_block_ids"]])
+        self.assertTrue({"phantom20", "duplicate21", "paragraph22", "cross24"} <= set(packet["owned_block_ids"]))
+        self.assertEqual(set(packet["source_assets"]), {"note-evidence.png"})
+        corrected = self.corrected_source_revision(packet, binding)
+        for fault in ("unselected", "crossing", "shared_definition"):
+            invalid = copy.deepcopy(corrected)
+            if fault == "unselected":
+                invalid["blocks"].append(copy.deepcopy(old_source["blocks"][0]))
+            elif fault == "crossing":
+                next(block for block in invalid["blocks"] if block["id"] == "cross24")["source_pages"] = [packet["owned_pages"][-1]]
+            else:
+                next(item for item in invalid["protected"] if item["id"] == "SharedName")["value"] = "Unauthorized shared name edit"
+            with self.subTest(source_output=fault), self.assertRaises(ValueError):
+                self.finish(job, prepared, invalid)
+            self.assertFalse((job / selected["checkpoint"]).exists())
+            self.assertEqual(core.load_json(translation_active), old_target_pointer)
+            self.assertEqual((job / "book-source.json").read_bytes(), old_files[job / "book-source.json"])
+        self.finish(job, prepared, corrected)
+        workflow.assemble_units(job, "source")
+        revised_source = core.load_json(job / "book-source.json")
+        self.assertFalse({"phantom20", "duplicate21"} & {block["id"] for block in revised_source["blocks"]})
+        self.assertEqual(next(block for block in revised_source["blocks"] if block["id"] == "paragraph22")["kind"], "display_math")
+        self.assertEqual(next(item for item in revised_source["protected"] if item["id"] == "Formula")["value"], "x^2")
+        self.assertEqual((job / "source.sha256").read_bytes(), old_seal)
+        with self.assertRaises(ValueError):
+            units.validate_aggregate(job, core.load_json(job / base["source_receipt"]["path"]), "source")
+        workflow.seal_job(job, reseal=True)
+        new_seal = (job / "source.sha256").read_text(encoding="ascii").strip()
+        self.assertNotEqual(new_seal, old_seal.decode().strip())
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("source_ready", 0))
+        stale_pending = next(spec for spec in pending["units"] if spec["unit_id"] not in old_completed)
+        with self.assertRaises(ValueError):
+            units.unit_binding(job, "translation", stale_pending["unit_id"])
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "translation", 3, rebase_source=revision_path, accept_policy_compatibility=old_handoff_sha)
+        self.assertEqual(core.load_json(translation_active), old_target_pointer)
+        (job / "handoff.md").write_text(
+            f"Synthetic selected Term judgement for the current table. Verified corrected source has {len(revised_source['blocks'])} blocks.\n"
+            "Source artifact corrections do not themselves prove policy compatibility; exact operator acceptance is required.\n", encoding="utf-8")
+        acceptance = workflow.digest_file(job / "handoff.md")
+        self.assertNotEqual(acceptance, old_handoff_sha)
+
+        def term_checkpoint(revise=False):
+            task = domain_fixtures.save_task_result(self.root / "coordinator-results", "terminology", PROVIDER, MODEL)
+            workflow.checkpoint_role(job, "terminology", task, revise=revise)
+            return workflow.terminology_ready(job, workflow.load_job(job))
+
+        changed_terms = json.loads(old_terms)
+        changed_terms["terms"][0]["target"] = "Other Literal Name"
+        core.save_json(job / "terms.json", changed_terms)
+        term_checkpoint()
+
+        def refuse_rebase(role="translation", pages_per_unit=3, **overrides):
+            options = {"rebase_source": revision_path, "accept_policy_compatibility": acceptance, **overrides}
+            before = {path: path.read_bytes() if path.is_file() else None for path in job.rglob("*")}
+            with self.assertRaises(ValueError):
+                workflow.plan_units(job, role, pages_per_unit, **options)
+            self.assertEqual({path: path.read_bytes() if path.is_file() else None for path in job.rglob("*")}, before)
+            self.assertEqual(translation_active.read_bytes(), before[translation_active])
+
+        refuse_rebase()
+        (job / "terms.json").write_bytes(old_terms + b"\n")
+        term_checkpoint(revise=True)
+        refuse_rebase()
+        (job / "terms.json").write_bytes(old_terms)
+        term_receipt = term_checkpoint(revise=True)
+        self.assertEqual(term_receipt["source_digest"], new_seal)
+        self.assertEqual((job / "terms.json").read_bytes(), old_terms)
+        for options in ({"accept_policy_compatibility": None}, {"accept_policy_compatibility": "0" * 64},
+                        {"rebase_source": None}, {"rebase_source": job / old_source_pointer["plan"]},
+                        {"replan_pending": True}, {"reopen_units": ["u0001"]}, {"draft": job / "draft.json"}, {"revise": True}):
+            with self.subTest(rebase_flags=options):
+                refuse_rebase(**options)
+        refuse_rebase(pages_per_unit=2)
+        refuse_rebase(role="source", pages_per_unit=6)
+        critical = [job / name for name in ("book-source.json", "source.sha256", "terms.json", "handoff.md", "note-evidence.png", "extraction.json")]
+        critical += [job / old_job["source_file"], job / old_source_pointer["plan"], job / old_target_pointer["plan"]]
+        critical += [job / selected[name] for name in ("checkpoint", "result", "packet")]
+        critical += [job / packet["pages"][0]["evidence"]]
+        critical += [job / next(event for event in reversed(workflow.load_job(job)["history"]) if event["event"] == name)["receipt"]
+                     for name in ("stage_terminology", "role_source")]
+        critical += [job / base_reference["path"], revision_path, job / projection_spec["result"]]
+        critical += [job / base[name]["path"] for name in ("job", "source", "seal", "terms", "handoff", "source_receipt", "terminology_receipt")]
+        critical += [job / original_spec[name] for name in ("checkpoint", "result", "packet")]
+        critical += [job / next(spec for spec in pending["units"] if spec["unit_id"] == identifier)[name]
+                     for identifier in ("u0001", "u0005") for name in ("checkpoint", "result", "packet")]
+        critical.append(job / packet["pages"][0]["image"])
+        critical.append(job / next(iter(drafts)))
+        for path in dict.fromkeys(critical):
+            content = path.read_bytes()
+            try:
+                path.write_bytes(content + b"\n ")
+                with self.subTest(tampered=path.relative_to(job).as_posix()):
+                    refuse_rebase()
+            finally:
+                path.write_bytes(content)
+        for changes in ({"round": 1}, {"state": "changes_requested"}, {"max_rounds": old_job["max_rounds"] + 1},
+                        {"source_language": "fr"}, {"target_language": "fr"}, {"title": "Changed original metadata"},
+                        {"layout": {**old_job["layout"], "outer_mm": old_job["layout"]["outer_mm"] + 1}},
+                        {"models": {**old_job["models"], "translation": {"provider": "openai-codex", "model": "gpt-6-luna"}}},
+                        {"models": {**old_job["models"], "review": {"provider": "openai-codex", "model": "gpt-6-luna"}}}):
+            current_bytes = (job / "job.json").read_bytes()
+            try:
+                core.save_json(job / "job.json", {**json.loads(current_bytes), **changes})
+                with self.subTest(rebase_job_changes=changes):
+                    refuse_rebase()
+            finally:
+                (job / "job.json").write_bytes(current_bytes)
+
+        before_rebase = {path: path.read_bytes() for path in job.rglob("*") if path.is_file() and path != translation_active}
+        reference = workflow.plan_units(job, "translation", 3, rebase_source=revision_path, accept_policy_compatibility=acceptance)
+        rebased = core.load_json(job / reference["plan"])
+        bridge = rebased["source_rebase"]
+        self.assertEqual(bridge["revision_plan"], {name: revision_reference[name] for name in ("plan", "plan_sha256")})
+        self.assertEqual(bridge["base"], base_reference)
+        self.assertEqual(bridge["policy_acceptance"]["handoff_sha256"], acceptance)
+        self.assertIs(bridge["policy_acceptance"]["accepted"], True)
+        self.assertEqual(bridge["carried"], {identifier: old_completed[identifier] for identifier in ("u0001", "u0003")})
+        self.assertEqual(rebased["source_digest"], new_seal)
+        self.assertEqual(rebased["pages_per_unit"], 3)
+        self.assertEqual([spec["unit_id"] for spec in rebased["units"]], [spec["unit_id"] for spec in pending["units"]])
+        self.assertEqual([spec["owned_pages"] for spec in rebased["units"]], [spec["owned_pages"] for spec in pending["units"]])
+        self.assertEqual(units.status(job, "translation")["admitted"], ["u0001", "u0003"])
+        for name in drafts:
+            previous = next(spec for spec in pending["units"] if spec["result"] == name)
+            replacement = next(spec for spec in rebased["units"] if spec["unit_id"] == previous["unit_id"])
+            self.assertEqual(replacement["reading_aid"]["result"], {"path": name, "sha256": workflow.digest_file(job / name)})
+            self.assertNotIn("checkpoint", replacement["reading_aid"])
+            self.assertNotEqual(replacement["result"], name)
+            self.assertFalse((job / replacement["checkpoint"]).exists())
+        for identifier in ("u0001", "u0003"):
+            previous = next(spec for spec in pending["units"] if spec["unit_id"] == identifier)
+            carried = next(spec for spec in rebased["units"] if spec["unit_id"] == identifier)
+            for name in ("packet", "packet_sha256", "result", "assets_dir", "checkpoint", "owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"):
+                self.assertEqual(carried[name], previous[name], (identifier, name))
+            self.assertEqual(carried["carried_checkpoint"], old_completed[identifier])
+            footprint = bridge["footprints"][identifier]
+            self.assertEqual(footprint["before"], footprint["after"])
+            self.assertEqual(footprint["decision"], "carried")
+        readonly_footprint = bridge["footprints"]["u0005"]
+        self.assertNotEqual(readonly_footprint["before"], readonly_footprint["after"])
+        self.assertEqual(readonly_footprint["decision"], "pending")
+        affected = next(spec for spec in rebased["units"] if spec["unit_id"] == "u0005")
+        old_affected = next(spec for spec in pending["units"] if spec["unit_id"] == "u0005")
+        old_packet = core.load_json(job / old_affected["packet"])
+        prepared, _, fresh_packet, full_output = self.prepare(job, "translation", "u0005")
+        self.assertEqual(fresh_packet["blocks"], old_packet["blocks"])
+        self.assertEqual(fresh_packet["notes"], old_packet["notes"])
+        self.assertNotEqual(fresh_packet["context_blocks"], old_packet["context_blocks"])
+        self.assertNotEqual(fresh_packet["context_notes"], old_packet["context_notes"])
+        self.assertEqual(affected["reading_aid"]["result"], {"path": old_affected["result"], "sha256": workflow.digest_file(job / old_affected["result"])})
+        self.assertEqual(affected["reading_aid"]["checkpoint"], old_completed["u0005"])
+        self.assertNotEqual(affected["packet"], old_affected["packet"])
+        self.assertNotEqual(affected["checkpoint"], old_affected["checkpoint"])
+        self.assertFalse((job / affected["checkpoint"]).exists())
+        for path, content in before_rebase.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+        partial = copy.deepcopy(full_output)
+        partial["blocks"] = partial["blocks"][:1]
+        with self.assertRaisesRegex(ValueError, "exactly its owned blocks"):
+            self.finish(job, prepared, partial)
+        self.assertFalse((job / affected["checkpoint"]).exists())
+        carried_quality = core.load_json(job / core.load_json(job / old_completed["u0003"]["path"])["result"])
+        self.assertEqual(next(token["text"] for token in carried_quality["blocks"][0]["target"] if "text" in token),
+                         "Incorrect seam interpretation retained until explicit operator reopening. ")
+        quality_reference = workflow.plan_units(job, "translation", 3, reopen_units=["u0003"])
+        quality_plan = core.load_json(job / quality_reference["plan"])
+        self.assertEqual({name: quality_plan["translation_reopen"][name] for name in ("plan", "plan_sha256")},
+                         {name: reference[name] for name in ("plan", "plan_sha256")})
+        self.assertEqual(units.status(job, "translation")["admitted"], ["u0001"])
+        for spec in rebased["units"]:
+            replacement = next(item for item in quality_plan["units"] if item["unit_id"] == spec["unit_id"])
+            if spec["unit_id"] != "u0003":
+                self.assertEqual(replacement, spec)
+            else:
+                self.assertEqual(replacement["packet"], spec["packet"])
+                self.assertEqual(replacement["packet_sha256"], spec["packet_sha256"])
+                self.assertNotEqual(replacement["checkpoint"], spec["checkpoint"])
+        before_completion = (job / "job.json").read_bytes()
+        quality_correction = None
+        for spec in quality_plan["units"]:
+            if spec["unit_id"] == "u0001":
+                continue
+            prepared, _, current_packet, output = self.prepare(job, "translation", spec["unit_id"])
+            self.assertFalse({"phantom20", "duplicate21"} & set(current_packet["owned_block_ids"]))
+            if spec["unit_id"] == "u0003":
+                next(token for token in output["blocks"][0]["target"] if "text" in token)["text"] = "Operator-requested semantic correction after explicit reopening. "
+                quality_correction = copy.deepcopy(output["blocks"][0])
+            checkpoint = self.finish(job, prepared, output)
+            if spec["unit_id"] == "u0003":
+                self.assertEqual(checkpoint["source_digest"], new_seal)
+                self.assertNotEqual(checkpoint["task"]["id"], core.load_json(job / old_completed["u0003"]["path"])["task"]["id"])
+        self.assertEqual((job / "job.json").read_bytes(), before_completion)
+        with patch("render.build", side_effect=synthetic_build):
+            result = workflow.assemble_units(job, "translation")
+        self.assertEqual((result["state"], result["round"]), ("translated", 1))
+        current = workflow.load_job(job)
+        workflow.translation_ready(job, current)
+        book = core.validate_book(job, translated=True)
+        self.assertEqual([block["id"] for block in book["blocks"]], [block["id"] for block in revised_source["blocks"]])
+        self.assertIsNotNone(quality_correction)
+        self.assertEqual(next(block for block in book["blocks"] if block["id"] == quality_correction["id"])["target"],
+                         quality_correction["target"])
+        event = next(event for event in reversed(current["history"]) if event["event"] == "stage_translation")
+        aggregate = core.load_json(job / event["receipt"])
+        self.assertIn(old_completed["u0001"], aggregate["unit_checkpoints"])
+        self.assertNotIn(old_completed["u0003"], aggregate["unit_checkpoints"])
+        self.assertEqual(current["models"], old_job["models"])
+        self.assertEqual(current["max_rounds"], old_job["max_rounds"])
+        self.assertEqual(len([event for event in current["history"] if event["event"] == "stage_translation"]), 1)
+        allowed_changes = {source_active, translation_active, job / "job.json", job / "book-source.json",
+                           job / "source.sha256", job / "handoff.md"}
+        for path, content in old_files.items():
+            if path not in allowed_changes:
+                self.assertEqual(path.read_bytes(), content, str(path))
+        for name, content in drafts.items():
+            self.assertEqual((job / name).read_bytes(), content, name)
+        self.assertNotIn("UNADMITTED HISTORICAL TRANSLATION DRAFT", json.dumps(book))
+        refuse_rebase()
+        before_source_refusal = {path: path.read_bytes() for path in (source_active, translation_active, job / "job.json")}
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0004"])
+        for path, content in before_source_refusal.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+        self.assertEqual(workflow.load_job(job)["round"], 1)
 
     def test_extraction_lineage_and_complete_small_source_inventory(self):
         job = self.new_job()

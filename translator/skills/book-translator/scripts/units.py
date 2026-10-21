@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import Counter
 from functools import lru_cache
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -222,6 +223,10 @@ def _plan_inputs(job: Path, plan: dict) -> None:
         _translation_replan_context(plan, previous)
     if plan.get("translation_reopen") is not None:
         _translation_reopen_inputs(job, plan)
+    if plan.get("source_revision") is not None:
+        _source_revision_inputs(job, plan)
+    if plan.get("source_rebase") is not None:
+        _source_rebase_inputs(job, plan)
 
 
 
@@ -419,6 +424,8 @@ def _prepare_pending_translation(job: Path, pages_per_unit: int, max_context_pag
             or set(previous["pages"]) != set(previous["page_ids"])):
         raise ValueError("Active translation plan lacks exact unique unit/page ownership")
     carried, origin_plans = {}, {}
+    if previous.get("source_rebase") is not None:
+        _rebase_context(job, previous, origin_plans)
     for spec in specs:
         packet = _checked(job, spec["packet"], spec["packet_sha256"])
         _packet_scope(packet)
@@ -455,7 +462,7 @@ def _translation_reopen_inputs(job: Path, plan: dict) -> None:
     reopened = _translation_reopen_ids(link["reopened"])
     previous = _checked(job, link["plan"], link["plan_sha256"])
     _translation_replan_context(plan, previous, allow_same_bound=True)
-    ignored_plan = {"plan_id", "units", "pending_replan", "translation_reopen"}
+    ignored_plan = {"plan_id", "units", "pending_replan", "translation_reopen", "source_rebase"}
     if (plan["pages_per_unit"] != previous["pages_per_unit"] or plan["base_state"] != "terminology_ready"
             or plan["base_round"] != 0 or plan["plan_id"] == previous["plan_id"]
             or {key: value for key, value in plan.items() if key not in ignored_plan}
@@ -523,7 +530,7 @@ def _reopen_translation(job: Path, pages_per_unit: int, max_context_pages: int,
         else:
             spec = dict(carried.get(original["unit_id"], original))
         specs.append(spec)
-    plan = {key: value for key, value in previous.items() if key not in {"pending_replan", "translation_reopen"}}
+    plan = {key: value for key, value in previous.items() if key not in {"pending_replan", "translation_reopen", "source_rebase"}}
     plan.update(plan_id=identifier, units=specs,
                 translation_reopen={**pointer, "reopened": reopened,
                                     "prior_checkpoints": {unit: carried[unit]["carried_checkpoint"] for unit in reopened}})
@@ -541,142 +548,9 @@ def _reopen_translation(job: Path, pages_per_unit: int, max_context_pages: int,
     return {**new_pointer, "role": "translation", "units": [spec["unit_id"] for spec in specs], "pages": len(plan["page_ids"])}
 
 
-def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
-                max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False,
-                reopen_units: list[str] | None = None) -> dict:
-    """Snapshot bounded page evidence and untrusted draft slices without admission.
-
-    A complete block belongs to its first source page's unit. Notes follow their
-    callout owner; shared protected declarations have one owner and read-only
-    copies elsewhere. Crossing blocks stay intact with bounded context pages.
-    """
-    job = Path(job).resolve(strict=True)
-    if role not in _ROLES or type(pages_per_unit) is not int or not 1 <= pages_per_unit <= 8:
-        raise ValueError("Choose source/translation/review and pages_per_unit between 1 and 8")
-    if type(max_context_pages) is not int or not 0 <= max_context_pages <= 4:
-        raise ValueError("max_context_pages must be between 0 and 4")
-    if role != "source" and (not isinstance(readiness, dict) or not isinstance(readiness.get("bindings"), dict)):
-        raise ValueError("Controller must supply admitted readiness bindings for translation/review planning")
-    if replan_pending and (role != "translation" or draft_path is not None or revise):
-        raise ValueError("Pending replanning requires translation without draft import or revision")
-    if reopen_units is not None and (role != "translation" or draft_path is not None or revise or replan_pending):
-        raise ValueError("Translation reopening requires translation without pending resize, draft import or revision")
-    data = _job(job)
-    if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
-           for name in ("source", "terminology", "translation", "review")):
-        raise ValueError("Every exact role model must be configured before unit planning")
-    sealed = (job / "source.sha256").is_file()
-    if role == "source":
-        if (revise and not sealed) or (not revise and (data["state"] != "extracted" or sealed)):
-            raise ValueError("Source units require extracted/unsealed state or explicit sealed revision")
-    elif role == "translation" and (revise or data["state"] not in {"terminology_ready", "changes_requested"} or data["round"] >= data["max_rounds"]):
-        raise ValueError("Translation units require an eligible pending translation round")
-    elif role == "review" and (revise or data["state"] != "translated" or data["round"] < 1):
-        raise ValueError("Review units require a current translated round")
-    if role in {"translation", "review"}:
-        core.validate_book(job, translated=role == "review")
-        core.validate_document("terms", core.load_json(job / "terms.json"))
-        if not (job / "handoff.md").read_text(encoding="utf-8").strip():
-            raise ValueError("Translation units require a substantive terminology handoff")
-    if reopen_units is not None:
-        return _reopen_translation(job, pages_per_unit, max_context_pages, readiness, reopen_units)
-    pending_replan, previous, carried = None, None, {}
-    if replan_pending:
-        pending_replan, previous, carried = _prepare_pending_translation(job, pages_per_unit, max_context_pages, readiness)
-    extraction = core.extraction_inventory(job)
-    if extraction is None:
-        raise ValueError("Unit planning requires controller-admitted complete extraction evidence")
-    extraction_digest = next(event["extraction_sha256"] for event in reversed(data["history"]) if event.get("event") == "extracted")
-    pages = extraction["pages"]
-    page_ids = [page["id"] for page in pages]
+def _packet_builder(job: Path, role: str, draft: dict, declarations: dict, page_ids: list,
+                    extraction: dict, data: dict, baseline: dict, build, max_context_pages: int):
     page_order = {name: index for index, name in enumerate(page_ids)}
-    identifier = uuid.uuid4().hex
-    directory = _path(job, f"units/{role}/{identifier}")
-    if not replan_pending:
-        directory.mkdir(parents=True, exist_ok=False)
-    baseline = _baseline(job)
-    review_artifacts = {}
-    if role == "review":
-        for suffix in ("json", "receipt.json"):
-            name = f"reviews/round-{data['round']}.{suffix}"
-            path = _path(job, name)
-            review_artifacts[name] = _hash(path) if path.is_file() else None
-    draft_info = None
-    build = _review_build(job) if role == "review" else None
-    if role in {"translation", "review"}:
-        draft = core.load_json(job / ("book.json" if role == "review" else "book-source.json"))
-    else:
-        selected_draft = Path(draft_path).resolve(strict=True) if draft_path else job / "book-source.json"
-        if selected_draft.is_file():
-            draft, draft_info = _import_draft(job, directory, selected_draft)
-        else:
-            draft = {"title": data["title"], "main_body_start": None, "source_pages": [],
-                     "blocks": [], "notes": [], "protected": []}
-            for page in pages:
-                text = page.get("ocr", {}).get("text") or page.get("text", "")
-                source = [{"page": page["id"]}]
-                if text:
-                    source.append({"text": text})
-                draft["blocks"].append({"id": f"draft_{page['id']}", "kind": "paragraph",
-                    "source_pages": [page["id"]], "source": source, "target": []})
-    if role != "source" and [page["id"] for page in draft["source_pages"]] != page_ids:
-        raise ValueError("Sealed source inventory differs from complete original extraction page order")
-    declarations = {}
-    for category in ("blocks", "notes", "protected"):
-        declarations[category] = {item["id"]: item for item in draft[category]}
-        if len(declarations[category]) != len(draft[category]):
-            raise ValueError(f"Draft {category} IDs are duplicated; resolve ownership before planning")
-    unit_specs = []
-    if previous is None:
-        groups = [(f"u{index + 1:04d}", page_ids[offset:offset + pages_per_unit])
-                  for index, offset in enumerate(range(0, len(pages), pages_per_unit))]
-    else:
-        if page_ids != previous["page_ids"]:
-            raise ValueError("Original page inventory changed before pending replanning")
-        old_ownership = _translation_ownership(draft, declarations, previous, page_order)
-        completed_pages = {page for spec in carried.values() for page in spec["owned_pages"]}
-        new_groups = []
-        for offset in range(0, len(page_ids), pages_per_unit):
-            run = []
-            for page in page_ids[offset:offset + pages_per_unit]:
-                if page in completed_pages:
-                    if run:
-                        new_groups.append(run)
-                        run = []
-                else:
-                    run.append(page)
-            if run:
-                new_groups.append(run)
-        next_id = max(int(spec["unit_id"][1:]) for spec in previous["units"]) + 1
-        groups = [(spec["unit_id"], spec["owned_pages"]) for spec in carried.values()]
-        groups.extend((f"u{next_id + index:04d}", owned) for index, owned in enumerate(new_groups))
-        groups.sort(key=lambda group: page_order[group[1][0]])
-    for unit_id, owned in groups:
-        unit_specs.append({"unit_id": unit_id, "owned_pages": owned, "owned_block_ids": [],
-                           "owned_note_ids": [], "owned_protected_ids": []})
-    ownership = _assign_ownership(draft, declarations, unit_specs, page_order)
-    block_owners, note_owners, protected_users, metadata_owner = ownership
-    if previous is not None:
-        for index, spec in enumerate(unit_specs):
-            if spec["unit_id"] not in carried:
-                continue
-            original = carried[spec["unit_id"]]
-            if (any(spec[key] != original[key] for key in ("owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"))
-                    or (previous["metadata_owner"] == spec["unit_id"]) != (metadata_owner == spec["unit_id"])):
-                raise ValueError("Pending replanning changed completed unit ownership or metadata authority")
-            unit_specs[index] = original
-    pdf_page_ids = _review_ownership(job, unit_specs, block_owners, note_owners, metadata_owner) if role == "review" else []
-    page_records = previous["pages"] if previous is not None else {}
-    for page in ([] if previous is not None else pages):
-        image = page.get("image")
-        if not image or not _path(job, image).is_file():
-            raise ValueError(f"Source page {page['id']} lacks a readable inspection image")
-        destination = directory / "pages" / f"{page['id']}.json"
-        _write_once(destination, page)
-        page_records[page["id"]] = {"page_id": page["id"], "locator": page["locator"],
-            "evidence": _relative(job, destination), "evidence_sha256": _hash(destination),
-            "image": image, "image_sha256": _hash(_path(job, image)),
-            "raster_region_count": len(page.get("image_regions", []))}
     def packet_for(spec, packet_plan_id, records, packet_ownership):
         block_owners, note_owners, protected_users, metadata_owner = packet_ownership
         blocks = [declarations["blocks"][name] for name in spec["owned_block_ids"]]
@@ -746,6 +620,795 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
                           context_pdf_pages=spec["context_pdf_pages"], source_unit_id=spec["source_unit_id"])
             packet["round"] = data["round"]
         return packet
+    return packet_for
+
+
+def _ref(job: Path, path: Path) -> dict:
+    return {"path": _relative(job, path), "sha256": _hash(path)}
+
+
+def _bound_bytes(job: Path, reference: dict) -> bytes:
+    path = _path(job, reference["path"])
+    if not path.is_file() or _hash(path) != reference["sha256"]:
+        raise ValueError("Missing or changed frozen book artifact")
+    return path.read_bytes()
+
+
+def _snapshot(job: Path, directory: Path, relative: str, filename: str) -> dict:
+    source = _path(job, relative)
+    destination = directory / filename
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as stream:
+        stream.write(source.read_bytes())
+    return _ref(job, destination)
+
+
+def _admitted_artifacts(job: Path, roots: list[dict]) -> dict:
+    """Retain hash identities after normal live admission, not historical runtime state."""
+    mutable = {"job.json", "book-source.json", "source.sha256", "terms.json", "handoff.md", "book.json"}
+    artifacts, followed = {}, set()
+
+    def add(name, digest, follow=False):
+        if name in mutable:
+            return
+        if name in artifacts and artifacts[name] != digest:
+            raise ValueError("Conflicting admitted book artifact identities")
+        artifacts[name] = digest
+        if follow and name not in followed:
+            followed.add(name)
+            scan(_checked(job, name, digest))
+
+    def scan(value, field=""):
+        if isinstance(value, list):
+            for item in value:
+                scan(item, field)
+            return
+        if not isinstance(value, dict):
+            return
+        if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
+            add(value["path"], value["sha256"], field in {"source_receipt", "terminology_receipt", "checkpoint", "base", "unit_checkpoints", "target_checkpoints"})
+        if isinstance(value.get("plan"), str) and isinstance(value.get("plan_sha256"), str):
+            add(value["plan"], value["plan_sha256"], True)
+        for name, digest, follow in (("packet", "packet_sha256", True), ("result", "result_sha256", False),
+                                     ("snapshot", "snapshot_sha256", False),
+                                     ("evidence", "evidence_sha256", False), ("image", "image_sha256", False)):
+            if isinstance(value.get(name), str) and isinstance(value.get(digest), str):
+                add(value[name], value[digest], follow)
+        for name, item in value.items():
+            if name in {"assets", "source_assets", "artifacts", "target_drafts"} and isinstance(item, dict):
+                for path, digest in item.items():
+                    add(path, digest)
+            else:
+                scan(item, "checkpoint" if field in {"carried", "prior_checkpoints"} else name)
+
+    for root in roots:
+        scan(root)
+    return artifacts
+
+
+def _check_admitted_artifacts(job: Path, artifacts: dict) -> None:
+    for name, digest in artifacts.items():
+        if not _path(job, name).is_file() or _hash(_path(job, name)) != digest:
+            raise ValueError("Frozen admitted member/packet/result/asset/evidence changed")
+
+
+def _initial_prebuild(data: dict) -> None:
+    if (data["state"] != "terminology_ready" or data["round"] != 0 or data["round"] >= data["max_rounds"]
+            or any(event.get("event") in {"translation_content_authored", "stage_translation"} for event in data["history"])):
+        raise ValueError("Source correction/rebase requires initial unassembled terminology_ready round 0")
+
+
+def _journal_ref(job: Path, data: dict, event_name: str) -> tuple[dict, dict]:
+    event = next((entry for entry in reversed(data["history"]) if entry.get("event") == event_name), None)
+    if event is None:
+        raise ValueError(f"Missing admitted {event_name} record")
+    reference = {"path": event["receipt"], "sha256": event["receipt_sha256"]}
+    return reference, _checked(job, reference["path"], reference["sha256"])
+
+
+def _term_proof(job: Path, data: dict, digest: str, terms: bytes, handoff: bytes, seal_sha256: str) -> tuple[dict, dict]:
+    reference, receipt = _journal_ref(job, data, "stage_terminology")
+    selected = data["models"]["terminology"]
+    if (receipt.get("kind") != "book-role-checkpoint" or receipt.get("role") != "terminology"
+            or receipt.get("stage") != "terminology" or receipt.get("completed") is not True
+            or receipt.get("source_digest") != digest or receipt.get("source_file_sha256") != data["source_sha256"]
+            or not isinstance(receipt.get("bindings"), dict)
+            or receipt["bindings"].get("source_seal_sha256") != seal_sha256
+            or receipt.get("selector") != core.admit_model(**selected)
+            or any(receipt.get(key) != selected[key] for key in ("provider", "model"))
+            or receipt.get("terms_sha256") != hashlib.sha256(terms).hexdigest()
+            or receipt.get("handoff_sha256") != hashlib.sha256(handoff).hexdigest() or not handoff.strip()):
+        raise ValueError("Terminology proof does not bind these exact source/terms/handoff/model artifacts")
+    task_metadata(receipt.get("task"), "terminology", selected)
+    return reference, receipt
+
+
+def _old_target_context(job: Path, base: dict, source: dict, cache: dict) -> tuple[dict, dict]:
+    pointer = base["target_plan"]
+    plan = _checked(job, pointer["plan"], pointer["plan_sha256"])
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    terms = _bound_bytes(job, base["terms"])
+    handoff = _bound_bytes(job, base["handoff"])
+    term_reference, _ = _term_proof(job, old_job, base["source_digest"], terms, handoff, base["seal"]["sha256"])
+    candidate = base.get("book_candidate")
+    if plan["baseline"]["book.json"] != (candidate["sha256"] if candidate is not None else None):
+        raise ValueError("Frozen target candidate baseline changed")
+    if candidate is not None:
+        _bound_bytes(job, candidate)
+    if term_reference != base["terminology_receipt"]:
+        raise ValueError("Frozen terminology receipt reference changed")
+    bindings = {"source_seal_sha256": base["seal"]["sha256"], "terminology_receipt": term_reference["path"],
+                "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": base["terms"]["sha256"],
+                "handoff_sha256": base["handoff"]["sha256"]}
+    if (plan.get("role") != "translation" or plan.get("kind") != "book-unit-plan"
+            or plan["job_sha256"] != base["job"]["sha256"] or plan["base_state"] != "terminology_ready"
+            or plan["base_round"] != 0 or plan["source_digest"] != base["source_digest"]
+            or plan["selected_model"] != old_job["models"]["translation"]
+            or plan["baseline"]["book-source.json"] != base["source"]["sha256"]
+            or any(plan["baseline"][name] != base[key]["sha256"] for name, key in
+                   (("source.sha256", "seal"), ("terms.json", "terms"), ("handoff.md", "handoff")))
+            or plan["readiness"] != {"source_digest": base["source_digest"], "bindings": bindings}):
+        raise ValueError("Frozen translation context is not bound to the archived source/terminology/job")
+    records = {entry["unit_id"]: entry for entry in base["target_checkpoints"]}
+    if len(records) != len(base["target_checkpoints"]):
+        raise ValueError("Frozen target checkpoint IDs are duplicated")
+    completed = {}
+    for spec in plan["units"]:
+        reference = records.get(spec["unit_id"])
+        if reference is None:
+            if _path(job, spec["checkpoint"]).exists():
+                raise ValueError("Unfrozen target completion appeared after the source revision snapshot")
+            continue
+        if reference["path"] != spec["checkpoint"]:
+            raise ValueError("Frozen target checkpoint path changed")
+        checkpoint = _checked(job, reference["path"], reference["sha256"])
+        if (checkpoint.get("completed") is not True or checkpoint.get("role") != "translation"
+                or checkpoint.get("unit_id") != spec["unit_id"]
+                or any(checkpoint.get(key) != spec[key] for key in ("packet", "packet_sha256", "result"))):
+            raise ValueError("Frozen target member differs from its admitted original scope")
+        completed[spec["unit_id"]] = _checked(job, checkpoint["result"], checkpoint["result_sha256"])
+    if set(completed) != set(records):
+        raise ValueError("Frozen target checkpoints do not match the old plan")
+    for name, digest in base["target_drafts"].items():
+        if _hash(_path(job, name)) != digest:
+            raise ValueError("Frozen unadmitted target draft changed")
+    return plan, completed
+
+
+def _archived_source(job: Path, base_reference: dict, cache: dict) -> tuple[dict, dict]:
+    key = ("archived-source", base_reference["path"], base_reference["sha256"])
+    if key in cache:
+        return cache[key]
+    base = _checked(job, base_reference["path"], base_reference["sha256"])
+    if base.get("version") != 1 or base.get("kind") != "source-revision-base":
+        raise ValueError("Invalid source revision archive")
+    _check_admitted_artifacts(job, base["artifacts"])
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    source = _checked(job, base["source"]["path"], base["source"]["sha256"])
+    seal = _bound_bytes(job, base["seal"]).decode("ascii").strip()
+    receipt = _checked(job, base["source_receipt"]["path"], base["source_receipt"]["sha256"])
+    pointer = base["source_plan"]
+    plan = _checked(job, pointer["plan"], pointer["plan_sha256"])
+    proofs = [{"path": spec["checkpoint"], "sha256": base["artifacts"][spec["checkpoint"]]} for spec in plan["units"]]
+    if (seal != base["source_digest"] or receipt.get("completed") is not True or receipt.get("role") != "source"
+            or receipt.get("execution") != "units" or receipt.get("kind") != "unit-role-completed"
+            or receipt.get("plan") != pointer["plan"] or receipt.get("plan_sha256") != pointer["plan_sha256"]
+            or receipt.get("unit_checkpoints") != proofs or receipt.get("source_document_sha256") != base["source"]["sha256"]
+            or receipt.get("merged_document_sha256") != base["source"]["sha256"]
+            or receipt.get("merged_document_digest") != _canonical(source) or receipt.get("source_snapshot_digest") != seal
+            or receipt.get("source_file_sha256") != old_job["source_sha256"]
+            or receipt.get("selector") != core.admit_model(**old_job["models"]["source"])):
+        raise ValueError("Archived canonical source differs from its normally admitted aggregate/member/seal identities")
+    core._validate_structure(source, job, None, False)
+    if core._source_digest(job, old_job, source) != seal:
+        raise ValueError("Archived source seal or immutable source assets changed")
+    cache[key] = (base, source)
+    return base, source
+
+
+def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[str]) -> dict:
+    reopened = _translation_reopen_ids(reopen_units)
+    data = _job(job)
+    _initial_prebuild(data)
+    source = core.validate_book(job, translated=False)
+    digest = (job / "source.sha256").read_text(encoding="ascii").strip()
+    source_reference, source_receipt = _journal_ref(job, data, "role_source")
+    source_pointer, source_plan, source_plan_sha = _current_plan(job, "source")
+    pointer = {"plan": _relative(job, source_pointer), "plan_sha256": source_plan_sha}
+    if (source_receipt.get("role") != "source" or source_receipt.get("completed") is not True
+            or source_receipt.get("plan") != pointer["plan"] or source_receipt.get("plan_sha256") != source_plan_sha
+            or source_receipt.get("source_snapshot_digest") != digest
+            or source_receipt.get("source_document_sha256") != _hash(job / "book-source.json")
+            or source_receipt.get("selector") != core.admit_model(**data["models"]["source"])
+            or pages_per_unit != source_plan["pages_per_unit"]
+            or not set(reopened) <= {spec["unit_id"] for spec in source_plan["units"]}):
+        raise ValueError("Selective source revision requires the current complete sealed source plan at its original bound")
+    validate_aggregate(job, source_receipt, "source")
+    terms, handoff = (job / "terms.json").read_bytes(), (job / "handoff.md").read_bytes()
+    term_reference, _ = _term_proof(job, data, digest, terms, handoff, _hash(job / "source.sha256"))
+    target_path, target_plan, target_sha = _current_plan(job, "translation")
+    target_readiness = {"source_digest": digest, "bindings": {
+        "source_seal_sha256": _hash(job / "source.sha256"), "terminology_receipt": term_reference["path"],
+        "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": _hash(job / "terms.json"),
+        "handoff_sha256": _hash(job / "handoff.md")}}
+    _, _, completed = _prepare_pending_translation(job, target_plan["pages_per_unit"], target_plan["max_context_pages"],
+                                                 target_readiness, reduce_pending=False)
+    drafts = {}
+    for spec in target_plan["units"]:
+        if spec["unit_id"] not in completed and _path(job, spec["result"]).is_file():
+            drafts[spec["result"]] = _hash(_path(job, spec["result"]))
+    roots = [source_reference, term_reference, pointer,
+             {"plan": _relative(job, target_path), "plan_sha256": target_sha},
+             {"path": data["source_file"], "sha256": data["source_sha256"]}]
+    roots.append({"target_checkpoints": [spec["carried_checkpoint"] for spec in completed.values()], "target_drafts": drafts})
+    artifacts = _admitted_artifacts(job, [{"source_receipt": source_reference, "terminology_receipt": term_reference}, *roots])
+    for ref in [source_reference, term_reference, *[spec["carried_checkpoint"] for spec in completed.values()]]:
+        artifacts[ref["path"]] = ref["sha256"]
+    _check_admitted_artifacts(job, artifacts)
+    return {"source": source, "source_digest": digest, "source_receipt": source_reference, "artifacts": artifacts,
+            "source_plan": pointer, "old_source_plan": source_plan,
+            "terminology_receipt": term_reference,
+            "target_plan": {"plan": _relative(job, target_path), "plan_sha256": target_sha},
+            "target_checkpoints": [{"unit_id": unit, **spec["carried_checkpoint"]} for unit, spec in completed.items()],
+            "target_drafts": drafts, "reopened": reopened}
+
+
+def _freeze_source_base(job: Path, directory: Path, context: dict) -> dict:
+    base = {"version": 1, "kind": "source-revision-base", "source_digest": context["source_digest"],
+            **{key: context[key] for key in ("source_receipt", "source_plan", "terminology_receipt", "target_plan", "target_checkpoints", "target_drafts", "artifacts")}}
+    for key, relative, name in (("job", "job.json", "before-job.json"), ("source", "book-source.json", "before-source.json"),
+                                ("seal", "source.sha256", "before-source.sha256"), ("terms", "terms.json", "before-terms.json"),
+                                ("handoff", "handoff.md", "before-handoff.md")):
+        base[key] = _snapshot(job, directory, relative, name)
+    if (job / "book.json").is_file():
+        base["book_candidate"] = _snapshot(job, directory, "book.json", "before-book.json")
+    path = directory / "revision-base.json"
+    _write_once(path, base)
+    return _ref(job, path)
+
+
+def _source_projection(source: dict, packet: dict) -> dict:
+    owned_pages = set(packet["owned_pages"])
+    blocks = [block for block in source["blocks"] if block["source_pages"][0] in owned_pages]
+    note_ids = {note for block in blocks for note in _references(block, "note")}
+    protected_ids = set(packet["owned_protected_ids"])
+    projection = {"version": 1, "kind": "source-unit-projection", "unit_id": packet["unit_id"],
+                  "source_pages": [page for page in source["source_pages"] if page["id"] in owned_pages],
+                  "blocks": blocks, "notes": [note for note in source["notes"] if note["id"] in note_ids],
+                  "protected": [item for item in source["protected"] if item["id"] in protected_ids]}
+    if packet["metadata_owner"]:
+        projection["metadata"] = {"title": source["title"], "main_body_start": source["main_body_start"]}
+    return projection
+
+
+def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
+    revision = plan["source_revision"]
+    if not isinstance(revision, dict) or set(revision) != {"base", "reopened"}:
+        raise ValueError("Invalid selective source revision link")
+    reopened = _translation_reopen_ids(revision["reopened"])
+    base = _checked(job, revision["base"]["path"], revision["base"]["sha256"])
+    source = _checked(job, base["source"]["path"], base["source"]["sha256"])
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    original = _checked(job, base["source_plan"]["plan"], base["source_plan"]["plan_sha256"])
+    if (plan["role"] != "source" or plan["revision"] is not True or plan["base_round"] != 0
+            or plan["base_state"] != "terminology_ready" or plan["job_sha256"] != base["job"]["sha256"]
+            or plan["source_digest"] != base["source_digest"] or plan["selected_model"] != old_job["models"]["source"]
+            or plan["pages_per_unit"] != original["pages_per_unit"]
+            or [(spec["unit_id"], spec["owned_pages"]) for spec in plan["units"]]
+                != [(spec["unit_id"], spec["owned_pages"]) for spec in original["units"]]
+            or not set(reopened) <= {spec["unit_id"] for spec in original["units"]}
+            or plan["baseline"]["book-source.json"] != base["source"]["sha256"]
+            or any(plan["baseline"][name] != base[key]["sha256"] for name, key in
+                   (("source.sha256", "seal"), ("terms.json", "terms"), ("handoff.md", "handoff")))):
+        raise ValueError("Selective source revision changed its frozen scope or original context")
+    declarations = {name: {item["id"]: item for item in source[name]} for name in ("blocks", "notes", "protected")}
+    _translation_ownership(source, declarations, plan, {page: index for index, page in enumerate(plan["page_ids"])})
+    for spec in plan["units"]:
+        if (spec["unit_id"] in reopened) == (spec.get("source_carry") is not None) or spec.get("carried_checkpoint") is not None:
+            raise ValueError("Source revision may freshly execute only its explicit selected units")
+    return base, source
+
+
+def _source_carried_member(job: Path, plan: dict, spec: dict, cache: dict) -> tuple[dict, dict]:
+    reference = plan["source_revision"]["base"]
+    base, source = _archived_source(job, reference, cache)
+    carry = spec["source_carry"]
+    old_plan = _checked(job, base["source_plan"]["plan"], base["source_plan"]["plan_sha256"])
+    old_spec = next(item for item in old_plan["units"] if item["unit_id"] == spec["unit_id"])
+    receipt = _checked(job, base["source_receipt"]["path"], base["source_receipt"]["sha256"])
+    origin = next(item for item in receipt["unit_checkpoints"] if item["path"] == old_spec["checkpoint"])
+    if (set(carry) != {"checkpoint", "projection"} or carry["checkpoint"] != origin
+            or spec["checkpoint"] != origin["path"] or spec["result"] != carry["projection"]["path"]):
+        raise ValueError("Source projection is not bound to its original aggregate/member")
+    packet = _checked(job, spec["packet"], spec["packet_sha256"])
+    _packet_inputs(job, packet)
+    projection = _checked(job, carry["projection"]["path"], carry["projection"]["sha256"])
+    if projection != _source_projection(source, packet):
+        raise ValueError("Carried source projection differs from the frozen canonical source")
+    return _checked(job, origin["path"], origin["sha256"]), projection
+
+
+def _source_revision_scope(job: Path, plan: dict, document: dict, cache: dict) -> None:
+    base, old = _archived_source(job, plan["source_revision"]["base"], cache)
+    selected = set(plan["source_revision"]["reopened"])
+    untouched = {page for spec in plan["units"] if spec["unit_id"] not in selected for page in spec["owned_pages"]}
+    if (document["title"] != old["title"] or document["main_body_start"] != old["main_body_start"]
+            or [page["id"] for page in document["source_pages"]] != [page["id"] for page in old["source_pages"]]
+            or [page["locator"] for page in document["source_pages"]] != [page["locator"] for page in old["source_pages"]]
+            or [page for page in document["source_pages"] if page["id"] in untouched]
+                != [page for page in old["source_pages"] if page["id"] in untouched]):
+        raise ValueError("Source revision changed inventory, metadata or unselected source pages")
+    old_blocks = [block for block in old["blocks"] if block["source_pages"][0] in untouched]
+    new_blocks = [block for block in document["blocks"] if block["source_pages"][0] in untouched]
+    note_ids = {note for block in old_blocks for note in _references(block, "note")}
+    if (old_blocks != new_blocks
+            or [note for note in old["notes"] if note["id"] in note_ids] != [note for note in document["notes"] if note["id"] in note_ids]):
+        raise ValueError("Source revision changed unselected owned blocks or notes")
+    if document == old:
+        raise ValueError("Selective source revision has no corrected source content to reseal")
+    protected_ids = {name for item in old_blocks + [note for note in old["notes"] if note["id"] in note_ids]
+                     for name in _references(item, "protected")}
+    old_defs = {item["id"]: item for item in old["protected"]}
+    new_defs = {item["id"]: item for item in document["protected"]}
+    if any(new_defs.get(name) != old_defs[name] for name in protected_ids):
+        raise ValueError("Source revision changed a shared definition outside its explicit closure")
+
+
+def _same_rebase_intent(old: dict, current: dict) -> None:
+    keys = ("version", "title", "source_language", "target_language", "source_file", "source_sha256", "models", "layout", "max_rounds", "round")
+    if (any(old[key] != current[key] for key in keys) or old["round"] != 0
+            or current["history"][:len(old["history"])] != old["history"]):
+        raise ValueError("Source rebase changed original evidence/model/language/layout/cap/round or prior history")
+
+
+def _term_source_names(terms: dict, old: dict, current: dict) -> None:
+    before = {item["id"]: item for item in old["protected"]}
+    after = {item["id"]: item for item in current["protected"]}
+    for term in terms["terms"]:
+        for name in term["protected_ids"]:
+            if (name not in before or before[name]["kind"] != "name" or after.get(name) != before[name]
+                    or before[name]["value"] not in term["source"] or before[name]["value"] not in term["target"]):
+                raise ValueError("Unchanged terminology no longer binds the same protected source names")
+
+
+def _logical_layout(source: dict, plan: dict) -> tuple[dict, list, tuple]:
+    declarations = {name: {item["id"]: item for item in source[name]} for name in ("blocks", "notes", "protected")}
+    specs = [{"unit_id": spec["unit_id"], "owned_pages": spec["owned_pages"], "owned_block_ids": [],
+              "owned_note_ids": [], "owned_protected_ids": []} for spec in plan["units"]]
+    ownership = _assign_ownership(source, declarations, specs, {page: index for index, page in enumerate(plan["page_ids"])})
+    return declarations, specs, ownership
+
+
+def _source_footprint(packet: dict, source: dict, canonical: dict) -> str:
+    envelope = {"version", "kind", "role", "unit_id", "plan_id", "terms", "handoff"}
+    value = {key: item for key, item in packet.items() if key not in envelope}
+    for key in ("context_block_owners", "context_note_owners"):
+        value[key] = canonical[key]
+    page_ids = {page["page_id"] for page in packet["pages"]}
+    value["source_page_records"] = [page for page in source["source_pages"] if page["id"] in page_ids]
+    return _canonical(value)
+
+
+def _rebase_view(job: Path, revision_pointer: dict, base_reference: dict, current: dict,
+                 acceptance: dict, old_target: dict, cache: dict) -> dict:
+    base, old_source = _archived_source(job, base_reference, cache)
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    new_job = _checked(job, current["job"]["path"], current["job"]["sha256"])
+    _same_rebase_intent(old_job, new_job)
+    new_source = _checked(job, current["source"]["path"], current["source"]["sha256"])
+    seal = _bound_bytes(job, current["seal"]).decode("ascii").strip()
+    revision = _checked(job, revision_pointer["plan"], revision_pointer["plan_sha256"])
+    receipt = _checked(job, current["source_receipt"]["path"], current["source_receipt"]["sha256"])
+    _check_admitted_artifacts(job, current["artifacts"])
+    proofs = [{"path": spec["checkpoint"], "sha256": current["artifacts"][spec["checkpoint"]]} for spec in revision["units"]]
+    if (revision.get("source_revision", {}).get("base") != base_reference or revision["revision"] is not True
+            or receipt.get("plan") != revision_pointer["plan"] or receipt.get("plan_sha256") != revision_pointer["plan_sha256"]
+            or receipt.get("unit_checkpoints") != proofs or receipt.get("source_document_sha256") != current["source"]["sha256"]
+            or receipt.get("source_snapshot_digest") != seal or receipt.get("revision") is not True
+            or receipt.get("role") != "source" or receipt.get("completed") is not True
+            or receipt.get("kind") != "unit-role-completed" or receipt.get("execution") != "units"
+            or receipt.get("merged_document_digest") != _canonical(new_source) or seal == base["source_digest"]):
+        raise ValueError("Source rebase lacks the exact completed source revision/aggregate/new snapshot")
+    core._validate_structure(new_source, job, None, False)
+    _source_revision_scope(job, revision, new_source, cache)
+    if core._source_digest(job, new_job, new_source) != seal:
+        raise ValueError("Source rebase new seal/source assets changed")
+    reseal = next((event for event in reversed(new_job["history"]) if event.get("event") == "source_resealed"), {})
+    if (reseal.get("source_digest") != seal or reseal.get("source_receipt") != current["source_receipt"]["path"]
+            or reseal.get("source_receipt_sha256") != current["source_receipt"]["sha256"]):
+        raise ValueError("Source rebase requires the legitimate explicit reseal journal record")
+    terms_before = _bound_bytes(job, base["terms"])
+    terms_after = _bound_bytes(job, current["terms"])
+    handoff_after = _bound_bytes(job, current["handoff"])
+    if terms_before != terms_after:
+        raise ValueError("Source rebase requires entire terminology bytes unchanged")
+    term_ref, _ = _term_proof(job, new_job, seal, terms_after, handoff_after, current["seal"]["sha256"])
+    if (term_ref != current["terminology_receipt"] or acceptance.get("accepted") is not True
+            or acceptance.get("handoff_sha256") != current["handoff"]["sha256"]
+            or acceptance.get("scope") != ["forms", "meanings", "style", "register", "names", "first_use", "index", "source_quality", "metadata", "preface"]):
+        raise ValueError("Source rebase requires explicit acceptance of the exact fresh native handoff compatibility claim")
+    terms = core.load_json(_path(job, current["terms"]["path"]))
+    _term_source_names(terms, old_source, new_source)
+    if (old_source["title"] != new_source["title"] or old_source["main_body_start"] != new_source["main_body_start"]
+            or [(page["id"], page["locator"]) for page in old_source["source_pages"]]
+                != [(page["id"], page["locator"]) for page in new_source["source_pages"]]):
+        raise ValueError("Source rebase changed global title/body/inventory metadata")
+    archived_target, completed = _old_target_context(job, base, old_source, cache)
+    if archived_target != old_target:
+        raise ValueError("Source rebase used a different frozen target plan")
+    _packet_inputs(job, {"pages": list(old_target["pages"].values())})
+    extraction = core.extraction_inventory(job)
+    old_defs, old_specs, old_ownership = _logical_layout(old_source, old_target)
+    new_defs, new_specs, new_ownership = _logical_layout(new_source, old_target)
+    if old_ownership[3] != old_target["metadata_owner"] or new_ownership[3] != old_target["metadata_owner"]:
+        raise ValueError("Source rebase changed translation metadata ownership")
+    baseline_before = old_target["baseline"]
+    baseline_after = {"terms.json": current["terms"]["sha256"], "handoff.md": current["handoff"]["sha256"]}
+    old_builder = _packet_builder(job, "translation", old_source, old_defs, old_target["page_ids"], extraction,
+                                  old_job, baseline_before, None, old_target["max_context_pages"])
+    new_builder = _packet_builder(job, "translation", new_source, new_defs, old_target["page_ids"], extraction,
+                                  new_job, baseline_after, None, old_target["max_context_pages"])
+    footprints, packets = {}, {}
+    for original, before_spec, after_spec in zip(old_target["units"], old_specs, new_specs):
+        actual = _checked(job, original["packet"], original["packet_sha256"])
+        before_packet = old_builder(before_spec, actual["plan_id"], old_target["pages"], old_ownership)
+        after_packet = new_builder(after_spec, "source-rebase-candidate", old_target["pages"], new_ownership)
+        before = _source_footprint(actual, old_source, before_packet)
+        canonical_before = _source_footprint(before_packet, old_source, before_packet)
+        after = _source_footprint(after_packet, new_source, after_packet)
+        carried = original["unit_id"] in completed and before == canonical_before == after
+        reason = "exact unchanged owned/read-only source footprint" if carried else (
+            "no completed checkpoint" if original["unit_id"] not in completed else "changed or uncertain source footprint")
+        footprints[original["unit_id"]] = {"before": before, "after": after, "decision": "carried" if carried else "pending", "reason": reason}
+        packets[original["unit_id"]] = (after_spec, after_packet)
+    return {"base": base, "old_source": old_source, "new_source": new_source, "old_target": old_target,
+            "completed": completed, "footprints": footprints, "packets": packets, "new_job": new_job}
+
+
+def _rebase_context(job: Path, plan: dict, cache: dict) -> dict:
+    bridge = plan["source_rebase"]
+    key = ("source-rebase", bridge["base"]["path"], _canonical(bridge))
+    if key not in cache:
+        old_target = _checked(job, bridge["prior_target_plan"]["plan"], bridge["prior_target_plan"]["plan_sha256"])
+        view = _rebase_view(job, bridge["revision_plan"], bridge["base"], bridge["current"], bridge["policy_acceptance"], old_target, cache)
+        if bridge["footprints"] != view["footprints"]:
+            raise ValueError("Recorded source rebase footprint decisions changed")
+        references = {entry["unit_id"]: {"path": entry["path"], "sha256": entry["sha256"]} for entry in view["base"]["target_checkpoints"]}
+        expected = {unit: references[unit] for unit, footprint in view["footprints"].items() if footprint["decision"] == "carried"}
+        if bridge["carried"] != expected:
+            raise ValueError("Source rebase carried checkpoint set changed")
+        cache[key] = view
+    return cache[key]
+
+
+def _source_rebase_inputs(job: Path, plan: dict) -> None:
+    bridge = plan["source_rebase"]
+    if plan["role"] != "translation" or any(plan.get(key) is not None for key in ("pending_replan", "translation_reopen", "source_revision")):
+        raise ValueError("Invalid active source rebase transition")
+    base = _checked(job, bridge["base"]["path"], bridge["base"]["sha256"])
+    current = bridge["current"]
+    current_job = _checked(job, current["job"]["path"], current["job"]["sha256"])
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    _same_rebase_intent(old_job, current_job)
+    for record in (base, current):
+        for key in ("source", "seal", "terms", "handoff", "source_receipt", "terminology_receipt"):
+            _bound_bytes(job, record[key])
+    seal = _bound_bytes(job, current["seal"]).decode("ascii").strip()
+    terms, handoff = _bound_bytes(job, current["terms"]), _bound_bytes(job, current["handoff"])
+    term_reference, _ = _term_proof(job, current_job, seal, terms, handoff, current["seal"]["sha256"])
+    acceptance = bridge["policy_acceptance"]
+    bindings = {"source_seal_sha256": current["seal"]["sha256"], "terminology_receipt": term_reference["path"],
+                "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": current["terms"]["sha256"],
+                "handoff_sha256": current["handoff"]["sha256"]}
+    if (terms != _bound_bytes(job, base["terms"]) or term_reference != current["terminology_receipt"]
+            or acceptance.get("accepted") is not True or acceptance.get("handoff_sha256") != current["handoff"]["sha256"]
+            or acceptance.get("scope") != ["forms", "meanings", "style", "register", "names", "first_use", "index", "source_quality", "metadata", "preface"]
+            or plan["readiness"] != {"source_digest": seal, "bindings": bindings}):
+        raise ValueError("Source rebase policy acceptance or exact terminology/readiness binding changed")
+    if (plan["job_sha256"] != current["job"]["sha256"] or plan["base_state"] != "terminology_ready" or plan["base_round"] != 0
+            or plan["selected_model"] != current_job["models"]["translation"] or plan["source_digest"] != seal
+            or any(plan["baseline"][name] != current[key]["sha256"] for name, key in
+                   (("book-source.json", "source"), ("source.sha256", "seal"), ("terms.json", "terms"), ("handoff.md", "handoff")))):
+        raise ValueError("Current source rebase plan differs from its exact frozen new context")
+    pointer = bridge["revision_plan"]
+    revision = _checked(job, pointer["plan"], pointer["plan_sha256"])
+    receipt = _checked(job, current["source_receipt"]["path"], current["source_receipt"]["sha256"])
+    if (revision.get("source_revision", {}).get("base") != bridge["base"] or revision.get("revision") is not True
+            or receipt.get("plan") != pointer["plan"] or receipt.get("plan_sha256") != pointer["plan_sha256"]
+            or receipt.get("source_snapshot_digest") != seal or receipt.get("source_document_sha256") != current["source"]["sha256"]
+            or receipt.get("revision") is not True or receipt.get("role") != "source" or receipt.get("completed") is not True):
+        raise ValueError("Source rebase lost its exact completed source revision and new seal")
+    original = _checked(job, base["target_plan"]["plan"], base["target_plan"]["plan_sha256"])
+    unchanged = ("pages_per_unit", "max_context_pages", "metadata_owner", "source_file_sha256", "extraction_sha256", "page_ids", "pages")
+    if (bridge["prior_target_plan"] != base["target_plan"] or any(plan[key] != original[key] for key in unchanged)
+            or plan["baseline"]["book.json"] != original["baseline"]["book.json"]
+            or [(spec["unit_id"], spec["owned_pages"]) for spec in plan["units"]]
+                != [(spec["unit_id"], spec["owned_pages"]) for spec in original["units"]]):
+        raise ValueError("Source rebase changed target ownership, metadata authority or immutable evidence/page bounds")
+    ids = {spec["unit_id"] for spec in plan["units"]}
+    footprints, carried = bridge["footprints"], bridge["carried"]
+    if (set(footprints) != ids or any(item.get("decision") not in {"carried", "pending"} for item in footprints.values())
+            or set(carried) != {unit for unit, item in footprints.items() if item["decision"] == "carried"}):
+        raise ValueError("Source rebase decisions do not describe the exact target partition")
+    for spec in plan["units"]:
+        reference = carried.get(spec["unit_id"])
+        if spec.get("carried_checkpoint") != reference or (reference is not None and reference["path"] != spec["checkpoint"]):
+            raise ValueError("Source rebase carried checkpoint identity changed")
+
+
+def _rebased_member(job: Path, plan: dict, spec: dict, cache: dict) -> tuple[dict, dict]:
+    view = _rebase_context(job, plan, cache)
+    reference = plan["source_rebase"]["carried"].get(spec["unit_id"])
+    original = next(item for item in view["old_target"]["units"] if item["unit_id"] == spec["unit_id"])
+    ignored = {"carried_checkpoint"}
+    if (reference is None or spec.get("carried_checkpoint") != reference or reference["path"] != spec["checkpoint"]
+            or {key: value for key, value in spec.items() if key not in ignored}
+                != {key: value for key, value in original.items() if key not in ignored}):
+        raise ValueError("Rebased checkpoint is not the exact accepted original member")
+    return _checked(job, reference["path"], reference["sha256"]), view["completed"][spec["unit_id"]]
+
+
+def _rebase_translation(job: Path, pages_per_unit: int, max_context_pages: int, readiness: dict,
+                        revision_path, accept_policy_compatibility) -> dict:
+    data = _job(job)
+    _initial_prebuild(data)
+    if not isinstance(revision_path, (str, Path)):
+        raise ValueError("Source rebase requires an absolute or job-relative source revision plan path")
+    path = Path(revision_path)
+    path = path.resolve(strict=True) if path.is_absolute() else _path(job, str(path))
+    if not path.is_relative_to(job):
+        raise ValueError("Source revision plan must be contained by this job")
+    revision = core.load_json(path)
+    if revision.get("role") != "source" or revision.get("revision") is not True or revision.get("source_revision") is None:
+        raise ValueError("Source rebase requires the explicit selective source revision plan")
+    revision_pointer = {"plan": _relative(job, path), "plan_sha256": _hash(path)}
+    base_reference = revision["source_revision"]["base"]
+    base, old_source = _archived_source(job, base_reference, {})
+    source = core.validate_book(job, translated=False)
+    digest = (job / "source.sha256").read_text(encoding="ascii").strip()
+    source_reference, source_receipt = _journal_ref(job, data, "role_source")
+    if (source_receipt.get("plan") != revision_pointer["plan"] or source_receipt.get("plan_sha256") != revision_pointer["plan_sha256"]
+            or source_receipt.get("source_snapshot_digest") != digest or source_receipt.get("revision") is not True):
+        raise ValueError("New source is not the completed, explicitly resealed requested revision")
+    validate_aggregate(job, source_receipt, "source")
+    terms, handoff = (job / "terms.json").read_bytes(), (job / "handoff.md").read_bytes()
+    if terms != _bound_bytes(job, base["terms"]):
+        raise ValueError("Source rebase requires entire terminology bytes unchanged")
+    term_reference, _ = _term_proof(job, data, digest, terms, handoff, _hash(job / "source.sha256"))
+    if (not isinstance(accept_policy_compatibility, str) or accept_policy_compatibility != _hash(job / "handoff.md")):
+        raise ValueError("Explicit acceptance must name the exact fresh native handoff compatibility judgment")
+    old_target = _checked(job, base["target_plan"]["plan"], base["target_plan"]["plan_sha256"])
+    if (pages_per_unit != old_target["pages_per_unit"] or max_context_pages != old_target["max_context_pages"]
+            or core.load_json(job / "units/translation/active.json") != base["target_plan"]):
+        raise ValueError("Source rebase must use the frozen active target plan and unchanged page/context bounds")
+    candidate_sha = _hash(job / "book.json") if (job / "book.json").is_file() else None
+    if candidate_sha != old_target["baseline"]["book.json"]:
+        raise ValueError("Unadmitted canonical target baseline changed during source correction")
+    expected_readiness = {"source_digest": digest, "bindings": {
+        "source_seal_sha256": _hash(job / "source.sha256"), "terminology_receipt": term_reference["path"],
+        "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": _hash(job / "terms.json"),
+        "handoff_sha256": _hash(job / "handoff.md")}}
+    if readiness != expected_readiness:
+        raise ValueError("Source rebase requires current source/terminology readiness")
+    identifier = uuid.uuid4().hex
+    directory = _path(job, f"units/translation/{identifier}")
+    current = {"source_receipt": source_reference, "terminology_receipt": term_reference,
+               "artifacts": _admitted_artifacts(job, [{"source_receipt": source_reference,
+                                                       "terminology_receipt": term_reference}, revision_pointer,
+                                                      {"path": data["source_file"], "sha256": data["source_sha256"]}])}
+    snapshots = (("job", "job.json", "current-job.json"), ("source", "book-source.json", "current-source.json"),
+                 ("seal", "source.sha256", "current-source.sha256"), ("terms", "terms.json", "current-terms.json"),
+                 ("handoff", "handoff.md", "current-handoff.md"))
+    for key, relative, _ in snapshots:
+        current[key] = _ref(job, _path(job, relative))
+    acceptance = {"handoff_sha256": accept_policy_compatibility, "accepted": True,
+                  "scope": ["forms", "meanings", "style", "register", "names", "first_use", "index", "source_quality", "metadata", "preface"],
+                  "at": datetime.now(timezone.utc).isoformat()}
+    view = _rebase_view(job, revision_pointer, base_reference, current, acceptance, old_target, {})
+    for key, relative, name in snapshots:
+        frozen = _snapshot(job, directory, relative, name)
+        if frozen["sha256"] != current[key]["sha256"]:
+            raise ValueError("Current source rebase context changed during freezing")
+        current[key] = frozen
+    references = {entry["unit_id"]: {"path": entry["path"], "sha256": entry["sha256"]} for entry in base["target_checkpoints"]}
+    specs, carried = [], {}
+    for original in old_target["units"]:
+        unit = original["unit_id"]
+        if view["footprints"][unit]["decision"] == "carried":
+            spec = {**original, "carried_checkpoint": references[unit]}
+            carried[unit] = references[unit]
+        else:
+            logical, packet = view["packets"][unit]
+            packet = {**packet, "plan_id": identifier}
+            packet_path = directory / "packets" / f"{unit}.json"
+            _write_once(packet_path, packet)
+            spec = {**logical, "packet": _relative(job, packet_path), "packet_sha256": _hash(packet_path),
+                    "result": _relative(job, directory / "results" / f"{unit}.json"),
+                    "assets_dir": _relative(job, directory / "assets" / unit),
+                    "checkpoint": _relative(job, directory / "checkpoints" / f"{unit}.json")}
+            old_result = _path(job, original["result"])
+            if old_result.is_file():
+                aid = {"result": _ref(job, old_result)}
+                if unit in references:
+                    aid["checkpoint"] = references[unit]
+                spec["reading_aid"] = aid
+        specs.append(spec)
+    plan = {"version": 1, "kind": "book-unit-plan", "plan_id": identifier, "role": "translation",
+            "job_path": str(job), "job_sha256": current["job"]["sha256"], "base_state": data["state"], "base_round": data["round"],
+            "revision": False, "selected_model": data["models"]["translation"], "source_file_sha256": data["source_sha256"],
+            "source_digest": digest, "baseline": _baseline(job), "extraction_sha256": old_target["extraction_sha256"],
+            "pages_per_unit": pages_per_unit, "max_context_pages": max_context_pages,
+            "page_ids": old_target["page_ids"], "pages": old_target["pages"], "metadata_owner": old_target["metadata_owner"],
+            "draft": None, "build": None, "pdf_page_ids": [], "readiness": readiness, "review_artifacts": {}, "units": specs,
+            "source_rebase": {"revision_plan": revision_pointer, "base": base_reference, "prior_target_plan": base["target_plan"],
+                              "current": current, "policy_acceptance": acceptance, "footprints": view["footprints"], "carried": carried}}
+    destination = directory / "plan.json"
+    _write_once(destination, plan)
+    pointer = {"plan": _relative(job, destination), "plan_sha256": _hash(destination)}
+    _stable_context(job, plan)
+    _rebase_context(job, plan, {})
+    core.save_json(job / "units/translation/active.json", pointer)
+    return {**pointer, "role": "translation", "units": [spec["unit_id"] for spec in specs], "pages": len(plan["page_ids"])}
+
+
+
+def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
+                max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False,
+                reopen_units: list[str] | None = None, rebase_source: Path | None = None,
+                accept_policy_compatibility: str | None = None) -> dict:
+    """Snapshot bounded page evidence and untrusted draft slices without admission.
+
+    A complete block belongs to its first source page's unit. Notes follow their
+    callout owner; shared protected declarations have one owner and read-only
+    copies elsewhere. Crossing blocks stay intact with bounded context pages.
+    """
+    job = Path(job).resolve(strict=True)
+    if role not in _ROLES or type(pages_per_unit) is not int or not 1 <= pages_per_unit <= 8:
+        raise ValueError("Choose source/translation/review and pages_per_unit between 1 and 8")
+    if type(max_context_pages) is not int or not 0 <= max_context_pages <= 4:
+        raise ValueError("max_context_pages must be between 0 and 4")
+    if role != "source" and (not isinstance(readiness, dict) or not isinstance(readiness.get("bindings"), dict)):
+        raise ValueError("Controller must supply admitted readiness bindings for translation/review planning")
+    if replan_pending and (role != "translation" or draft_path is not None or revise):
+        raise ValueError("Pending replanning requires translation without draft import or revision")
+    source_revision_requested = role == "source" and revise is True and reopen_units is not None
+    if source_revision_requested and (draft_path is not None or replan_pending or rebase_source is not None or accept_policy_compatibility is not None):
+        raise ValueError("Selective source revision cannot combine draft/resize/rebase options")
+    if reopen_units is not None and not source_revision_requested and (role != "translation" or draft_path is not None or revise or replan_pending):
+        raise ValueError("Reopening requires selected source revision or eligible prebuild translation")
+    if (rebase_source is None) != (accept_policy_compatibility is None):
+        raise ValueError("Source rebase requires explicit handoff-policy acceptance")
+    if rebase_source is not None and (role != "translation" or draft_path is not None or revise or replan_pending or reopen_units is not None):
+        raise ValueError("Source rebase cannot combine role/draft/revision/resize/reopen options")
+    data = _job(job)
+    if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
+           for name in ("source", "terminology", "translation", "review")):
+        raise ValueError("Every exact role model must be configured before unit planning")
+    sealed = (job / "source.sha256").is_file()
+    if role == "source":
+        if (revise and not sealed) or (not revise and (data["state"] != "extracted" or sealed)):
+            raise ValueError("Source units require extracted/unsealed state or explicit sealed revision")
+    elif role == "translation" and (revise or data["state"] not in {"terminology_ready", "changes_requested"} or data["round"] >= data["max_rounds"]):
+        raise ValueError("Translation units require an eligible pending translation round")
+    elif role == "review" and (revise or data["state"] != "translated" or data["round"] < 1):
+        raise ValueError("Review units require a current translated round")
+    if role in {"translation", "review"}:
+        core.validate_book(job, translated=role == "review")
+        core.validate_document("terms", core.load_json(job / "terms.json"))
+        if not (job / "handoff.md").read_text(encoding="utf-8").strip():
+            raise ValueError("Translation units require a substantive terminology handoff")
+    if rebase_source is not None:
+        return _rebase_translation(job, pages_per_unit, max_context_pages, readiness, rebase_source, accept_policy_compatibility)
+    source_context = _source_revision_context(job, pages_per_unit, reopen_units) if source_revision_requested else None
+    if reopen_units is not None and not source_revision_requested:
+        return _reopen_translation(job, pages_per_unit, max_context_pages, readiness, reopen_units)
+    pending_replan, previous, carried = None, None, {}
+    if replan_pending:
+        pending_replan, previous, carried = _prepare_pending_translation(job, pages_per_unit, max_context_pages, readiness)
+    extraction = core.extraction_inventory(job)
+    if extraction is None:
+        raise ValueError("Unit planning requires controller-admitted complete extraction evidence")
+    extraction_digest = next(event["extraction_sha256"] for event in reversed(data["history"]) if event.get("event") == "extracted")
+    pages = extraction["pages"]
+    page_ids = [page["id"] for page in pages]
+    page_order = {name: index for index, name in enumerate(page_ids)}
+    identifier = uuid.uuid4().hex
+    directory = _path(job, f"units/{role}/{identifier}")
+    if not replan_pending:
+        directory.mkdir(parents=True, exist_ok=False)
+    revision_base = _freeze_source_base(job, directory, source_context) if source_context is not None else None
+    baseline = _baseline(job)
+    review_artifacts = {}
+    if role == "review":
+        for suffix in ("json", "receipt.json"):
+            name = f"reviews/round-{data['round']}.{suffix}"
+            path = _path(job, name)
+            review_artifacts[name] = _hash(path) if path.is_file() else None
+    draft_info = None
+    build = _review_build(job) if role == "review" else None
+    if source_context is not None:
+        draft = source_context["source"]
+        base = _checked(job, revision_base["path"], revision_base["sha256"])
+        draft_info = {"snapshot": base["source"]["path"], "snapshot_sha256": base["source"]["sha256"],
+                      "assets": core._asset_hashes(job, draft), "trusted": False, "origin": "sealed-source"}
+    elif role in {"translation", "review"}:
+        draft = core.load_json(job / ("book.json" if role == "review" else "book-source.json"))
+    else:
+        selected_draft = Path(draft_path).resolve(strict=True) if draft_path else job / "book-source.json"
+        if selected_draft.is_file():
+            draft, draft_info = _import_draft(job, directory, selected_draft)
+        else:
+            draft = {"title": data["title"], "main_body_start": None, "source_pages": [],
+                     "blocks": [], "notes": [], "protected": []}
+            for page in pages:
+                text = page.get("ocr", {}).get("text") or page.get("text", "")
+                source = [{"page": page["id"]}]
+                if text:
+                    source.append({"text": text})
+                draft["blocks"].append({"id": f"draft_{page['id']}", "kind": "paragraph",
+                    "source_pages": [page["id"]], "source": source, "target": []})
+    if role != "source" and [page["id"] for page in draft["source_pages"]] != page_ids:
+        raise ValueError("Sealed source inventory differs from complete original extraction page order")
+    declarations = {}
+    for category in ("blocks", "notes", "protected"):
+        declarations[category] = {item["id"]: item for item in draft[category]}
+        if len(declarations[category]) != len(draft[category]):
+            raise ValueError(f"Draft {category} IDs are duplicated; resolve ownership before planning")
+    unit_specs = []
+    if previous is None:
+        groups = [(f"u{index + 1:04d}", page_ids[offset:offset + pages_per_unit])
+                  for index, offset in enumerate(range(0, len(pages), pages_per_unit))]
+    else:
+        if page_ids != previous["page_ids"]:
+            raise ValueError("Original page inventory changed before pending replanning")
+        old_ownership = _translation_ownership(draft, declarations, previous, page_order)
+        completed_pages = {page for spec in carried.values() for page in spec["owned_pages"]}
+        new_groups = []
+        for offset in range(0, len(page_ids), pages_per_unit):
+            run = []
+            for page in page_ids[offset:offset + pages_per_unit]:
+                if page in completed_pages:
+                    if run:
+                        new_groups.append(run)
+                        run = []
+                else:
+                    run.append(page)
+            if run:
+                new_groups.append(run)
+        next_id = max(int(spec["unit_id"][1:]) for spec in previous["units"]) + 1
+        groups = [(spec["unit_id"], spec["owned_pages"]) for spec in carried.values()]
+        groups.extend((f"u{next_id + index:04d}", owned) for index, owned in enumerate(new_groups))
+        groups.sort(key=lambda group: page_order[group[1][0]])
+    for unit_id, owned in groups:
+        unit_specs.append({"unit_id": unit_id, "owned_pages": owned, "owned_block_ids": [],
+                           "owned_note_ids": [], "owned_protected_ids": []})
+    if source_context is not None and [(spec["unit_id"], spec["owned_pages"]) for spec in unit_specs] != [
+            (spec["unit_id"], spec["owned_pages"]) for spec in source_context["old_source_plan"]["units"]]:
+        raise ValueError("Selective source revision must retain original source ownership")
+    ownership = _assign_ownership(draft, declarations, unit_specs, page_order)
+    block_owners, note_owners, protected_users, metadata_owner = ownership
+    if previous is not None:
+        for index, spec in enumerate(unit_specs):
+            if spec["unit_id"] not in carried:
+                continue
+            original = carried[spec["unit_id"]]
+            if (any(spec[key] != original[key] for key in ("owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"))
+                    or (previous["metadata_owner"] == spec["unit_id"]) != (metadata_owner == spec["unit_id"])):
+                raise ValueError("Pending replanning changed completed unit ownership or metadata authority")
+            unit_specs[index] = original
+    pdf_page_ids = _review_ownership(job, unit_specs, block_owners, note_owners, metadata_owner) if role == "review" else []
+    page_records = previous["pages"] if previous is not None else {}
+    for page in ([] if previous is not None else pages):
+        image = page.get("image")
+        if not image or not _path(job, image).is_file():
+            raise ValueError(f"Source page {page['id']} lacks a readable inspection image")
+        destination = directory / "pages" / f"{page['id']}.json"
+        _write_once(destination, page)
+        page_records[page["id"]] = {"page_id": page["id"], "locator": page["locator"],
+            "evidence": _relative(job, destination), "evidence_sha256": _hash(destination),
+            "image": image, "image_sha256": _hash(_path(job, image)),
+            "raster_region_count": len(page.get("image_regions", []))}
+    packet_for = _packet_builder(job, role, draft, declarations, page_ids, extraction, data, baseline, build, max_context_pages)
 
     if previous is not None:
         for spec in previous["units"]:
@@ -773,6 +1436,19 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
                     result=_relative(job, directory / "results" / f"{spec['unit_id']}.json"),
                     assets_dir=_relative(job, directory / "assets" / spec["unit_id"]),
                     checkpoint=_relative(job, directory / "checkpoints" / f"{spec['unit_id']}.json"))
+    if source_context is not None:
+        old_specs = {spec["unit_id"]: spec for spec in source_context["old_source_plan"]["units"]}
+        old_receipt = _checked(job, source_context["source_receipt"]["path"], source_context["source_receipt"]["sha256"])
+        origins = {item["path"]: item for item in old_receipt["unit_checkpoints"]}
+        for spec in unit_specs:
+            if spec["unit_id"] in source_context["reopened"]:
+                continue
+            packet = _checked(job, spec["packet"], spec["packet_sha256"])
+            projection_path = directory / "projections" / f"{spec['unit_id']}.json"
+            _write_once(projection_path, _source_projection(draft, packet))
+            origin = origins[old_specs[spec["unit_id"]]["checkpoint"]]
+            spec.update(result=_relative(job, projection_path), checkpoint=origin["path"],
+                        source_carry={"checkpoint": origin, "projection": _ref(job, projection_path)})
     plan = {"version": 1, "kind": "book-unit-plan", "plan_id": identifier, "role": role,
             "job_path": str(job), "job_sha256": _hash(job / "job.json"),
             "base_state": data["state"], "base_round": data["round"], "revision": revise,
@@ -783,6 +1459,9 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             "page_ids": page_ids, "pages": page_records, "metadata_owner": metadata_owner,
             "draft": draft_info, "build": build, "pdf_page_ids": pdf_page_ids, "readiness": readiness,
             "review_artifacts": review_artifacts, "units": unit_specs}
+    if revision_base is not None:
+        plan["source_revision"] = {"base": revision_base, "reopened": source_context["reopened"]}
+        _source_revision_inputs(job, plan)
     if pending_replan is not None:
         plan["pending_replan"] = pending_replan
     destination = directory / "plan.json"
@@ -795,6 +1474,9 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         for spec in unit_specs:
             if spec.get("carried_checkpoint") is not None:
                 _member_checkpoint(job, plan, pointer["plan"], pointer["plan_sha256"], spec, origins)
+    if revision_base is not None:
+        _stable_context(job, plan)
+        _archived_source(job, revision_base, {})
     core.save_json(_path(job, f"units/{role}/active.json"), pointer)
     return {**pointer, "role": role, "units": [item["unit_id"] for item in unit_specs], "pages": len(page_ids)}
 
@@ -1148,6 +1830,10 @@ def import_checkpoints(job, role: str, plan_path) -> dict:
 
 def _member_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, spec: dict,
                        origin_plans: dict) -> tuple[dict, dict]:
+    if spec.get("source_carry") is not None:
+        return _source_carried_member(job, plan, spec, origin_plans)
+    if plan.get("source_rebase") is not None and spec.get("carried_checkpoint") is not None:
+        return _rebased_member(job, plan, spec, origin_plans)
     reference = spec.get("carried_checkpoint")
     checkpoint_path = _path(job, spec["checkpoint"])
     if reference is None:
@@ -1189,6 +1875,10 @@ def _member_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, 
                     or (parent_spec.get("carried_checkpoint") is not None and parent_spec["carried_checkpoint"] != reference)
                     or (parent_spec.get("carried_checkpoint") is None and (origin_name, origin_digest) != parent_key)):
                 raise ValueError("Carried translation checkpoint is not linked through the exact parent scope/origin")
+            if (parent["metadata_owner"] == spec["unit_id"]) != (plan["metadata_owner"] == spec["unit_id"]):
+                raise ValueError("Carried translation metadata authority changed from its immediate parent")
+            if parent_spec.get("carried_checkpoint") is not None:
+                return _member_checkpoint(job, parent, link["plan"], link["plan_sha256"], parent_spec, origin_plans)
             _translation_replan_context(plan, origin_plan, allow_same_bound=reopening)
             if (origin_plan["metadata_owner"] == spec["unit_id"]) != (plan["metadata_owner"] == spec["unit_id"]):
                 raise ValueError("Carried translation metadata ownership changed")
@@ -1268,7 +1958,7 @@ def continue_source(job, future_job: dict) -> dict:
             "previous_job": previous_job, "job_snapshot": job_snapshot, "reopened": reopened}
 
 
-def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[list, list]:
+def _members(job: Path, plan: dict, plan_name: str, plan_digest: str, *, cache: dict | None = None) -> tuple[list, list]:
     checkpoints, outputs = [], []
     _plan_inputs(job, plan)
     if plan.get("historical_plan") is not None:
@@ -1295,7 +1985,7 @@ def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[l
         pdf_owned = [page for item in plan["units"] for page in item["pdf_pages"]]
         if Counter(pdf_owned) != Counter(plan["pdf_page_ids"]):
             raise ValueError("Review unit plan lacks exact complete physical PDF page ownership")
-    origin_plans = {}
+    origin_plans = {} if cache is None else cache
     for spec in plan["units"]:
         _, output = _member_checkpoint(job, plan, plan_name, plan_digest, spec, origin_plans)
         checkpoints.append({"path": spec["checkpoint"], "sha256": _hash(_path(job, spec["checkpoint"]))})
@@ -1350,6 +2040,10 @@ def _merge(job: Path, plan: dict, outputs: list) -> dict:
         referenced.update(token["protected"] for token in item.get("target", []) if "protected" in token)
     # Unused exact imports stay in immutable unit evidence, not the canonical symbol table.
     book["protected"] = [item for item in book["protected"] if item["id"] in referenced or item["id"] in authored]
+    if plan.get("source_revision") is not None:
+        _, original = _source_revision_inputs(job, plan)
+        order = {item["id"]: index for index, item in enumerate(original["protected"])}
+        book["protected"].sort(key=lambda item: order.get(item["id"], len(order)))
     return book
 
 
@@ -1375,12 +2069,15 @@ def assemble_units(job, role: str) -> dict:
     job = Path(job).resolve(strict=True)
     plan_path, plan, digest = _current_plan(job, role)
     _stable_context(job, plan)
-    checkpoints, outputs = _members(job, plan, _relative(job, plan_path), digest)
+    archives = {}
+    checkpoints, outputs = _members(job, plan, _relative(job, plan_path), digest, cache=archives)
     if role == "review":
         document = _review_report(plan, outputs)
         name = f"reviews/round-{plan['base_round']}.json"
     else:
         document = _merge(job, plan, outputs)
+        if plan.get("source_revision") is not None:
+            _source_revision_scope(job, plan, document, archives)
         core.validate_document("book", document)
         terms = core.load_json(job / "terms.json") if role == "translation" else None
         data = _job(job)
@@ -1426,7 +2123,8 @@ def validate_aggregate(job, receipt: dict, role: str | None = None) -> None:
             or receipt.get("selector") != core.admit_model(**plan["selected_model"])
             or any(receipt.get(key) != plan["selected_model"][key] for key in ("provider", "model"))):
         raise ValueError("Aggregate differs from immutable unit stage context")
-    checkpoints, outputs = _members(job, plan, receipt["plan"], receipt["plan_sha256"])
+    archives = {}
+    checkpoints, outputs = _members(job, plan, receipt["plan"], receipt["plan_sha256"], cache=archives)
     if receipt.get("unit_checkpoints") != checkpoints:
         raise ValueError("Aggregate member set/order/hash changed")
     if role == "review":
@@ -1442,6 +2140,8 @@ def validate_aggregate(job, receipt: dict, role: str | None = None) -> None:
             raise ValueError("Aggregate review differs from exact complete PDF-bound member reports")
         return
     book = _merge(job, plan, outputs)
+    if plan.get("source_revision") is not None:
+        _source_revision_scope(job, plan, book, archives)
     name = "book-source.json" if role == "source" else "book.json"
     if (receipt.get("merged_document") != name or receipt.get("merged_document_digest") != _canonical(book)
             or receipt.get("merged_document_sha256") != _hash(job / name)
