@@ -1,8 +1,8 @@
-"""Durable bounded native work units; only assembly writes canonical manuscripts.
+"""Durable bounded book work units; only assembly writes canonical manuscripts.
 
 Unit admission deliberately leaves job.json, source seals and global rounds alone.
-The workflow controller supplies already checked native identity evidence and remains
-responsible for stage transitions, source sealing, canonical builds and review.
+OMP owns execution. Content checkpoints retain compact task references, not execution
+attestation. The controller owns stage transitions, seals, builds and review.
 """
 from __future__ import annotations
 
@@ -147,9 +147,9 @@ def _current_plan(job: Path, role: str) -> tuple[Path, dict, str]:
         raise ValueError("Bounded units support source, translation and review")
     active = core.load_json(_path(job, f"units/{role}/active.json"))
     plan = _checked(job, active["plan"], active["plan_sha256"])
-    if (plan.get("version") != 1 or plan.get("kind") != "native-unit-plan"
+    if (plan.get("version") != 1 or plan.get("kind") != "book-unit-plan"
             or plan.get("role") != role or plan.get("job_path") != str(job)):
-        raise ValueError("Invalid active unit plan")
+        raise ValueError("Invalid active book unit plan; explicitly import historical completed checkpoints first")
     return _path(job, active["plan"]), plan, active["plan_sha256"]
 
 
@@ -436,7 +436,7 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         if len(context) > max_context_pages:
             raise ValueError(f"Unit {spec['unit_id']} needs {len(context)} context pages, exceeding declared bound {max_context_pages}; explicitly replan")
         referenced = references | set(spec["owned_protected_ids"])
-        packet = {"version": 1, "kind": "native-unit-packet", "role": role, "unit_id": spec["unit_id"],
+        packet = {"version": 1, "kind": "book-unit-packet", "role": role, "unit_id": spec["unit_id"],
             "plan_id": identifier, "source_file_sha256": data["source_sha256"],
             "owned_pages": spec["owned_pages"], "context_pages": sorted(context, key=page_order.__getitem__),
             "pages": [page_records[name] for name in spec["owned_pages"] + sorted(context, key=page_order.__getitem__)],
@@ -473,8 +473,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         spec.update(packet=_relative(job, packet_path), packet_sha256=_hash(packet_path),
                     result=_relative(job, directory / "results" / f"{spec['unit_id']}.json"),
                     assets_dir=_relative(job, directory / "assets" / spec["unit_id"]),
-                    receipt=_relative(job, directory / "receipts" / f"{spec['unit_id']}.json"))
-    plan = {"version": 1, "kind": "native-unit-plan", "plan_id": identifier, "role": role,
+                    checkpoint=_relative(job, directory / "checkpoints" / f"{spec['unit_id']}.json"))
+    plan = {"version": 1, "kind": "book-unit-plan", "plan_id": identifier, "role": role,
             "job_path": str(job), "job_sha256": _hash(job / "job.json"),
             "base_state": data["state"], "base_round": data["round"], "revision": revise,
             "selected_model": data["models"][role], "source_file_sha256": data["source_sha256"],
@@ -507,7 +507,7 @@ def _packet_scope(packet: dict) -> None:
 
 
 
-def prepare_unit(job, role: str, unit_id: str, revise: bool | None = None) -> dict:
+def unit_binding(job, role: str, unit_id: str, revise: bool | None = None) -> dict:
     job = Path(job).resolve(strict=True)
     plan_path, plan, digest = _current_plan(job, role)
     _stable_context(job, plan)
@@ -516,8 +516,8 @@ def prepare_unit(job, role: str, unit_id: str, revise: bool | None = None) -> di
     spec = next((item for item in plan["units"] if item["unit_id"] == unit_id), None)
     if spec is None:
         raise ValueError("Unknown unit in active plan")
-    if _path(job, spec["receipt"]).exists():
-        raise ValueError("Unit is already admitted; do not dispatch it again")
+    if _path(job, spec["checkpoint"]).exists():
+        raise ValueError("Unit is already checkpointed; do not dispatch it again")
     packet = _checked(job, spec["packet"], spec["packet_sha256"])
     _packet_scope(packet)
     return {"plan": _relative(job, plan_path), "plan_sha256": digest,
@@ -716,46 +716,134 @@ def _packet_inputs(job: Path, packet: dict) -> None:
 
 
 
-def complete_unit(job, request: dict, native_identity: dict) -> dict:
-    """Consume a successful native run into one immutable unit receipt, not a stage."""
-    job = Path(job).resolve(strict=True)
-    binding = request.get("bindings", {}).get("unit")
-    if not isinstance(binding, dict):
-        raise ValueError("Native request lacks a bound work unit")
-    plan = _checked(job, binding["plan"], binding["plan_sha256"])
-    _stable_context(job, plan)
-    role = plan["role"]
-    spec = next((item for item in plan["units"] if item["unit_id"] == binding["unit_id"]), None)
-    if spec is None or any(binding.get(key) != spec[key] for key in ("packet", "packet_sha256", "result", "assets_dir")):
-        raise ValueError("Native unit binding differs from the prepared plan")
-    if (request.get("role") != role or request.get("base_state") != plan["base_state"]
-            or request.get("base_round") != plan["base_round"] or request.get("job_sha256") != plan["job_sha256"]
-            or native_identity.get("completed") is not True
-            or any(native_identity.get(key) != plan["selected_model"][key] for key in ("provider", "model"))):
-        raise ValueError("Native identity/request does not match unit plan context")
-    readiness = plan.get("readiness")
-    if readiness is not None and (request.get("source_digest") != readiness.get("source_digest")
-            or {key: value for key, value in request.get("bindings", {}).items() if key != "unit"} != readiness["bindings"]):
-        raise ValueError("Native request differs from immutable admitted stage readiness")
+def task_metadata(value: dict, role: str, selected_model: dict) -> dict:
+    """Retain normal settled task metadata as a reference, not execution attestation."""
+    selector = core.admit_model(**selected_model)
+    if (not isinstance(value, dict) or not isinstance(value.get("id"), str) or not value["id"].strip()
+            or value.get("agent") != f"book-{role}" or type(value.get("exitCode")) is not int
+            or value["exitCode"] != 0 or value.get("error") or value.get("aborted", False) is not False
+            or value.get("resolvedModelIdentity") != selector
+            or value.get("resolvedModelIsFallback", False) is not False):
+        raise ValueError("Book checkpoint requires a successful settled task on the selected role/model without fallback")
+    return {key: value[key] for key in ("id", "agent", "exitCode", "resolvedModelIdentity")} | {
+        "resolvedModelIsFallback": False}
+
+
+def _content_checkpoint(job: Path, plan: dict, plan_name: str, plan_digest: str, spec: dict) -> dict:
     packet = _checked(job, spec["packet"], spec["packet_sha256"])
     _packet_inputs(job, packet)
-    result_path = _path(job, spec["result"])
-    output = core.load_json(result_path)
-    assets = _validate_result(job, packet, output, binding)
-    receipt = {**native_identity, "version": 1, "kind": "native-unit-completed", "role": role, "stage": role,
-        "plan": binding["plan"], "plan_sha256": binding["plan_sha256"], "unit_id": spec["unit_id"],
+    output = core.load_json(_path(job, spec["result"]))
+    assets = _validate_result(job, packet, output, spec)
+    return {"version": 1, "kind": "book-unit-checkpoint", "role": plan["role"], "stage": plan["role"],
+        "completed": True, **plan["selected_model"], "selector": core.admit_model(**plan["selected_model"]),
+        "plan": plan_name, "plan_sha256": plan_digest, "unit_id": spec["unit_id"],
         "packet": spec["packet"], "packet_sha256": spec["packet_sha256"],
-        "result": spec["result"], "result_sha256": _hash(result_path), "assets": assets,
+        "result": spec["result"], "result_sha256": _hash(_path(job, spec["result"])), "assets": assets,
         "source_file_sha256": plan["source_file_sha256"], "source_digest": plan["source_digest"],
         "base_state": plan["base_state"], "base_round": plan["base_round"], "revision": plan["revision"]}
-    receipt_path = _path(job, spec["receipt"])
-    _write_once(receipt_path, receipt)
-    return {**receipt, "receipt_path": _relative(job, receipt_path), "receipt_sha256": _hash(receipt_path)}
 
 
-def _members(job: Path, plan: dict, plan_name: str, plan_digest: str, validate_native_receipt) -> tuple[list, list]:
-    proofs, outputs = [], []
+def checkpoint_unit(job, role: str, unit_id: str, task: dict) -> dict:
+    """Checkpoint complete assigned book content without changing global state."""
+    job = Path(job).resolve(strict=True)
+    plan_path, plan, digest = _current_plan(job, role)
+    _stable_context(job, plan)
+    spec = next((item for item in plan["units"] if item["unit_id"] == unit_id), None)
+    if spec is None:
+        raise ValueError("Unknown unit in active plan")
+    if _path(job, spec["checkpoint"]).exists():
+        raise ValueError("Unit is already checkpointed; do not dispatch it again")
+    metadata = task_metadata(task, role, plan["selected_model"])
+    checkpoint = _content_checkpoint(job, plan, _relative(job, plan_path), digest, spec)
+    checkpoint["task"] = metadata
+    checkpoint_path = _path(job, spec["checkpoint"])
+    _write_once(checkpoint_path, checkpoint)
+    return {**checkpoint, "checkpoint_path": _relative(job, checkpoint_path),
+            "checkpoint_sha256": _hash(checkpoint_path)}
+
+
+def _checkpoint_origin(job: Path, checkpoint: dict, plan: dict) -> None:
+    if ("task" in checkpoint) == ("historical_origin" in checkpoint):
+        raise ValueError("Book checkpoint needs exactly one task reference or explicit historical origin")
+    if "task" in checkpoint:
+        task_metadata(checkpoint["task"], plan["role"], plan["selected_model"])
+    else:
+        origin = checkpoint["historical_origin"]
+        if not isinstance(origin, dict) or set(origin) != {"path", "sha256"}:
+            raise ValueError("Invalid historical checkpoint origin")
+        _checked(job, origin["path"], origin["sha256"])
+
+
+def import_checkpoints(job, role: str, plan_path) -> dict:
+    """Import legacy receipt-bound content, never replay or relabel old execution."""
+    job = Path(job).resolve(strict=True)
+    plan_path = Path(plan_path).resolve(strict=True)
+    if not plan_path.is_relative_to(job / "units" / role):
+        raise ValueError("Historical plan must be inside this job's role unit directory")
+    legacy_name = _relative(job, plan_path)
+    legacy_digest = _hash(plan_path)
+    legacy = core.load_json(plan_path)
+    if (legacy.get("version") != 1 or legacy.get("kind") != "native-unit-plan"
+            or legacy.get("role") != role or role not in _ROLES):
+        raise ValueError("Explicit import requires a historical native-unit-plan for this role")
+    _stable_context(job, legacy)
+    domain_path = plan_path.with_name("book-plan.json")
+    domain_name = _relative(job, domain_path)
+    domain = {**legacy, "kind": "book-unit-plan", "historical_plan": {"path": legacy_name, "sha256": legacy_digest},
+              "units": []}
+    imported = []
+    for old_spec in legacy["units"]:
+        spec = {key: value for key, value in old_spec.items() if key != "receipt"}
+        spec["checkpoint"] = _relative(job, plan_path.parent / "checkpoints" / f"{spec['unit_id']}.json")
+        domain["units"].append(spec)
+        origin_path = _path(job, old_spec["receipt"])
+        if not origin_path.exists():
+            continue
+        receipt = core.load_json(origin_path)
+        expected = {"version": 1, "kind": "native-unit-completed", "completed": True, "role": role, "stage": role,
+                    "selector": core.admit_model(**legacy["selected_model"]),
+                    "plan": legacy_name, "plan_sha256": legacy_digest, "unit_id": spec["unit_id"],
+                    **{key: spec[key] for key in ("packet", "packet_sha256", "result")},
+                    **legacy["selected_model"],
+                    **{key: legacy[key] for key in ("source_file_sha256", "source_digest", "base_state", "base_round", "revision")}}
+        if (receipt.get("completed") is not True or type(receipt.get("revision")) is not bool
+                or any(receipt.get(key) != value for key, value in expected.items())):
+            raise ValueError("Historical completed receipt does not bind this exact planned result/context")
+        checkpoint = _content_checkpoint(job, domain, domain_name, "", spec)
+        if any(receipt.get(key) != checkpoint[key] for key in ("result_sha256", "assets")):
+            raise ValueError("Historical completed result or source assets changed")
+        checkpoint["historical_origin"] = {"path": old_spec["receipt"], "sha256": _hash(origin_path)}
+        imported.append((spec, checkpoint))
+    if not imported:
+        raise ValueError("Historical plan contains no receipt-bound completed results to import")
+
+    def publish(path: Path, value: dict) -> None:
+        if path.is_symlink() or not path.resolve().is_relative_to(job):
+            raise ValueError("Imported checkpoint artifact must stay inside the job without symlinks")
+        if path.exists():
+            if core.load_json(path) != value:
+                raise ValueError("A different imported checkpoint artifact already exists")
+        else:
+            _write_once(path, value)
+
+    publish(domain_path, domain)
+    digest = _hash(domain_path)
+    for spec, checkpoint in imported:
+        checkpoint["plan_sha256"] = digest
+        publish(_path(job, spec["checkpoint"]), checkpoint)
+    pointer = {"plan": domain_name, "plan_sha256": digest}
+    active = _path(job, f"units/{role}/active.json")
+    if not active.exists() or core.load_json(active) != pointer:
+        core.save_json(active, pointer)
+    return {**status(job, role), "imported": [spec["unit_id"] for spec, _ in imported]}
+
+
+def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[list, list]:
+    checkpoints, outputs = [], []
     _plan_inputs(job, plan)
+    if plan.get("historical_plan") is not None:
+        origin = plan["historical_plan"]
+        _checked(job, origin["path"], origin["sha256"])
     if plan.get("draft") is not None:
         for name, digest in plan["draft"]["assets"].items():
             if _hash(_path(job, name)) != digest:
@@ -774,28 +862,15 @@ def _members(job: Path, plan: dict, plan_name: str, plan_digest: str, validate_n
         if Counter(pdf_owned) != Counter(plan["pdf_page_ids"]):
             raise ValueError("Review unit plan lacks exact complete physical PDF page ownership")
     for spec in plan["units"]:
-        receipt_path = _path(job, spec["receipt"])
-        receipt = core.load_json(receipt_path)
-        if (receipt.get("kind") != "native-unit-completed" or receipt.get("role") != plan["role"]
-                or receipt.get("completed") is not True or receipt.get("plan") != plan_name
-                or receipt.get("plan_sha256") != plan_digest or receipt.get("unit_id") != spec["unit_id"]
-                or any(receipt.get(key) != spec[key] for key in ("packet", "packet_sha256", "result"))
-                or receipt.get("base_state") != plan["base_state"] or receipt.get("base_round") != plan["base_round"]
-                or any(receipt.get(key) != plan["selected_model"][key] for key in ("provider", "model"))):
-            raise ValueError("Unit receipt differs from aggregate plan/context")
-        validate_native_receipt(job, receipt, plan["role"])
-        packet = _checked(job, spec["packet"], spec["packet_sha256"])
-        output = _checked(job, spec["result"], receipt["result_sha256"])
-        _packet_inputs(job, packet)
-        for name, digest in receipt["assets"].items():
-            if _hash(_path(job, name)) != digest:
-                raise ValueError("Admitted unit source asset changed")
-        assets = _validate_result(job, packet, output, spec)
-        if assets != receipt["assets"]:
-            raise ValueError("Unit asset closure differs from its immutable receipt")
-        proofs.append({"path": spec["receipt"], "sha256": _hash(receipt_path)})
-        outputs.append(output)
-    return proofs, outputs
+        checkpoint_path = _path(job, spec["checkpoint"])
+        checkpoint = core.load_json(checkpoint_path)
+        expected = _content_checkpoint(job, plan, plan_name, plan_digest, spec)
+        if checkpoint.get("completed") is not True or any(checkpoint.get(key) != value for key, value in expected.items()):
+            raise ValueError("Unit checkpoint differs from its complete current result/context")
+        _checkpoint_origin(job, checkpoint, plan)
+        checkpoints.append({"path": spec["checkpoint"], "sha256": _hash(checkpoint_path)})
+        outputs.append(core.load_json(_path(job, spec["result"])))
+    return checkpoints, outputs
 
 
 def _merge(job: Path, plan: dict, outputs: list) -> dict:
@@ -852,15 +927,12 @@ def _review_report(plan: dict, outputs: list) -> dict:
 
 
 
-def assemble_units(job, role: str, *, validate_native_receipt) -> dict:
-    """Publish an exact complete merge; the caller journals global admission."""
+def assemble_units(job, role: str) -> dict:
+    """Publish an exact complete content merge; the caller journals global state."""
     job = Path(job).resolve(strict=True)
     plan_path, plan, digest = _current_plan(job, role)
     _stable_context(job, plan)
-    proofs, outputs = _members(job, plan, _relative(job, plan_path), digest, validate_native_receipt)
-    versions = {core.load_json(_path(job, proof["path"]))["omp_version"] for proof in proofs}
-    if len(versions) != 1:
-        raise ValueError("Unit aggregate contains mixed runtime versions")
+    checkpoints, outputs = _members(job, plan, _relative(job, plan_path), digest)
     if role == "review":
         document = _review_report(plan, outputs)
         name = f"reviews/round-{plan['base_round']}.json"
@@ -876,10 +948,10 @@ def assemble_units(job, role: str, *, validate_native_receipt) -> dict:
             raise ValueError("Assembled translation changed immutable source")
         name = "book-source.json" if role == "source" else "book.json"
     core.save_json(_path(job, name), document)
-    aggregate = {"version": 1, "kind": "unit-role-completed", "execution": "native-units", "role": role,
+    aggregate = {"version": 1, "kind": "unit-role-completed", "execution": "units", "role": role,
         "stage": role, "completed": True, **plan["selected_model"],
-        "selector": core.admit_model(**plan["selected_model"]), "omp_version": versions.pop(),
-        "plan": _relative(job, plan_path), "plan_sha256": digest, "unit_receipts": proofs,
+        "selector": core.admit_model(**plan["selected_model"]),
+        "plan": _relative(job, plan_path), "plan_sha256": digest, "unit_checkpoints": checkpoints,
         "base_state": plan["base_state"], "base_round": plan["base_round"], "revision": plan["revision"],
         "source_file_sha256": plan["source_file_sha256"], "source_digest": plan["source_digest"],
         "merged_document": name, "merged_document_sha256": _hash(_path(job, name)),
@@ -894,14 +966,14 @@ def assemble_units(job, role: str, *, validate_native_receipt) -> dict:
     return aggregate
 
 
-def validate_aggregate(job, receipt: dict, role: str | None = None, validate_native_receipt=None) -> None:
-    """Validate immutable member provenance after global state/history advancement."""
+def validate_aggregate(job, receipt: dict, role: str | None = None) -> None:
+    """Validate complete immutable book content after global state advancement."""
     job = Path(job).resolve(strict=True)
-    if receipt.get("execution") != "native-units" or receipt.get("role") not in _ROLES:
-        raise ValueError("Invalid native unit aggregate")
+    if receipt.get("execution") != "units" or receipt.get("role") not in _ROLES:
+        raise ValueError("Invalid book unit aggregate")
     plan = _checked(job, receipt["plan"], receipt["plan_sha256"])
-    if role is not None and role != plan["role"]:
-        raise ValueError("Aggregate role differs from requested provenance role")
+    if plan.get("kind") != "book-unit-plan" or (role is not None and role != plan["role"]):
+        raise ValueError("Aggregate role differs from its book unit plan")
     role = plan["role"]
     if (receipt["role"] != role or receipt.get("base_state") != plan["base_state"]
             or receipt.get("base_round") != plan["base_round"]
@@ -911,12 +983,9 @@ def validate_aggregate(job, receipt: dict, role: str | None = None, validate_nat
             or receipt.get("selector") != core.admit_model(**plan["selected_model"])
             or any(receipt.get(key) != plan["selected_model"][key] for key in ("provider", "model"))):
         raise ValueError("Aggregate differs from immutable unit stage context")
-    proofs, outputs = _members(job, plan, receipt["plan"], receipt["plan_sha256"], validate_native_receipt)
-    if receipt.get("unit_receipts") != proofs:
+    checkpoints, outputs = _members(job, plan, receipt["plan"], receipt["plan_sha256"])
+    if receipt.get("unit_checkpoints") != checkpoints:
         raise ValueError("Aggregate member set/order/hash changed")
-    versions = {core.load_json(_path(job, proof["path"]))["omp_version"] for proof in proofs}
-    if versions != {receipt.get("omp_version")}:
-        raise ValueError("Aggregate runtime version differs from its native members")
     if role == "review":
         report = _review_report(plan, outputs)
         name = f"reviews/round-{plan['base_round']}.json"
@@ -934,7 +1003,7 @@ def validate_aggregate(job, receipt: dict, role: str | None = None, validate_nat
     if (receipt.get("merged_document") != name or receipt.get("merged_document_digest") != _canonical(book)
             or receipt.get("merged_document_sha256") != _hash(job / name)
             or core.load_json(job / name) != book):
-        raise ValueError("Canonical manuscript differs from immutable admitted member merge")
+        raise ValueError("Canonical manuscript differs from immutable complete member merge")
     if role == "source":
         if receipt.get("source_snapshot_digest") != core.source_snapshot_digest(job):
             raise ValueError("Aggregate source snapshot changed")
@@ -947,7 +1016,7 @@ def status(job, role: str) -> dict:
     path, plan, digest = _current_plan(job, role)
     admitted, pending = [], []
     for spec in plan["units"]:
-        (admitted if _path(job, spec["receipt"]).is_file() else pending).append(spec["unit_id"])
+        (admitted if _path(job, spec["checkpoint"]).is_file() else pending).append(spec["unit_id"])
     return {"role": role, "plan": _relative(job, path), "plan_sha256": digest,
             "revision": plan["revision"], "base_state": plan["base_state"], "base_round": plan["base_round"],
             "pages": len(plan["page_ids"]), "admitted": admitted, "pending": pending,

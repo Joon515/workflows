@@ -1,9 +1,10 @@
-"""Isolated unit-contract regressions; synthetic evidence never proves inference."""
+"""Book unit-checkpoint regressions; metadata fixtures never prove native inference."""
 from __future__ import annotations
 
 from collections import Counter
 import copy
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -18,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import core
 import translator as workflow
 import units
-import test_workflow as native_fixtures
+import test_workflow as domain_fixtures
 
 
 PROVIDER = "opencode-go"
@@ -131,42 +132,41 @@ class UnitContractTests(unittest.TestCase):
         return job
 
     def plan(self, job, role="source", draft=None, pages_per_unit=1):
-        reference = workflow.plan_native_units(job, role, pages_per_unit, draft=draft)
+        reference = workflow.plan_units(job, role, pages_per_unit, draft=draft)
         return core.load_json(job / reference["plan"])
 
     def prepare(self, job, role, unit_id):
-        prepared = workflow.begin_native_role(job, role, unit=unit_id)
-        request = core.load_json(Path(prepared["request_path"]))
-        binding = request["bindings"]["unit"]
+        binding = units.unit_binding(job, role, unit_id)
         packet = core.load_json(job / binding["packet"])
-        return prepared, binding, packet, unit_output(packet, binding)
+        return {"role": role, "unit_id": unit_id}, binding, packet, unit_output(packet, binding)
 
-    def finish(self, job, prepared, output, evidence=None):
-        request = core.load_json(Path(prepared["request_path"]))
-        core.save_json(job / request["bindings"]["unit"]["result"], output)
-        evidence_path = native_fixtures.save_evidence(prepared, evidence)
-        return workflow.complete_native_role(Path(prepared["request_path"]), evidence_path)
+    def finish(self, job, prepared, output):
+        role, unit_id = prepared["role"], prepared["unit_id"]
+        binding = units.unit_binding(job, role, unit_id)
+        core.save_json(job / binding["result"], output)
+        result = domain_fixtures.save_task_result(self.root / "coordinator-results", role, PROVIDER, MODEL)
+        return workflow.checkpoint_unit(job, role, unit_id, result)
 
     def admit_source(self, job):
         plan = self.plan(job)
         for spec in plan["units"]:
             prepared, _, _, output = self.prepare(job, "source", spec["unit_id"])
             self.finish(job, prepared, output)
-        workflow.assemble_native_units(job, "source")
+        workflow.assemble_units(job, "source")
         workflow.seal_job(job)
 
     def admit_terminology(self, job):
-        prepared = workflow.begin_native_role(job, "terminology")
         core.save_json(job / "terms.json", {"version": 1, "terms": []})
         (job / "handoff.md").write_text("Synthetic fixture: no governed terminology entries.\n", encoding="utf-8")
-        workflow.complete_native_role(Path(prepared["request_path"]), native_fixtures.save_evidence(prepared))
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "terminology", PROVIDER, MODEL)
+        workflow.checkpoint_role(job, "terminology", task)
 
     def admit_translation(self, job, plan, pdf_pages=2):
         for spec in plan["units"]:
             prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
             self.finish(job, prepared, output)
         with patch("render.build", side_effect=lambda current: synthetic_build(current, pdf_pages)):
-            return workflow.assemble_native_units(job, "translation")
+            return workflow.assemble_units(job, "translation")
 
     def translated_job(self, pdf_pages=2):
         job = self.new_job()
@@ -183,14 +183,12 @@ class UnitContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "controller-recorded extraction"):
             self.plan(job)
         self.assertFalse((job / "book-source.json").exists())
-
         job = self.new_job()
-        prepared = workflow.begin_native_role(job, "source")
         page = core.extraction_inventory(job)["pages"][0]
-        book = native_fixtures.source_book(page["locator"])
-        core.save_json(job / "book-source.json", book)
+        core.save_json(job / "book-source.json", domain_fixtures.source_book(page["locator"]))
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", PROVIDER, MODEL)
         with self.assertRaisesRegex(ValueError, "every original extraction page"):
-            workflow.complete_native_role(Path(prepared["request_path"]), native_fixtures.save_evidence(prepared))
+            workflow.checkpoint_role(job, "source", task)
         with self.assertRaisesRegex(ValueError, "every original extraction page"):
             workflow.seal_job(job)
         self.assertFalse((job / "source.sha256").exists())
@@ -222,20 +220,20 @@ class UnitContractTests(unittest.TestCase):
         progress = units.status(job, "source")
         self.assertEqual((progress["admitted"], progress["pending"]), (["u0002"], ["u0001"]))
         with self.assertRaisesRegex(ValueError, "Every planned unit"):
-            workflow.assemble_native_units(job, "source")
+            workflow.assemble_units(job, "source")
         self.assertFalse((job / "book-source.json").exists())
         self.assertEqual((job / "job.json").read_bytes(), before)
         prepared, _, _, output = siblings[0]
         self.finish(job, prepared, output)
         self.assertEqual((job / "job.json").read_bytes(), before)
-        workflow.assemble_native_units(job, "source")
+        workflow.assemble_units(job, "source")
         book = core.load_json(job / "book-source.json")
         self.assertEqual(len(book["protected"]), 1)
         self.assertEqual(sum(token.get("protected") == "SharedName"
                              for block in book["blocks"] for token in block["source"]), 2)
         receipt = workflow.latest_role_receipt(job, workflow.load_job(job), "source")
-        self.assertEqual(receipt["execution"], "native-units")
-        self.assertEqual(len(receipt["unit_receipts"]), 2)
+        self.assertEqual(receipt["execution"], "units")
+        self.assertEqual(len(receipt["unit_checkpoints"]), 2)
         self.assertNotIn("child_id", receipt)
         self.assertFalse((job / "source.sha256").exists())
         workflow.seal_job(job)
@@ -335,11 +333,11 @@ class UnitContractTests(unittest.TestCase):
                         candidate = output["body_start"]
                     self.finish(job, prepared, output)
                 if mode == "unique":
-                    workflow.assemble_native_units(job, "source")
+                    workflow.assemble_units(job, "source")
                     self.assertEqual(core.load_json(job / "book-source.json")["main_body_start"], candidate)
                 else:
                     with self.assertRaisesRegex(ValueError, "exactly one verified main-body boundary"):
-                        workflow.assemble_native_units(job, "source")
+                        workflow.assemble_units(job, "source")
                     self.assertFalse((job / "book-source.json").exists())
         job = self.new_job()
         self.plan(job)
@@ -381,10 +379,10 @@ class UnitContractTests(unittest.TestCase):
                 output["checks"]["typography"] = False
             if index == len(plan["units"]) - 1:
                 with self.assertRaisesRegex(ValueError, "Every planned unit"):
-                    workflow.assemble_native_units(job, "review")
+                    workflow.assemble_units(job, "review")
                 self.assertFalse((job / "reviews/round-1.json").exists())
             self.finish(job, prepared, output)
-        workflow.assemble_native_units(job, "review")
+        workflow.assemble_units(job, "review")
         report = core.load_json(job / "reviews/round-1.json")
         self.assertEqual(report["verdict"], "changes_requested")
         self.assertFalse(report["checks"]["typography"])
@@ -392,57 +390,130 @@ class UnitContractTests(unittest.TestCase):
         self.assertEqual(report["findings"], expected_findings)
         self.assertEqual(workflow.submit_review(job, job / "reviews/round-1.json")["state"], "changes_requested")
         self.assertFalse((job / "output.pdf").exists())
-
-    def test_provisional_units_check_own_proof_and_defer_ancestor_replay(self):
+    
+    def test_explicit_legacy_completed_subset_import_preserves_bytes_and_origin(self):
+        # Two completed units and two failed output-only siblings model the historical 17/19 subset.
+        job = self.new_job(page_count=4)
+        plan = self.plan(job)
+        active = core.load_json(job / "units/source/active.json")
+        plan_path = job / active["plan"]
+        legacy = copy.deepcopy(plan)
+        legacy["kind"] = "native-unit-plan"
+        for spec in legacy["units"]:
+            spec["receipt"] = spec.pop("checkpoint").replace("/checkpoints/", "/receipts/")
+            packet_path = job / spec["packet"]
+            packet = core.load_json(packet_path)
+            packet["kind"] = "native-unit-packet"
+            core.save_json(packet_path, packet)
+            spec["packet_sha256"] = workflow.digest_file(packet_path)
+            core.save_json(job / spec["result"], unit_output(packet, spec))
+        core.save_json(plan_path, legacy)
+        legacy_digest = workflow.digest_file(plan_path)
+        core.save_json(job / "units/source/active.json", {"plan": active["plan"], "plan_sha256": legacy_digest})
+        evidence = plan_path.parent / "historical-events.jsonl"
+        evidence.write_text('{"type":"historical_fixture_only"}\n', encoding="utf-8")
+        for spec in legacy["units"][:2]:
+            receipt = {"version": 1, "kind": "native-unit-completed", "completed": True,
+                       "role": "source", "stage": "source", "selector": PROVIDER + "/" + MODEL,
+                       "plan": active["plan"], "plan_sha256": legacy_digest,
+                       **{key: spec[key] for key in ("unit_id", "packet", "packet_sha256", "result")},
+                       "result_sha256": workflow.digest_file(job / spec["result"]), "assets": {},
+                       **legacy["selected_model"],
+                       **{key: legacy[key] for key in ("source_file_sha256", "source_digest", "base_state", "base_round", "revision")},
+                       "trace": evidence.relative_to(job).as_posix(), "trace_sha256": workflow.digest_file(evidence)}
+            core.save_json(job / spec["receipt"], receipt)
+        old_bytes = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        with self.assertRaises(ValueError):
+            units.status(job, "source")
+        capture = io.StringIO()
+        with patch("sys.stdout", capture):
+            self.assertEqual(workflow.main(["import-checkpoints", str(job), "source", "--plan", str(plan_path)]), 0)
+        imported = core.load_json(job / "units/source/active.json")
+        domain = core.load_json(job / imported["plan"])
+        progress = units.status(job, "source")
+        self.assertEqual(progress["admitted"], ["u0001", "u0002"])
+        self.assertEqual(progress["pending"], ["u0003", "u0004"])
+        self.assertEqual(domain["historical_plan"], {"path": active["plan"], "sha256": legacy_digest})
+        self.assertEqual(json.loads(capture.getvalue())["imported"], ["u0001", "u0002"])
+        for spec in domain["units"][:2]:
+            checkpoint = core.load_json(job / spec["checkpoint"])
+            origin = next(item["receipt"] for item in legacy["units"] if item["unit_id"] == spec["unit_id"])
+            self.assertEqual(checkpoint["historical_origin"], {"path": origin, "sha256": workflow.digest_file(job / origin)})
+            self.assertNotIn("task", checkpoint)
+        for spec in domain["units"][2:]:
+            self.assertTrue((job / spec["result"]).is_file())
+            self.assertFalse((job / spec["checkpoint"]).exists())
+        for name, content in old_bytes.items():
+            if name != "units/source/active.json":
+                self.assertEqual((job / name).read_bytes(), content, name)
+        with self.assertRaisesRegex(ValueError, "Every planned unit"):
+            workflow.assemble_units(job, "source")
+        self.assertFalse((job / "book-source.json").exists())
+        for spec in domain["units"][2:]:
+            prepared, _, _, output = self.prepare(job, "source", spec["unit_id"])
+            self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        self.assertEqual(len(core.load_json(job / "book-source.json")["source_pages"]), 4)
+        origin_path = job / legacy["units"][0]["receipt"]
+        original = origin_path.read_bytes()
+        origin_path.write_bytes(original + b"\n")
+        with self.assertRaises(ValueError):
+            workflow.seal_job(job)
+        origin_path.write_bytes(original)
+        workflow.seal_job(job)
+    
+    
+    def test_source_page_counter_and_partial_translation_merge(self):
         job = self.new_job()
-        self.admit_source(job)
+        self.plan(job, pages_per_unit=2)
+        prepared, _, _, output = self.prepare(job, "source", "u0001")
+        incomplete = copy.deepcopy(output)
+        incomplete["source_pages"].pop()
+        with self.assertRaisesRegex(ValueError, "exactly its owned original page records"):
+            self.finish(job, prepared, incomplete)
+        self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        workflow.seal_job(job)
         self.admit_terminology(job)
         plan = self.plan(job, "translation")
-        source_receipt = workflow.latest_role_receipt(job, workflow.load_job(job), "source")
-        member = core.load_json(job / source_receipt["unit_receipts"][0]["path"])
-        ancestor = job / member["trace"]
-        original_ancestor = ancestor.read_bytes()
-        ancestor.write_bytes(original_ancestor + b"Synthetic ancestor tampering.\n")
         before = (job / "job.json").read_bytes()
-        for index, spec in enumerate(plan["units"]):
-            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
-            evidence = native_fixtures.synthetic_evidence(prepared)
-            if index == 0:
-                own_trace = job / evidence["trace"]
-                original_own = own_trace.read_bytes()
-                own_trace.write_bytes(original_own + b"Synthetic own-proof tampering.\n")
-                with self.assertRaisesRegex(ValueError, "native execution trace"):
-                    self.finish(job, prepared, output, evidence)
-                own_trace.write_bytes(original_own)
-            self.finish(job, prepared, output, evidence)
-            self.assertEqual((job / "job.json").read_bytes(), before)
-        with self.assertRaisesRegex(ValueError, "native execution trace"):
-            workflow.assemble_native_units(job, "translation")
+        first, second = plan["units"]
+        prepared, _, _, output = self.prepare(job, "translation", second["unit_id"])
+        changed = copy.deepcopy(output)
+        changed["blocks"][0]["target"] = [{"text": "Dropped original source-page token."}]
+        with self.assertRaisesRegex(ValueError, "token order or multiplicity"):
+            self.finish(job, prepared, changed)
+        self.finish(job, prepared, output)
+        with self.assertRaisesRegex(ValueError, "Every planned unit"):
+            workflow.assemble_units(job, "translation")
         self.assertFalse((job / "book.json").exists())
         self.assertEqual((job / "job.json").read_bytes(), before)
-        with self.assertRaisesRegex(ValueError, "native execution trace"):
-            workflow.source_digest(job)
-        ancestor.write_bytes(original_ancestor)
+        prepared, _, _, output = self.prepare(job, "translation", first["unit_id"])
+        self.finish(job, prepared, output)
         with patch("render.build", side_effect=synthetic_build):
-            result = workflow.assemble_native_units(job, "translation")
+            result = workflow.assemble_units(job, "translation")
         self.assertEqual((result["state"], result["round"]), ("translated", 1))
-
-    def test_host_failure_rejects_otherwise_recovered_same_model_unit(self):
+        book = core.load_json(job / "book.json")
+        source = core.load_json(job / "book-source.json")
+        self.assertEqual([item["id"] for item in book["blocks"]], [item["id"] for item in source["blocks"]])
+        self.assertTrue(all(item["target"] for item in book["blocks"]))
+    
+    
+    def test_duplicate_source_page_union_cannot_merge(self):
         job = self.new_job()
-        self.plan(job)
-        prepared, _, _, output = self.prepare(job, "source", "u0001")
-        evidence = native_fixtures.synthetic_evidence(prepared)
-        intermediate = copy.deepcopy(evidence["assistant_messages"][0])
-        intermediate.update(stopReason="error", errorMessage="Synthetic transient same-model error.")
-        evidence["assistant_messages"].insert(0, intermediate)
-        failed = copy.deepcopy(evidence)
-        failed["failure"] = "Synthetic host-observed routing failure."
-        with self.assertRaisesRegex(ValueError, "Native host captured"):
-            self.finish(job, prepared, output, failed)
-        result = self.finish(job, prepared, output, evidence)
-        self.assertTrue(result["completed"])
-        self.assertEqual((result["provider"], result["model"]), (PROVIDER, MODEL))
+        plan = self.plan(job)
+        active = core.load_json(job / "units/source/active.json")
+        plan["units"][1]["owned_pages"] = plan["units"][0]["owned_pages"]
+        core.save_json(job / active["plan"], plan)
+        active["plan_sha256"] = workflow.digest_file(job / active["plan"])
+        core.save_json(job / "units/source/active.json", active)
+        with self.assertRaisesRegex(ValueError, "exact original source page union"):
+            units.assemble_units(job, "source")
         self.assertFalse((job / "book-source.json").exists())
+
+    
+
+    
 
 
 if __name__ == "__main__":

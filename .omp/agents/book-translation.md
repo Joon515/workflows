@@ -1,0 +1,1 @@
+../../translator/agents/book-translation.md
