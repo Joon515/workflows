@@ -4,9 +4,19 @@
 
 Use the native resource-loading arrangements in [omp-contract.md](omp-contract.md): recommended published --plugin-dir startup loads skill and four task agents; an already-running parent may discover explicit project .omp/agents copies/links and read the skill manually. Both use the same built-in OMP task tool. Native OMP owns models/authentication/retries/fallback/settlement/journals; the translator owns book state and domain checks only.
 
-Run `python3 <skill>/scripts/translator.py doctor`. Python 3.10+ and the libraries pinned in [requirements.txt](../requirements.txt) are required. Install dependencies only into an authorized project environment. PDF composition requires XeLaTeX, the template TeX packages and suitable Latin/CJK fonts; latexmk is optional. OCR requires working Tesseract language data even when PyMuPDF bundles the engine. DjVu requires ddjvu. Missing capabilities block affected inputs. Do not install globally or upload sources without authorization. Local extraction does not make hosted-model translation local.
+Run `python3 <skill>/scripts/translator.py doctor`. Python 3.10+ and the libraries pinned in [requirements.txt](../requirements.txt) are required. Install dependencies only into an authorized project environment. PDF composition requires XeLaTeX, the template TeX packages including `unicode-math`, suitable Latin/CJK text fonts and Latin Modern Math selected by the TeX-resolved filename `latinmodern-math.otf`; latexmk is optional.
+
+OCR requires working Tesseract language data even when PyMuPDF bundles the engine. DjVu requires ddjvu. Missing capabilities block affected inputs. Do not install globally or upload sources without authorization. Local extraction does not make hosted-model translation local.
 
 Use a fresh job directory outside the package, with explicit source/target languages and PDF, EPUB, MOBI or DjVu input. Init copies and hashes the original; do not overwrite an existing job. Assets remain inside the job. Dependency upgrades require relevant full tests and copy/compile smoke by the verification owner; do not silently change the executed OMP contract.
+
+### Unicode mathematics
+
+Diagnose math prerequisites through TeX file resolution: `kpsewhich unicode-math.sty` and `kpsewhich latinmodern-math.otf` must resolve the package and exact font file in the composition environment. A family-name result from `fc-match` does not establish that XeLaTeX selected the required math font. The observed installed versions/licenses and bounded glyph evidence are in [verification.md](verification.md#unicode-math-composition-dependency-and-glyph-evidence); neither dependency is bundled by the translator.
+
+Valid protected math/variable values may contain Unicode mathematical symbols as well as allowed TeX commands. Preserve their sealed bytes and inline/display modes; repair a demonstrated template/font rendering defect in composition rather than escaping or replacing valid source merely to accommodate the old font. The Source3 font defect does not require Source4, resealing or rewriting checkpoint/history bytes.
+
+A successful syntax compile is insufficient: the existing `Missing character` build failure remains mandatory. Glyph coverage is not semantic parity, and changes to math fonts/metrics still require actual current-PDF typography and semantic review.
 
 ## Model intake and native configuration
 

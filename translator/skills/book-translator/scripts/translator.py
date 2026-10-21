@@ -43,8 +43,8 @@ def doctor() -> dict:
             dependencies[distribution] = {"available": False, "error": str(error), "action": f"Install {distribution} in the Python environment running this command"}
     tools = {name: shutil.which(name) for name in ("xelatex", "latexmk", "kpsewhich")}
     resources = {}
-    required = ("ctexbook.cls", "geometry.sty", "amsmath.sty", "amssymb.sty", "graphicx.sty", "longtable.sty", "array.sty", "fvextra.sty", "tikz.sty", "footmisc.sty", "zref-savepos.sty", "zref-abspage.sty")
-    fonts = ("FandolSong-Regular.otf", "FandolSong-Bold.otf", "FandolHei-Regular.otf", "FandolHei-Bold.otf", "FandolKai-Regular.otf", "FandolFang-Regular.otf", "lmroman10-regular.otf", "lmmono10-regular.otf")
+    required = ("ctexbook.cls", "geometry.sty", "amsmath.sty", "amssymb.sty", "unicode-math.sty", "graphicx.sty", "longtable.sty", "array.sty", "fvextra.sty", "tikz.sty", "footmisc.sty", "zref-savepos.sty", "zref-abspage.sty")
+    fonts = ("FandolSong-Regular.otf", "FandolSong-Bold.otf", "FandolHei-Regular.otf", "FandolHei-Bold.otf", "FandolKai-Regular.otf", "FandolFang-Regular.otf", "lmroman10-regular.otf", "lmmono10-regular.otf", "latinmodern-math.otf")
     for resource in (*required, *fonts):
         found = None
         if tools["kpsewhich"]:

@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -1072,6 +1073,10 @@ class RenderTests(unittest.TestCase):
         core.save_json(self.job / "book.json", book)
         with self.assertRaisesRegex(ValueError, "missing font glyphs"):
             render.build(self.job)
+        report = core.load_json(self.job / "build/verification.json")
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["checks"]["compiler"])
+        self.assertIn("Missing character:", (self.job / "build/book.log").read_text(encoding="utf-8"))
 
     def test_palette_image_alpha_survives_normalization(self):
         from PIL import Image
@@ -1223,6 +1228,91 @@ class RenderTests(unittest.TestCase):
                         self.assertEqual("".join(span["text"] for span in line).count(marker), 1)
                         self.assertGreater(len(row["line_boxes_pt"]), 1)
                         self.assertTrue(all(following[1] >= previous[3] - .5 for previous, following in zip(row["line_boxes_pt"], row["line_boxes_pt"][1:])))
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for Unicode math glyph evidence")
+    def test_compiled_unicode_and_escaped_math_preserve_visible_glyphs(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        expressions = {
+            "Unicode": ("α ≤ β, x′", r"\begin{aligned} α &≤ β \\ x′ &≤ α + β \end{aligned}"),
+            "Escaped": (r"\alpha \leq \beta, x^{\prime}",
+                        r"\begin{aligned} \alpha &\leq \beta \\ x^{\prime} &\leq \alpha + \beta \end{aligned}"),
+        }
+        scenarios = []
+        blocks = [copy.deepcopy(book["blocks"][0])]
+        protected = []
+        for context in ("Inline", "Display", "Aligned"):
+            for spelling, values in expressions.items():
+                identifier = context + spelling
+                formula = identifier + "Formula"
+                protected.append({"id": formula, "kind": "math",
+                                  "value": values[1 if context == "Aligned" else 0]})
+                content = [{"text": identifier + " "}]
+                if context == "Inline":
+                    content.append({"protected": formula})
+                block = {"id": identifier, "kind": "paragraph" if context == "Inline" else "display_math",
+                         "source_pages": ["P1"], "source": content, "target": copy.deepcopy(content)}
+                if context != "Inline":
+                    block["protected_id"] = formula
+                blocks.append(block)
+                scenarios.append((identifier, context, spelling))
+        book.update(protected=protected, blocks=blocks, notes=[],
+                    source_pages=book["source_pages"][:1], human_preface=None)
+        source = copy.deepcopy(book)
+        source["agent_preface"] = []
+        for block in source["blocks"]:
+            block["target"] = []
+        core.save_json(self.job / "book-source.json", source)
+        core.save_json(self.job / "book.json", book)
+        core.save_json(self.job / "terms.json", {"version": 1, "terms": []})
+        core.seal_source(self.job)
+
+        pdf = render.build(self.job)
+        report = core.load_json(self.job / "build/verification.json")
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertTrue(report["checks"]["compiler"])
+        for name in ("book.log", "compiler.log"):
+            self.assertNotIn("Missing character:", (self.job / "build" / name).read_text(encoding="utf-8"))
+        boundaries = {row["id"]: row for row in report["block_boundaries"]}
+        normalize = lambda value: unicodedata.normalize("NFKC", value)
+        with pymupdf.open(pdf) as document:
+            extracted = "".join(normalize(page.get_text()) for page in document)
+            extracted = "".join(extracted.split())
+            outlines = {}
+            for index, (identifier, context, spelling) in enumerate(scenarios):
+                with self.subTest(context=context, spelling=spelling):
+                    expected = "α≤βx′≤α+β" if context == "Aligned" else "α≤β,x′"
+                    self.assertIn(identifier + expected, extracted)
+                    boundary = boundaries[identifier]
+                    self.assertEqual(boundary["start"]["page"], boundary["end"]["page"])
+                    page = document[boundary["start"]["page"] - 1]
+                    label, = page.search_for(identifier)
+                    bottom = page.rect.height
+                    if index + 1 < len(scenarios):
+                        following = scenarios[index + 1][0]
+                        if boundaries[following]["start"]["page"] == boundary["start"]["page"]:
+                            next_label, = page.search_for(following)
+                            bottom = next_label.y0
+                    glyphs = [(normalize(chr(char[0])), trace, char)
+                              for trace in page.get_texttrace() for char in trace["chars"]
+                              if label.y0 <= char[2][1] < bottom
+                              and normalize(chr(char[0])) in "≤′αβ"]
+                    self.assertEqual("".join(symbol for symbol, _, _ in glyphs),
+                                     "".join(symbol for symbol in expected if symbol in "≤′αβ"))
+                    outlines[context, spelling] = [(symbol, trace["font"], char[1])
+                                                   for symbol, trace, char in glyphs]
+                    for symbol, trace, char in glyphs:
+                        self.assertEqual(trace["type"], 0, symbol)
+                        self.assertGreater(trace["opacity"], 0, symbol)
+                        self.assertGreater(char[1], 0, symbol + " must not use the missing-glyph outline")
+                        ink = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=pymupdf.Rect(char[3]),
+                                              colorspace=pymupdf.csGRAY, alpha=False)
+                        self.assertGreater(sum(value < 200 for value in ink.samples), 2,
+                                           symbol + " must have actual visible ink in its PDF glyph bounds")
+            for context in ("Inline", "Display", "Aligned"):
+                self.assertEqual(outlines[context, "Unicode"], outlines[context, "Escaped"],
+                                 context + " literal and escaped symbols must use identical glyph outlines")
+
 
     @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for inline-limit line geometry")
     def test_inline_math_limits_preserve_paragraph_spacing_and_hanging_lines(self):

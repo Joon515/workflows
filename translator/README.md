@@ -61,7 +61,11 @@ The canonical source is **Book version 2**: verified body boundary, image calibr
 
 ## Dependencies
 
-Python 3.10+, PyMuPDF, Pillow and jsonschema are required; executed Python versions are pinned in [requirements.txt](skills/book-translator/requirements.txt). Use an authorized isolated project environment, for example `python3 -m pip install -r "$skill/requirements.txt"`, not global installation. Composition requires XeLaTeX, ctex/template packages, appropriate fonts and the LaTeX build/column/baselineattach output socket API. The recorded composition environment is TeX Live 2026; missing capability fails explicitly rather than skipping bottom-note size correction. latexmk is optional; repeated XeLaTeX is used otherwise. OCR needs working Tesseract language data; DjVu needs a real ddjvu decoder. Doctor reports capabilities, not permissions to install/upload.
+Python 3.10+, PyMuPDF, Pillow and jsonschema are required; executed Python versions are pinned in [requirements.txt](skills/book-translator/requirements.txt). Use an authorized isolated project environment, for example `python3 -m pip install -r "$skill/requirements.txt"`, not global installation. OCR needs working Tesseract language data; DjVu needs a real ddjvu decoder. Doctor reports capabilities, not permissions to install/upload.
+
+Composition requires XeLaTeX, ctex/template packages including `unicode-math`, appropriate Latin/CJK text fonts and the LaTeX build/column/baselineattach output socket API. The math font is Latin Modern Math, selected by the TeX-resolved filename `latinmodern-math.otf`, not a Fontconfig family-name fallback. The recorded composition environment is TeX Live 2026; missing capability fails explicitly rather than skipping bottom-note size correction. latexmk is optional; repeated XeLaTeX is used otherwise.
+
+Observed math-package/font versions, licenses and glyph-smoke limits are recorded in [verification.md](skills/book-translator/references/verification.md#unicode-math-composition-dependency-and-glyph-evidence); this is not a guarantee of arbitrary Unicode/font coverage.
 
 PyMuPDF/MuPDF uses AGPL or commercial licensing; independently assess compatibility with intended distribution/service use. Other dependencies retain their licenses. The package ships no upstream binaries, OCR language data or third-party books.
 
@@ -129,10 +133,14 @@ Exact schemas, commands and stage instructions are in [format.md](skills/book-tr
 
 ```sh
 python3 translator/skills/book-translator/scripts/verify_install.py
+# Real XeLaTeX Unicode-math glyph fixture, when assigned:
+python3 -m unittest discover -s translator/skills/book-translator/tests -p test_render.py -k compiled_unicode_and_escaped_math_preserve_visible_glyphs -v
 # Full domain regression, when explicitly assigned to the verification owner:
 python3 -m unittest discover -s translator/skills/book-translator/tests -v
 ```
 
 Adjust paths after copying. verify_install checks isolated .agents/translator and .omp/translator copy layouts: published --plugin-dir skill/four-agent discovery, conventional native frontmatter, and explicit project .omp/agents discovery without falsely claiming skill registration. It requests actual CLI metadata only, sends no model prompt and forwards no credentials. Fresh copied-layout discovery is not proof of live-parent discovery, provider authentication, task execution or translation quality. Executed checks/history/limits belong in [verification.md](skills/book-translator/references/verification.md); old results are not proof of this cutover.
+
+Keep discovery smoke roots unrelated to an existing OMP project: a TMPDIR nested under a project can expose ancestor native agents and contaminate copied-only expectations. The real glyph fixture generates synthetic inputs from shipped code and needs no book-job or diagnostic files.
 
 The workflow is not a malicious-agent/filesystem/network sandbox or independent endpoint attestation. Source parsers/TeX require appropriate OS isolation; prose is escaped, assets/math constrained and shell escape disabled. Do not claim complete real-book translation without actual selected-model native work, complete source/current-PDF review and book-domain gates. Complex scans, uncertain formulas, side-text artwork and narrow folio strips may require source-structure correction, not cropping, swallowed notes, fabricated pagination, unsupported fit or silent model substitution.
