@@ -743,8 +743,8 @@ def accept_job(job: Path) -> Path:
     return output
 
 
-def continue_source(job: Path, provider: str, model: str) -> dict:
-    """Change future model intent while retaining completed initial source content."""
+def continue_source(job: Path, provider: str, model: str, *, reopen_units: list[str] | None = None) -> dict:
+    """Continue initial source work, optionally reopening explicit completed units."""
     job = Path(job).resolve(strict=True)
     selector = core.admit_model(provider, model)
     data, _, previous_selector, _, _ = role_readiness(job, "source")
@@ -752,7 +752,7 @@ def continue_source(job: Path, provider: str, model: str) -> dict:
     future = {**data, "models": {role: dict(selected) for role in ROLES},
               "history": data["history"] + [{"event": "source_model_continued",
                   "at": datetime.now(timezone.utc).isoformat(), "selector": selector,
-                  "previous_selector": previous_selector}]}
+                  "previous_selector": previous_selector, "reopened": reopen_units if reopen_units is not None else []}]}
     validate_job_record(future)
     reference = importlib.import_module("units").continue_source(job, future)
     previous_job = contained(job, reference["previous_job"]["path"])
@@ -806,6 +806,8 @@ def parser() -> argparse.ArgumentParser:
                 action.add_argument("stage", choices=ROLES)
             action.add_argument("--provider", required=True)
             action.add_argument("--model", required=True)
+            if name == "continue-source":
+                action.add_argument("--reopen", dest="reopen_units", nargs="+", metavar="UNIT_ID")
         elif name == "checkpoint-role":
             action.add_argument("role", choices=ROLES)
             action.add_argument("--task-result", type=Path, required=True)
@@ -871,7 +873,7 @@ def main(argv=None) -> int:
                     elif args.command == "configure-model":
                         output = configure_model(job, args.stage, args.provider, args.model)
                     elif args.command == "continue-source":
-                        output = continue_source(job, args.provider, args.model)
+                        output = continue_source(job, args.provider, args.model, reopen_units=args.reopen_units)
                     elif args.command == "checkpoint-role":
                         output = checkpoint_role(job, args.role, args.task_result, revise=args.revise)
                     elif args.command == "checkpoint-unit":

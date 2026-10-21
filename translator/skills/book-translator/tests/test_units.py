@@ -600,9 +600,155 @@ class UnitContractTests(unittest.TestCase):
         self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("source_ready", 0))
         self.assertEqual(len(core.load_json(job / "book-source.json")["source_pages"]), 2)
 
-    
+    def test_reopen_carried_source_unit_preserves_history_and_current_model_guards(self):
+        job = self.new_job(page_count=3)
+        original_plan = self.plan(job)
+        original_reference = core.load_json(job / "units/source/active.json")
+        first_id, second_id, pending_id = [spec["unit_id"] for spec in original_plan["units"]]
+        prepared, _, _, output = self.prepare(job, "source", first_id)
+        self.finish(job, prepared, output)
+        old_go = original_plan["units"][0]
+        luna = {"provider": "openai-codex", "model": "gpt-6-luna"}
+        transition = workflow.continue_source(job, **luna)
+        current_plan = core.load_json(job / transition["plan"])
+        binding = units.unit_binding(job, "source", second_id)
+        core.save_json(job / binding["result"], unit_output(core.load_json(job / binding["packet"]), binding))
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", **luna)
+        workflow.checkpoint_unit(job, "source", second_id, task)
+        preserved = {name: (job / name).read_bytes() for name in (
+            original_reference["plan"], transition["plan"], old_go["packet"], old_go["result"], old_go["checkpoint"],
+            current_plan["units"][1]["result"], current_plan["units"][1]["checkpoint"])}
+        self.assertEqual(core.load_json(job / old_go["checkpoint"])["task"]["resolvedModelIdentity"], PROVIDER + "/" + MODEL)
+        for rejected in (["unknown"], [pending_id], [first_id, first_id]):
+            before = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+            with self.subTest(reopen=rejected), self.assertRaises(ValueError):
+                workflow.continue_source(job, **luna, reopen_units=rejected)
+            self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}, before)
+        original_job = (job / "job.json").read_bytes()
+        data = workflow.load_job(job)
+        data["state"] = "source_ready"
+        core.save_json(job / "job.json", data)
+        before = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        with self.assertRaises(ValueError):
+            workflow.continue_source(job, **luna, reopen_units=[first_id])
+        self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}, before)
+        (job / "job.json").write_bytes(original_job)
+        (job / "source.sha256").write_text("0" * 64 + "\n", encoding="ascii")
+        before = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        with self.assertRaises(ValueError):
+            workflow.continue_source(job, **luna, reopen_units=[first_id])
+        self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}, before)
+        (job / "source.sha256").unlink()
+        with patch("sys.stdout", new_callable=io.StringIO) as captured:
+            self.assertEqual(workflow.main(["continue-source", str(job), "--provider", luna["provider"],
+                                            "--model", luna["model"], "--reopen", first_id]), 0)
+            correction = json.loads(captured.getvalue())
+        self.assertEqual(correction["reopened"], [first_id])
+        self.assertEqual(correction["carried"], [second_id])
+        self.assertEqual(correction["pending"], [first_id, pending_id])
+        corrected_plan = core.load_json(job / correction["plan"])
+        self.assertEqual(corrected_plan["selected_model"], luna)
+        self.assertEqual(corrected_plan["continuation"]["reopened"], [first_id])
+        self.assertEqual(corrected_plan["units"][1]["checkpoint"], current_plan["units"][1]["checkpoint"])
+        for old, new in zip(current_plan["units"], corrected_plan["units"]):
+            for key in ("packet", "packet_sha256", "owned_pages", "owned_block_ids", "owned_note_ids", "owned_protected_ids"):
+                self.assertEqual(new[key], old[key])
+            if old["unit_id"] != second_id:
+                self.assertNotIn("carried_checkpoint", new)
+                for key in ("result", "assets_dir", "checkpoint"):
+                    self.assertNotEqual(new[key], old[key])
+                    self.assertFalse((job / new[key]).exists())
+        current = workflow.load_job(job)
+        self.assertEqual((current["state"], current["round"], current["max_rounds"]), ("extracted", 0, 3))
+        self.assertTrue(all(selected == luna for selected in current["models"].values()))
+        for unit_id in correction["pending"]:
+            binding = units.unit_binding(job, "source", unit_id)
+            output = unit_output(core.load_json(job / binding["packet"]), binding)
+            if unit_id == first_id:
+                output["blocks"][0]["source"].append({"text": " Corrected synthetic chapter heading."})
+            core.save_json(job / binding["result"], output)
+            task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", **luna)
+            workflow.checkpoint_unit(job, "source", unit_id, task)
+        workflow.assemble_units(job, "source")
+        aggregate = workflow.latest_role_receipt(job, workflow.load_job(job), "source")
+        self.assertIn({"path": current_plan["units"][1]["checkpoint"],
+                       "sha256": workflow.digest_file(job / current_plan["units"][1]["checkpoint"])}, aggregate["unit_checkpoints"])
+        self.assertNotIn(old_go["checkpoint"], [member["path"] for member in aggregate["unit_checkpoints"]])
+        for name, content in preserved.items():
+            self.assertEqual((job / name).read_bytes(), content, name)
+        workflow.seal_job(job)
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("source_ready", 0))
+        before = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        with self.assertRaises(ValueError):
+            workflow.continue_source(job, **luna, reopen_units=[first_id])
+        self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}, before)
 
-    
+
+    def test_source_assembly_exports_live_imports_but_preserves_authored_orphans(self):
+        for mode in ("imports", "new", "modified", "target_reference"):
+            with self.subTest(mode=mode):
+                job = self.new_job()
+                first, second = [page["id"] for page in core.extraction_inventory(job)["pages"]]
+                draft = {"title": "Synthetic protected imports", "main_body_start": "first", "source_pages": [],
+                    "blocks": [
+                        {"id": "first", "kind": "paragraph", "source_pages": [first],
+                         "source": [{"page": first}, {"protected": "OldVar"}, {"text": " + "},
+                                    {"protected": "OwnedOld"}, {"text": "; "}, {"protected": "KeepName"}], "target": []},
+                        {"id": "equation", "kind": "display_math", "source_pages": [first],
+                         "protected_id": "KeepMath", "source": [], "target": []},
+                        {"id": "second", "kind": "paragraph", "source_pages": [second],
+                         "source": [{"page": second}, {"protected": "OldVar"}, {"text": " + 1; "},
+                                    {"protected": "KeepName"}], "target": []}],
+                    "notes": [], "protected": [
+                        {"id": "OldVar", "kind": "variable", "value": "x"},
+                        {"id": "OwnedOld", "kind": "variable", "value": "1"},
+                        {"id": "KeepName", "kind": "name", "value": "Literal Name"},
+                        {"id": "KeepMath", "kind": "math", "value": "z^2"}]}
+                core.save_json(job / "draft.json", draft)
+                plan = self.plan(job, draft=job / "draft.json")
+                expected_blocks, expected_protected = [], {item["id"]: item for item in draft["protected"] if item["id"].startswith("Keep")}
+                for index, spec in enumerate(plan["units"]):
+                    prepared, _, packet, output = self.prepare(job, "source", spec["unit_id"])
+                    self.assertIn("OldVar", packet["shared_protected_ids"])
+                    formula = {"id": spec["unit_id"] + "_whole", "kind": "math", "value": "x+1"}
+                    output["protected"].append(formula)
+                    output["blocks"][0]["source"] = [
+                        {"page": spec["owned_pages"][0]}, {"protected": formula["id"]},
+                        {"text": "; "}, {"protected": "KeepName"}]
+                    expected_protected[formula["id"]] = formula
+                    if index == 0:
+                        if mode == "new":
+                            output["protected"].append({"id": spec["unit_id"] + "_missing", "kind": "variable", "value": "n"})
+                            output["blocks"][0]["source"].append({"text": " A synthetic missing formula call remains unresolved."})
+                        elif mode == "modified":
+                            next(item for item in output["protected"] if item["id"] == "OwnedOld")["value"] = "2"
+                        elif mode == "target_reference":
+                            output["blocks"][0]["target"] = [{"protected": "OwnedOld"}]
+                    expected_blocks.extend(copy.deepcopy(output["blocks"]))
+                    self.finish(job, prepared, output)
+                preserved = {name: (job / name).read_bytes() for spec in plan["units"]
+                             for name in (spec["packet"], spec["result"], spec["checkpoint"])}
+                before = (job / "job.json").read_bytes()
+                if mode != "imports":
+                    with self.assertRaisesRegex(ValueError, "Protected values must all be used"):
+                        workflow.assemble_units(job, "source")
+                    self.assertEqual((job / "job.json").read_bytes(), before)
+                    self.assertFalse((job / "book-source.json").exists())
+                    self.assertFalse((job / "source.sha256").exists())
+                else:
+                    workflow.assemble_units(job, "source")
+                    book = core.validate_book(job, translated=False)
+                    self.assertEqual({item["id"]: item for item in book["protected"]}, expected_protected)
+                    self.assertEqual(book["blocks"], expected_blocks)
+                    self.assertNotIn("OldVar", {item["id"] for item in book["protected"]})
+                    self.assertNotIn("OwnedOld", {item["id"] for item in book["protected"]})
+                    workflow.latest_role_receipt(job, workflow.load_job(job), "source")
+                    workflow.seal_job(job)
+                    self.assertEqual(workflow.load_job(job)["state"], "source_ready")
+                    self.assertEqual(workflow.source_digest(job), (job / "source.sha256").read_text().strip())
+                for name, content in preserved.items():
+                    self.assertEqual((job / name).read_bytes(), content, name)
+
 
 
 if __name__ == "__main__":

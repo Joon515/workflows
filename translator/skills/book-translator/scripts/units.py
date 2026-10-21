@@ -154,21 +154,26 @@ def _current_plan(job: Path, role: str) -> tuple[Path, dict, str]:
 
 
 def _source_model_change(previous: dict, current: dict) -> dict:
-    """Permit only one explicit future-model change during initial source work."""
+    """Permit explicit future-model choices or targeted initial-source corrections."""
     core.validate_document("job", current)
     selected = current["models"].get("source")
+    event = current["history"][-1] if current["history"] else {}
+    reopened = event.get("reopened", [])
+    if (not isinstance(reopened, list) or any(not isinstance(unit, str) or not unit for unit in reopened)
+            or len(set(reopened)) != len(reopened)):
+        raise ValueError("Reopened source units must be a list of unique nonempty unit IDs")
     if (previous.get("state") != "extracted" or current.get("state") != "extracted"
             or previous.get("round") != 0 or current.get("round") != 0
             or not isinstance(selected, dict)
             or any(current["models"].get(role) != selected for role in ("source", "terminology", "translation", "review"))
-            or selected == previous["models"].get("source")
+            or (selected == previous["models"].get("source") and not reopened)
             or {key: value for key, value in previous.items() if key not in {"models", "history"}}
                 != {key: value for key, value in current.items() if key not in {"models", "history"}}
             or len(current["history"]) != len(previous["history"]) + 1
             or current["history"][:-1] != previous["history"]):
-        raise ValueError("Source continuation may change only all four future model choices at extracted round 0")
+        raise ValueError("Source continuation requires changed future models or explicit completed units at extracted round 0")
     selector = core.admit_model(**selected)
-    event = current["history"][-1]
+
     if event.get("event") != "source_model_continued" or event.get("selector") != selector:
         raise ValueError("Source continuation requires its explicit model-choice history event")
     return selected
@@ -192,7 +197,8 @@ def _plan_inputs(job: Path, plan: dict) -> None:
         previous_job = _checked(job, previous["path"], previous["sha256"])
         future_job = _checked(job, future["path"], future["sha256"])
         if (previous_plan.get("job_sha256") != previous["sha256"] or plan["job_sha256"] != future["sha256"]
-                or _source_model_change(previous_job, future_job) != plan["selected_model"]):
+                or _source_model_change(previous_job, future_job) != plan["selected_model"]
+                or continuation.get("reopened", []) != future_job["history"][-1].get("reopened", [])):
             raise ValueError("Source continuation job snapshots do not match their immutable plans")
 
 
@@ -928,6 +934,11 @@ def continue_source(job, future_job: dict) -> dict:
         if checkpoint_path.exists() or spec.get("carried_checkpoint") is not None:
             _member_checkpoint(job, previous, previous_name, previous_digest, spec, origin_plans)
             carried[spec["unit_id"]] = {"path": spec["checkpoint"], "sha256": _hash(checkpoint_path)}
+    reopened = future_job["history"][-1].get("reopened", [])
+    if any(unit_id not in carried for unit_id in reopened):
+        raise ValueError("Only completed units in the active source plan may be explicitly reopened")
+    for unit_id in reopened:
+        del carried[unit_id]
     old_bytes = (job / "job.json").read_bytes()
     if hashlib.sha256(old_bytes).hexdigest() != previous["job_sha256"]:
         raise ValueError("Source continuation job changed during validation")
@@ -954,14 +965,14 @@ def continue_source(job, future_job: dict) -> dict:
         specs.append(spec)
     plan = {**previous, "plan_id": identifier, "job_sha256": job_snapshot["sha256"], "selected_model": selected,
             "units": specs, "continuation": {"plan": previous_name, "plan_sha256": previous_digest,
-                                             "previous_job": previous_job, "job_snapshot": job_snapshot}}
+                                             "previous_job": previous_job, "job_snapshot": job_snapshot, "reopened": reopened}}
     destination = directory / "plan.json"
     _write_once(destination, plan)
     return {"role": "source", "plan": _relative(job, destination), "plan_sha256": _hash(destination),
             "revision": False, "base_state": "extracted", "base_round": 0, "pages": len(plan["page_ids"]),
             "admitted": list(carried), "pending": [spec["unit_id"] for spec in specs if spec["unit_id"] not in carried],
             "complete": len(carried) == len(specs), "carried": list(carried),
-            "previous_job": previous_job, "job_snapshot": job_snapshot}
+            "previous_job": previous_job, "job_snapshot": job_snapshot, "reopened": reopened}
 
 
 def _members(job: Path, plan: dict, plan_name: str, plan_digest: str) -> tuple[list, list]:
@@ -1029,6 +1040,19 @@ def _merge(job: Path, plan: dict, outputs: list) -> dict:
         elif category == "blocks":
             # Stable sort retains authored reading order within each starting page.
             book[category].sort(key=lambda item: page_order[item["source_pages"][0]])
+    authored = set()
+    for spec, output in zip(plan["units"], outputs):
+        packet = _checked(job, spec["packet"], spec["packet_sha256"])
+        imports = {item["id"]: item for item in packet["protected"] + packet.get("context_protected", [])}
+        for item in output["protected"]:
+            if imports.get(item["id"]) != item:
+                authored.add(item["id"])
+    referenced = set()
+    for item in book["blocks"] + book["notes"]:
+        referenced.update(_references(item, "protected"))
+        referenced.update(token["protected"] for token in item.get("target", []) if "protected" in token)
+    # Unused exact imports stay in immutable unit evidence, not the canonical symbol table.
+    book["protected"] = [item for item in book["protected"] if item["id"] in referenced or item["id"] in authored]
     return book
 
 
