@@ -499,6 +499,17 @@ No new code regression run is claimed for this instruction clarification. Indepe
 No new code or regression run is claimed for this source-data recovery; the prior 248-test production-font run remains the latest full code regression. All remaining target authoring, authoritative full-PDF build, formal all-page review, MAIN whole-book typography and semantic approval, and exact-artifact acceptance remain required. The earlier accepted six-page excerpt remains a separate historical result.
 
 
+## Source6 one-reference recovery and preserved target work
+
+[OBSERVED] MAIN inspected the original page 304 and found one printed Steiner name where sealed Source5 b02200 contained two adjacent pn_06 references. A supported source revision reopened only u0038 under units/source/503ca5190c864be28649cd08b5c80cc7/plan.json, SHA256 6aa6267f6e3f441857e4bd39b740e7fbb0fdc4486be484aa2ae053071948900f. One complete eight-page ordinary native Luna Medium source result removed only zero-based source index 30; all other source fields, mathematical definitions, assets and geometry remained identical. Full merge, schema/core, revision scope and source-page planning passed before admission. Historical canonical projections were checked as hash-bound data, not relabeled native execution.
+
+[OBSERVED] Normal checkpoint-unit, assemble-units, seal-source --reseal and validate --source completed. Canonical source SHA256 is f03d4c8de3c2014750125c02805e95981fa4cdf91fc531aa2c4c6b50c61245fb and Source6 seal is 8ea06c6c7e662da3d3836efd58695f28c5b0323dd29b20a007be566480dffb1e. Counts remain 603 pages, 4,724 blocks, 2,244 protected records and no notes. No mathematical-corpus rerun was required by this name-only data change. Evidence is work/source6-native-global-preflight.json and work/source6-source-admission-outcome.json.
+
+[OBSERVED] Fresh ordinary native Luna Low terminology retained the exact approved terms bytes. MAIN rejected a first policy with a new incorrect rvert-command assertion, then read the complete policy and final surgical diff. Exact accepted final handoff SHA256 is 7ee38101c9994c02111e3fd09aa9a62a6a943df10e98e1015a8f5ab799be396a, 11,960 bytes. Normal terminology admission and conditional policy-bound rebase produced units/translation/52b2124dddb94afcbb3bb2e8a2b09a56/plan.json, SHA256 32cbb240242c8011faf3ddce149a3184c862ad702ed13efcecb229c066700b74. The actual comparator carried all 79 current checkpoint/result pairs exactly, covering 345 original pages, with 86 pending scopes, 165 stable IDs, metadata owner u0006 and round 0. All 99 pre-Source5 historical pairs and ten frozen pending drafts also remained byte-identical. Evidence is work/source6-policy-review.json and work/source6-rebase-actual-smoke.json.
+
+This is bounded source/policy/reuse evidence only. Pending drafts require current-packet authoring and admission; neither historical carry nor source validation establishes translation quality, full-book compilation, formal review, MAIN whole-book typography or acceptance.
+
+
 ## Verification interpretation
 
 Schema/semantic tests cover selected data boundaries and state transitions; they cannot establish all protected-span discovery, OCR fidelity, translation accuracy or truthfulness of model-supplied research/review. Mechanical PDF checks are not a substitute for visual and semantic review. Synthetic fixtures are development data, not evidence of a real book translated by an admitted model. Runtime identity resolution without a prompt is not inference evidence.
