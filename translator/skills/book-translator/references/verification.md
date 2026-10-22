@@ -469,6 +469,17 @@ The corpus probe above is a bounded syntax/font/glyph observation, not semantic 
 Source4 recovery and selective data reuse are complete within that scope; fresh affected-target authoring is separate. No new regression run is claimed for this data-only recovery; the preceding 248-test production-font run remains the latest full code regression. Whole-book target completion, authoritative PDF build, formal review, MAIN whole-book typography and semantic approval, and acceptance remain pending.
 
 
+## Typed target editing and source-view interpretation
+
+[OBSERVED] A native u0160 correction flattened typed targets into reading text and dropped protected references u0049_n_i and u0050_vmax. The unchanged unit validator rejected the lost nontext sequence. MAIN inspected the exact Inline deltas; native text-node repair restored both references at their meanings, retained the complete exercise question and passed read-only validation before checkpointing. The displayed vmax formula was already protected source, not a source-typing defect. No canonical source revision was performed for that false lead.
+
+[SOURCE] The single [translation-stage method](../stages/translation.md) now states that decoded views are read-only projections: inspect original token variants before diagnosing source typing, and edit typed target text nodes or retained occurrence maps rather than round-tripping flattened display text. No schema, validator, renderer, dependency or execution layer changed.
+
+[OBSERVED] Current-source native target units u0149 through u0164 were completed on Luna Medium and admitted after MAIN's complete owned-row reading and coordinated corrections. Together with the 83 exact carried checkpoints, actual status now records 99 admitted scopes covering 405 original pages; 66 scopes remain pending at round 0. The 24-row mathematical u0154 required incremental saved drafts and repeated semantic corrections before its full valid result was admitted. These observations are bounded authoring/recovery evidence, not proof that incremental work or this guidance generally ensures model compliance or translation quality.
+
+No new code regression run is claimed for this instruction clarification. Independent whole-book review, authoritative full-PDF build, MAIN whole-book typography and semantic approval, and acceptance remain pending. The separate complete-source mathematical-candidate audit is diagnosis evidence, not an already completed source revision or certified transcription.
+
+
 ## Verification interpretation
 
 Schema/semantic tests cover selected data boundaries and state transitions; they cannot establish all protected-span discovery, OCR fidelity, translation accuracy or truthfulness of model-supplied research/review. Mechanical PDF checks are not a substitute for visual and semantic review. Synthetic fixtures are development data, not evidence of a real book translated by an admitted model. Runtime identity resolution without a prompt is not inference evidence.
