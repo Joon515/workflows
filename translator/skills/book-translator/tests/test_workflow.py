@@ -76,6 +76,30 @@ def save_task_result(directory, role, provider=PROVIDER, model=MODEL, result=Non
 
 
 
+class DoctorPrerequisiteTests(unittest.TestCase):
+    def doctor_with_missing(self, missing=None):
+        def probe(arguments, **kwargs):
+            available = arguments[1] != missing
+            return subprocess.CompletedProcess(arguments, 0 if available else 1,
+                                               stdout="/test/tex/" + arguments[1] if available else "")
+
+        with patch("extract.doctor", return_value={"pymupdf": {"available": True}}), \
+             patch.object(workflow.shutil, "which", side_effect=lambda name: "/test/bin/" + name if name in {"xelatex", "kpsewhich"} else None), \
+             patch.object(workflow.subprocess, "run", side_effect=probe):
+            return workflow.doctor()
+
+    def test_doctor_blocks_each_missing_body_font_prerequisite(self):
+        self.assertTrue(self.doctor_with_missing()["render"]["ready"])
+        for missing in ("ucharclasses.sty", "JuliaMono-Regular.ttf", "JuliaMono-Bold.ttf",
+                        "JuliaMono-RegularItalic.ttf", "JuliaMono-BoldItalic.ttf"):
+            with self.subTest(resource=missing):
+                report = self.doctor_with_missing(missing)
+                resources = {**report["render"]["packages"], **report["render"]["fonts"]}
+                self.assertFalse(report["render"]["ready"])
+                self.assertIsNone(resources[missing])
+                self.assertTrue(all(value for name, value in resources.items() if name != missing))
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="book-controller-test-")

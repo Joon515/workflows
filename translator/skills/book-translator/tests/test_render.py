@@ -1229,6 +1229,119 @@ class RenderTests(unittest.TestCase):
                         self.assertGreater(len(row["line_boxes_pt"]), 1)
                         self.assertTrue(all(following[1] >= previous[3] - .5 for previous, following in zip(row["line_boxes_pt"], row["line_boxes_pt"][1:])))
 
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for ordinary TEXT glyph evidence")
+    def test_compiled_body_text_glyphs_keep_styles_and_restore_surrounding_fonts(self):
+        import os
+        import subprocess
+        import pymupdf
+        root = self.job / "body-text-glyphs"
+        root.mkdir()
+        shutil.copyfile(render.TEMPLATE.with_name("translator.sty"), root / "translator.sty")
+        preamble = render.TEMPLATE.read_text(encoding="utf-8").split(r"\begin{document}", 1)[0]
+        for key, value in {"INNER": "20", "OUTER": "8", "TOP": "15", "BOTTOM": "15",
+                           "MARK_EDGE": "3", "BEFORE_BODY": "Before body", "SOURCE_OVERLAYS": ""}.items():
+            preamble = preamble.replace("@@" + key + "@@", value)
+        # The 33 distinct ordinary-TEXT omissions observed in the admitted corpus.
+        # Keep the characters here, not a dependency on the diagnostic job.
+        corpus = "μᵐᵢ₀₁₂₃₄₅₆₇₈₉₋₌ₖₘₙₚℛ∅∈∑∩∪≤⌈⌉⌊⌋ⱼ𝒩𝒬"
+        names = "kᵢⱼ Bᵢ/Bⱼ Rᵢ; μ/𝒩/𝒬/ℛ."
+        cjk = "\u524d\u4e2d\u540e\uff0c\u3002"
+        styles = (
+            (r"\normalfont", "LMRoman10-Regular", "JuliaMono-Regular", "FandolSong-Regular"),
+            (r"\normalfont\bfseries", "LMRoman10-Bold", "JuliaMono-Bold", "FandolSong-Bold"),
+            (r"\normalfont\itshape", "LMRoman10-Italic", "JuliaMono-RegularItalic", "FandolKai-Regular"),
+            (r"\normalfont\bfseries\itshape", "LMRoman10-BoldItalic", "JuliaMono-BoldItalic", "FandolSong-Bold"),
+        )
+        rows = (
+            ("Corpus", "A" + corpus + "Z", render.escape("A" + corpus + "Z")),
+            ("Names", names, render.escape(names)),
+            ("CJK", "A\u524dμ\u4e2d𝒩\u540eⱼ\uff0cℛ\u3002Z", render.escape("A\u524dμ\u4e2d𝒩\u540eⱼ\uff0cℛ\u3002Z")),
+            ("Edges", "AμBᵢC𝒩D", r"A{\mbox{μ}}B{ᵢ}C\textnormal{𝒩}D"),
+            ("Families", "AμB C𝒬DE", r"\textsf{AμB}\ \texttt{C𝒬D}E"),
+        )
+        body = [r"\begin{document}\BTMainBody"]
+        for index, (command, _, _, _) in enumerate(styles):
+            if index:
+                body.append(r"\clearpage")
+            body.append("{" + command)
+            for label, _, tex in rows:
+                body.append(r"\noindent\makebox[5em][l]{" + label + "}" + tex + r"\par")
+            body.append("}")
+            if index == 0:
+                # This separate control is math; none of the corpus rows is.
+                body.append(r"\noindent\makebox[5em][l]{Math}A\(\mu\leq\mathcal{N}+\mathrm{M}+\mathit{I}+\mathbf{B}\)Z\par")
+        body.append(r"\end{document}")
+        (root / "book.tex").write_text(preamble + "\n".join(body), encoding="utf-8")
+        result = subprocess.run([shutil.which("xelatex"), "-no-shell-escape", "-halt-on-error",
+                                 "-interaction=batchmode", "book.tex"], cwd=root,
+                                env={**os.environ, "SOURCE_DATE_EPOCH": "1609459200", "FORCE_SOURCE_DATE": "1"},
+                                capture_output=True, text=True, timeout=30)
+        log = (root / "book.log").read_text(encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + log)
+        self.assertNotIn("Missing character:", log)
+        self.assertNotRegex(log, r"Overfull \\[hv]box|end occurred inside a group")
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), len(styles))
+            for page, (_, roman, fallback, chinese) in zip(document, styles):
+                traces = page.get_texttrace()
+                extracted = page.get_text()
+                for label, expected, _ in rows:
+                    with self.subTest(style=fallback, boundary=label):
+                        self.assertIn("".join(expected.split()), "".join(extracted.split()))
+                        bounds, = page.search_for(label)
+                        label_glyph = next(char for trace in traces for char in trace["chars"]
+                                           if chr(char[0]) == label[0] and
+                                           abs(char[2][0] - bounds.x0) < .1 and
+                                           bounds.y0 <= char[2][1] <= bounds.y1)
+                        glyphs = [(chr(char[0]), trace, char) for trace in traces for char in trace["chars"]
+                                  if char[2][0] > bounds.x1 + .5 and
+                                  abs(char[2][1] - label_glyph[2][1]) < .1 and not chr(char[0]).isspace()]
+                        self.assertEqual("".join(symbol for symbol, _, _ in glyphs), "".join(expected.split()))
+                        if label == "Names":
+                            # PDF extractors can omit spaces after encoded subscripts;
+                            # require the actual word gaps as well as exact nonspace codepoints.
+                            offset = 0
+                            for symbol in expected:
+                                if symbol.isspace():
+                                    previous = glyphs[offset - 1][2]
+                                    following = glyphs[offset][2]
+                                    self.assertGreater(following[2][0] - previous[3][2], .5,
+                                                       "An ordinary TEXT word space must retain visible advance")
+                                else:
+                                    offset += 1
+                        if label == "Families":
+                            fonts = [trace["font"] for _, trace, _ in glyphs]
+                            self.assertTrue(fonts[0].startswith("LMSans"), fonts)
+                            self.assertEqual(fonts[0], fonts[2], "Sans family must survive TEXT fallback")
+                            self.assertTrue(fonts[3].startswith("LMMono"), fonts)
+                            self.assertEqual(fonts[3], fonts[5], "Mono family must survive TEXT fallback")
+                        for position, (symbol, trace, char) in enumerate(glyphs):
+                            expected_font = chinese if symbol in cjk else fallback if symbol in corpus else roman
+                            if label == "Edges" and symbol == "𝒩":
+                                expected_font = "JuliaMono-Regular"
+                            if label != "Families" or position in (1, 4, 6):
+                                self.assertEqual(trace["font"], expected_font, (label, symbol))
+                            self.assertEqual(trace["type"], 0, symbol)
+                            self.assertGreater(trace["opacity"], 0, symbol)
+                            self.assertGreater(char[1], 0, symbol + " must have a real glyph, not .notdef")
+                            ink = page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=pymupdf.Rect(char[3]),
+                                                  colorspace=pymupdf.csGRAY, alpha=False)
+                            self.assertGreater(sum(value < 200 for value in ink.samples), 2,
+                                               symbol + " must have visible ink in its PDF glyph bounds")
+            page = document[0]
+            bounds, = page.search_for("Math")
+            math_glyphs = [(unicodedata.normalize("NFKC", chr(char[0])), trace["font"], char[1])
+                           for trace in page.get_texttrace() for char in trace["chars"]
+                           if char[2][0] > bounds.x1 + .5 and bounds.y0 <= char[2][1] <= bounds.y1
+                           and not chr(char[0]).isspace()]
+            self.assertEqual("".join(symbol for symbol, _, _ in math_glyphs), "Aμ≤N+M+I+BZ")
+            for symbol, font, glyph in math_glyphs:
+                expected_font = {"A": "LMRoman10-Regular", "Z": "LMRoman10-Regular",
+                                 "M": "LMRoman10-Regular", "I": "LMRoman10-Italic", "B": "LMRoman10-Bold"}.get(
+                                     symbol, "LatinModernMath-Regular")
+                self.assertEqual(font, expected_font, symbol)
+                self.assertGreater(glyph, 0, symbol)
+
     @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for Unicode math glyph evidence")
     def test_compiled_unicode_and_escaped_math_preserve_visible_glyphs(self):
         import pymupdf

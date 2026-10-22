@@ -5,6 +5,42 @@
 \RequirePackage{amsmath,amssymb,graphicx,longtable,array,fvextra,tikz}
 \RequirePackage{unicode-math}
 \setmathfont{latinmodern-math.otf}
+% Route only these non-CJK TEXT blocks; keep the existing BODY and math fonts.
+% Capture xeCJK/native classes before ucharclasses allocates its block classes.
+\newcount\BTGlyphPreviousLastClass
+\BTGlyphPreviousLastClass=\xe@alloc@intercharclass
+\RequirePackage[GreekAndCoptic,PhoneticExtensions,SuperscriptsAndSubscripts,LetterlikeSymbols,MathematicalOperators,MiscellaneousTechnical,LatinExtendedC,MathematicalAlphanumericSymbols]{ucharclasses}
+\newfontfamily\BTGlyphFallback{JuliaMono-Regular.ttf}[BoldFont=JuliaMono-Bold.ttf,ItalicFont=JuliaMono-RegularItalic.ttf,BoldItalicFont=JuliaMono-BoldItalic.ttf]
+\begingroup\BTGlyphFallback\xdef\BTGlyphFamily{\f@family}\endgroup
+\newcommand\BTEnterGlyphFallback{%
+  \ifx\f@family\BTGlyphFamily\else
+    \edef\BTGlyphSavedFamily{\f@family}%
+    \BTGlyphFallback
+  \fi}
+\newcommand\BTLeaveGlyphFallback{%
+  \ifx\f@family\BTGlyphFamily
+    \fontfamily{\BTGlyphSavedFamily}\selectfont
+  \fi}
+% Restore the incoming NFSS family without grouping across spaces/macros,
+% preserving series/shape and all existing native class-pair token lists.
+\ExplSyntaxOn
+\clist_const:Nn \c__bt_glyph_blocks_clist
+  {GreekAndCoptic,PhoneticExtensions,SuperscriptsAndSubscripts,LetterlikeSymbols,
+   MathematicalOperators,MiscellaneousTechnical,LatinExtendedC,MathematicalAlphanumericSymbols}
+\clist_map_inline:Nn \c__bt_glyph_blocks_clist
+  {
+    \int_step_inline:nnn {0}{\BTGlyphPreviousLastClass}
+      {
+        \XeTeXinterchartoks ##1~\use:c{#1Class}={\BTEnterGlyphFallback}
+        \XeTeXinterchartoks \use:c{#1Class}~##1={\BTLeaveGlyphFallback}
+      }
+    \XeTeXinterchartoks 4095~\use:c{#1Class}={\BTEnterGlyphFallback}
+    \XeTeXinterchartoks \use:c{#1Class}~4095={\BTLeaveGlyphFallback}
+    % Adjacent fallback blocks retain the original saved family.
+    \clist_map_inline:Nn \c__bt_glyph_blocks_clist
+      {\XeTeXinterchartoks \use:c{#1Class}~\use:c{##1Class}={}}
+  }
+\ExplSyntaxOff
 \RequirePackage[bottom,splitrule]{footmisc}
 \RequirePackage{zref-savepos,zref-abspage}
 \setCJKfamilyfont{BTTerm}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolSong-Bold.otf,BoldItalicFont=FandolSong-Bold.otf,FakeSlant=0.2]{FandolSong-Bold.otf}

@@ -510,6 +510,36 @@ No new code or regression run is claimed for this source-data recovery; the prio
 This is bounded source/policy/reuse evidence only. Pending drafts require current-packet authoring and admission; neither historical carry nor source validation establishes translation quality, full-book compilation, formal review, MAIN whole-book typography or acceptance.
 
 
+## Ordinary-TEXT glyph coverage and conservative font repair
+
+[OBSERVED] A captured production BODY-text probe found a different defect from protected mathematics: Latin Modern Roman text lacked 33 codepoints used in 223 actual target occurrences across 13 admitted scopes. The baseline snapshot covered 77 checkpoints, 339 original pages, 2,321 blocks and 4,306 ordinary-text records. Real two-pass text compilation produced 126 Missing character messages and absent PDF glyphs; the focused one-page witness also lost identifier subscripts. These failures were not repaired by the earlier unicode-math selection, which owns math mode rather than ordinary TEXT. Baseline evidence remains under work/target-text-glyph-smoke/2026-10-22T05-17-45-030Z-40409513-db8.
+
+[OBSERVED] Disposable font investigation checked 2,814 installed TeX Live font files and actual OS serif faces. No tested installed proportional serif family covered every required Latin-routed character in all four styles. The selected conservative profile keeps existing Latin Modern Roman ASCII, Fandol CJK and Latin Modern Math/its text-alphabet aliases. One already-installed four-style TEXT family, JuliaMono, supplies eight standard non-CJK Unicode blocks through ucharclasses with complete existing-class/boundary transitions and NFSS family restoration. MAIN viewed all four prototype identifier rasters before selecting this bounded profile. Rejected group-leaking, Default-only and math-alias-changing prototypes are retained, not presented as successful alternatives.
+
+[SOURCE] The canonical style and doctor implement that one profile. Doctor requires ucharclasses.sty and JuliaMono-Regular.ttf, JuliaMono-Bold.ttf, JuliaMono-RegularItalic.ttf and JuliaMono-BoldItalic.ttf through exact TeX file resolution. No input/Unicode rewriting, per-character replacement map, whole-math BODY font, schema change, new job option or missing-character suppression was introduced. The dependency/version/license and maintenance limits are owned by the ordinary-TEXT section of operation.md and the README. Observed JuliaMono 0.062 is SIL OFL 1.1, ucharclasses 2.6.0 is Public Domain with an explicit maintainer warning, and Latin Modern Math 1.959 retains its GUST license; none is bundled or installed by this repair.
+
+[OBSERVED] Production verification used actual canonical translator.sty SHA256 a97e200e8723593958c0ce54811b117a1924e48c2684885c31727baf31c482bd, with recorder evidence and no prototype preamble injection. The exact captured 1,517-character corpus ran in four styles (6,068 rows, 58 pages per style); all 223 failing contexts plus four identifier contexts ran in four styles (908 rows, 45 pages). Every targeted character had its expected real face and visible ink, with zero missing-glyph, invisible-glyph or ASCII-fallback-leak failures. There were 202,386 physical BODY-glyph ink checks. All 1,363 CJK ideographs used expected Fandol faces; 100 native class-pair comparisons including boundary 4095 and 1,376 sampled CJK assignments per document remained unchanged. Expanded ligature continuation records were explicitly bound to their positive owner glyphs and ink, not silently ignored.
+
+[OBSERVED] A separate replay of the byte-identical existing 567-ID Source5 math diagnostic used the changed production style: two passes, 1,134 inline/display expressions per pass, 104 pages and 13,533 glyph/ink checks per pass. No missing glyphs or ink failures occurred, and every page's glyph traces matched the prior diagnostic PDF, which was read rather than recompiled as a baseline. This replay was warranted by the font implementation change, not by the Source6 name-only source correction. It binds captured diagnostic inputs and current style, not mutable book hashes or semantic parity.
+
+[OBSERVED] Settled regression and exact-copy results, in the previously recorded isolated OCR/DjVu environment:
+
+| Check | Actual result |
+|---|---|
+| DoctorPrerequisiteTests | 1 passed in 0.029 seconds |
+| Complete renderer module | 45 passed, no skips, in 249.258 seconds |
+| Full existing suite | 250 run: 249 passed, one conditional dependency-absence skip, in 388.344 seconds |
+| Existing activation verifier | All six isolated cases passed on OMP 18.12.3; no model prompts or forwarded credentials |
+| Exact .agents/translator copy | Both ordinary-TEXT and Unicode-MATH fixtures passed in 5.226 seconds |
+| Exact .omp/translator copy | Both fixtures passed in 5.221 seconds |
+
+The sole skip was the missing-DjVu opposite condition because ddjvu was present; actual DjVu decoding and OCR fixtures passed. Both copies contained 34 source-snapshot-identical files, reported rendering/OCR/DjVu ready through copied CLI doctor, read no VLSI book artifacts for their compiler fixtures, and retained their evidence before disposable-root/synthetic-job cleanup. The subsequent verification-ledger append is documentation only, not an unexercised code change. The permanent new regression checks real ordinary TEXT, emphasis, family transitions, physical spaces, CJK and math controls; the existing actual U+10FFFF missing-character rejection remains intact.
+
+[OBSERVED] MAIN viewed the four fresh production identifier PNGs for regular/bold/italic/bolditalic, including k with i/j subscripts, B with i/j subscripts and R with i subscript. Characters previously absent are visible. Production evidence root is work/body-font-production-verification-2026-10-22T06-12-10-357Z-45fadaac; production-verification-summary.json SHA256 is 2f69bba23ef3c7ecc9df81c8d80fbcc1fb1b468a90319de4fc38c2235ca5e158. Raw diagnostics retain 14 overfull, six underfull, six label/reference and four font-warning entries from these diagnostic snippets, including the existing Fandol bolditalic substitution; no build gate or warning was suppressed. Executed versions include XeTeX 0.999998/TeX Live 2026, Python 3.13.11, PyMuPDF/MuPDF 1.28.2, Pillow 12.3.0 and fontTools 4.63.0.
+
+JuliaMono's distinct metrics and monospace shapes can reflow affected runs. This is bounded character/transition/runtime evidence, not universal Unicode coverage, semantic fidelity, all-context layout parity or whole-book approval. The actual complete translated book still requires its authoritative build, formal all-page review, MAIN entire-PDF typography and exact-artifact acceptance.
+
+
 ## Verification interpretation
 
 Schema/semantic tests cover selected data boundaries and state transitions; they cannot establish all protected-span discovery, OCR fidelity, translation accuracy or truthfulness of model-supplied research/review. Mechanical PDF checks are not a substitute for visual and semantic review. Synthetic fixtures are development data, not evidence of a real book translated by an admitted model. Runtime identity resolution without a prompt is not inference evidence.
