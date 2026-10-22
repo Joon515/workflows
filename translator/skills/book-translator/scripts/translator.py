@@ -44,7 +44,19 @@ def doctor() -> dict:
     tools = {name: shutil.which(name) for name in ("xelatex", "latexmk", "kpsewhich")}
     resources = {}
     required = ("ctexbook.cls", "geometry.sty", "amsmath.sty", "amssymb.sty", "unicode-math.sty", "ucharclasses.sty", "graphicx.sty", "longtable.sty", "array.sty", "fvextra.sty", "tikz.sty", "footmisc.sty", "zref-savepos.sty", "zref-abspage.sty")
-    fonts = ("FandolSong-Regular.otf", "FandolSong-Bold.otf", "FandolHei-Regular.otf", "FandolHei-Bold.otf", "FandolKai-Regular.otf", "FandolFang-Regular.otf", "lmroman10-regular.otf", "lmmono10-regular.otf", "latinmodern-math.otf", "JuliaMono-Regular.ttf", "JuliaMono-Bold.ttf", "JuliaMono-RegularItalic.ttf", "JuliaMono-BoldItalic.ttf")
+    fonts = (
+        "FandolSong-Regular.otf", "FandolSong-Bold.otf", "FandolHei-Regular.otf", "FandolHei-Bold.otf",
+        "FandolKai-Regular.otf", "FandolFang-Regular.otf",
+        "FreeSerif.otf", "FreeSerifBold.otf", "FreeSerifItalic.otf", "FreeSerifBoldItalic.otf",
+        "lmroman5-regular.otf", "lmroman6-regular.otf", "lmroman7-regular.otf", "lmroman8-regular.otf",
+        "lmroman9-regular.otf", "lmroman10-regular.otf", "lmroman12-regular.otf", "lmroman17-regular.otf",
+        "lmroman5-bold.otf", "lmroman6-bold.otf", "lmroman7-bold.otf", "lmroman8-bold.otf",
+        "lmroman9-bold.otf", "lmroman10-bold.otf", "lmroman12-bold.otf",
+        "lmroman7-italic.otf", "lmroman8-italic.otf", "lmroman9-italic.otf", "lmroman10-italic.otf",
+        "lmroman12-italic.otf", "lmroman10-bolditalic.otf",
+        "lmmono10-regular.otf", "latinmodern-math.otf",
+        "JuliaMono-Regular.ttf", "JuliaMono-Bold.ttf", "JuliaMono-RegularItalic.ttf", "JuliaMono-BoldItalic.ttf",
+    )
     for resource in (*required, *fonts):
         found = None
         if tools["kpsewhich"]:

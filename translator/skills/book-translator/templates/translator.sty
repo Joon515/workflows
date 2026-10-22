@@ -4,8 +4,39 @@
 \geometry{a5paper,inner=\BTInner mm,outer=\BTOuter mm,top=\BTTop mm,bottom=\BTBottom mm}
 \RequirePackage{amsmath,amssymb,graphicx,longtable,array,fvextra,tikz}
 \RequirePackage{unicode-math}
+\RequirePackage[bottom,splitrule]{footmisc}
+\RequirePackage{zref-savepos,zref-abspage}
 \setmathfont{latinmodern-math.otf}
-% Route only these non-CJK TEXT blocks; keep the existing BODY and math fonts.
+\setmainfont{FreeSerif.otf}[BoldFont=FreeSerifBold.otf,ItalicFont=FreeSerifItalic.otf,BoldItalicFont=FreeSerifBoldItalic.otf]
+% Preserve the original Latin Modern math text aliases and optical-size ranges.
+\setmathrm{lmroman10-regular.otf}[
+  BoldFont=lmroman10-bold.otf,
+  ItalicFont=lmroman10-italic.otf,
+  BoldItalicFont=lmroman10-bolditalic.otf,
+  SizeFeatures={
+    {Size={-5.5},Font=lmroman5-regular.otf},
+    {Size={5.5-6.5},Font=lmroman6-regular.otf},
+    {Size={6.5-7.5},Font=lmroman7-regular.otf},
+    {Size={7.5-8.5},Font=lmroman8-regular.otf},
+    {Size={8.5-9.5},Font=lmroman9-regular.otf},
+    {Size={9.5-11},Font=lmroman10-regular.otf},
+    {Size={11-15},Font=lmroman12-regular.otf},
+    {Size={15-},Font=lmroman17-regular.otf}},
+  BoldFeatures={SizeFeatures={
+    {Size={-5.5},Font=lmroman5-bold.otf},
+    {Size={5.5-6.5},Font=lmroman6-bold.otf},
+    {Size={6.5-7.5},Font=lmroman7-bold.otf},
+    {Size={7.5-8.5},Font=lmroman8-bold.otf},
+    {Size={8.5-9.5},Font=lmroman9-bold.otf},
+    {Size={9.5-11},Font=lmroman10-bold.otf},
+    {Size={11-},Font=lmroman12-bold.otf}}},
+  ItalicFeatures={SizeFeatures={
+    {Size={-7.5},Font=lmroman7-italic.otf},
+    {Size={7.5-8.5},Font=lmroman8-italic.otf},
+    {Size={8.5-9.5},Font=lmroman9-italic.otf},
+    {Size={9.5-11},Font=lmroman10-italic.otf},
+    {Size={11-},Font=lmroman12-italic.otf}}}]
+% Route only these non-CJK TEXT blocks; retain native CJK classes and glue.
 % Capture xeCJK/native classes before ucharclasses allocates its block classes.
 \newcount\BTGlyphPreviousLastClass
 \BTGlyphPreviousLastClass=\xe@alloc@intercharclass
@@ -41,12 +72,12 @@
       {\XeTeXinterchartoks \use:c{#1Class}~\use:c{##1Class}={}}
   }
 \ExplSyntaxOff
-\RequirePackage[bottom,splitrule]{footmisc}
-\RequirePackage{zref-savepos,zref-abspage}
 \setCJKfamilyfont{BTTerm}[BoldFont=FandolSong-Bold.otf,ItalicFont=FandolSong-Bold.otf,BoldItalicFont=FandolSong-Bold.otf,FakeSlant=0.2]{FandolSong-Bold.otf}
 \newcommand{\BTFirstTerm}[2]{%
   \begingroup\xeCJKsetup{CheckFullRight=true}\sbox{\BTTempBox}{\textsuperscript{#2}}%
   \textbf{\textit{\CJKfamily{BTTerm}#1\nobreak\usebox{\BTTempBox}}}\endgroup}
+% Preserve a literal compound hyphen while restoring native word hyphenation.
+\newcommand{\BTLiteralHyphen}{\leavevmode\nobreak\hskip0pt-\discretionary{}{}{}\nobreak\hskip0pt\relax}
 \setlength{\parindent}{2em}
 \setlength{\parskip}{3pt}
 \setlength{\emergencystretch}{1em}
@@ -126,9 +157,11 @@
 \newcommand{\BTHeading}[4]{%
   \par\ifnum#1=1\clearpage\fi
   \expandafter\gdef\csname BTLabel@#2\endcsname{#4}%
-  \ifnum#1=1\markboth{#2}{}\else\ifnum#1=2\markright{#2}\fi\fi
+  % Keep the old neutral break/lastskip boundary without leaking a future mark.
+  \ifnum#1<3\penalty0\fi
   \addvspace{\baselineskip}\noindent
   {\bfseries\ifcase#1\or\LARGE\or\Large\or\large\fi #3\par}
+  \ifnum#1=1\markboth{#2}{}\else\ifnum#1=2\markright{#2}\fi\fi
   \nobreak\smallskip}
 \newcommand{\BTParagraph}[2]{%
   \par\begingroup\parindent=2em\indent\typeout{BTTYPE|#1|paragraph|\number\dimexpr1em\relax}%

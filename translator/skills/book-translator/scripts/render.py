@@ -5,6 +5,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import core
@@ -16,6 +17,58 @@ _ESCAPE = {"\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$", "&": r
 _LITERAL_ESCAPE = {**_ESCAPE, "'": r"\textquotesingle{}", '"': r"\textquotedbl{}",
                    chr(96): r"\textasciigrave{}", "-": r"\char45{}",
                    "<": r"\textless{}", ">": r"\textgreater{}"}
+_URL = re.compile(r"(?<![A-Za-z0-9_])(?:https?://|www\.)[!-~]+")
+_COMPOUND_HYPHEN = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
+_ASCII_WHITESPACE = " \t\r\n\f\v"
+_NONBREAKING = "\u00a0\u2007\u2011\u202f\u2060\ufeff"
+# Positive boundary vocabulary, restricted to the same finite grammar as core.
+# Newly admitted or structurally opaque commands do not acquire an opportunity.
+_MATH_BOUNDARY_PREFIXES = frozenset("""
+displaystyle textstyle scriptstyle scriptscriptstyle
+quad qquad enspace thinspace medspace thickspace negthinspace negmedspace negthickspace
+mathrm mathit mathbf mathsf mathtt mathcal mathbb mathfrak mathnormal boldsymbol bm
+mathop mathbin mathrel mathord mathopen
+""".split()) & core._MATH_COMMANDS
+_MATH_BOUNDARY_OPEN = frozenset("langle lceil lfloor lbrace lgroup lvert lVert".split()) & core._MATH_COMMANDS
+_MATH_BOUNDARY_SIZES = frozenset("left big Big bigg Bigg bigl Bigl biggl Biggl".split()) & core._MATH_COMMANDS
+_MATH_BOUNDARY_SAFE = frozenset("""
+alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa varkappa
+lambda mu nu xi omicron pi varpi rho varrho sigma varsigma tau upsilon phi varphi chi psi omega
+Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega
+frac dfrac tfrac cfrac binom dbinom tbinom sqrt
+sum prod coprod int iint iiint iiiint oint oiint oiiint lim limsup liminf inf sup min max
+sin cos tan cot sec csc arcsin arccos arctan sinh cosh tanh coth log ln lg exp det gcd dim
+ker hom Pr arg deg
+backslash slash parallel nparallel perp mid nmid
+infty partial nabla ell hbar hslash imath jmath Re Im wp aleph beth gimel daleth emptyset
+varnothing exists nexists forall neg top bot angle measuredangle triangle square Box Diamond
+in ni notin subset supset subseteq supseteq subsetneq supsetneq sqsubset sqsupset sqsubseteq
+sqsupseteq cup cap uplus sqcup sqcap setminus smallsetminus land lor wedge vee bigcup bigcap
+bigvee bigwedge bigoplus bigotimes biguplus le ge leq geq neq ne equiv sim simeq approx
+cong asymp propto prec succ preceq succeq ll gg lesssim gtrsim lessapprox gtrapprox
+pm mp times div cdot ast star circ bullet diamond oplus ominus otimes oslash odot
+rightarrow leftarrow leftrightarrow Rightarrow Leftarrow Leftrightarrow longrightarrow
+longleftarrow longleftrightarrow Longrightarrow Longleftarrow Longleftrightarrow mapsto
+longmapsto hookrightarrow hookleftarrow uparrow downarrow updownarrow Uparrow Downarrow
+Updownarrow nearrow searrow swarrow nwarrow to gets implies iff leadsto rightsquigarrow
+rightharpoonup rightharpoondown leftharpoonup leftharpoondown rightleftharpoons
+""".split()) & core._MATH_COMMANDS
+_MATH_FENCE_OPENERS = frozenset("left bigl Bigl biggl Biggl".split()) & core._MATH_COMMANDS
+_MATH_FENCE_CLOSERS = frozenset("right bigr Bigr biggr Biggr".split()) & core._MATH_COMMANDS
+_MATH_FENCE_LEXEME = re.compile(r"\\(?:[A-Za-z]+|.)|\|\||[^\\]", re.S)
+_MATH_FENCE_TOKENS = {
+    "|": ("abs", 0), "∣": ("abs", 0), r"\vert": ("abs", 0),
+    "||": ("norm", 0), "‖": ("norm", 0), "∥": ("norm", 0),
+    r"\|": ("norm", 0), r"\Vert": ("norm", 0),
+    **{token: (family, side)
+       for family, left, right in (
+           ("abs", r"\lvert", r"\rvert"), ("norm", r"\lVert", r"\rVert"),
+           ("paren", "(", ")"), ("bracket", "[", "]"), ("brace", r"\{", r"\}"),
+           ("brace", r"\lbrace", r"\rbrace"), ("angle", "⟨", "⟩"),
+           ("angle", r"\langle", r"\rangle"), ("ceil", "⌈", "⌉"),
+           ("ceil", r"\lceil", r"\rceil"), ("floor", "⌊", "⌋"),
+           ("floor", r"\lfloor", r"\rfloor"), ("group", r"\lgroup", r"\rgroup"))
+       for token, side in ((left, 1), (right, -1))}}
 
 
 def escape(text: str) -> str:
@@ -26,6 +79,161 @@ def escape(text: str) -> str:
 def _literal_text(text: str) -> str:
     """Escape data without applying TeX's quote/dash input substitutions."""
     return "".join(_LITERAL_ESCAPE.get(c, c) for c in text).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _ordinary_text(text: str) -> str:
+    """Add local prose opportunities without interpreting or changing literal URLs."""
+    def compounds(value: str) -> str:
+        return r"\BTLiteralHyphen{}".join(escape(piece) for piece in _COMPOUND_HYPHEN.split(value))
+
+    result = []
+    cursor = 0
+    for match in _URL.finditer(text):
+        result.append(compounds(text[cursor:match.start()]))
+        result.append("".join(_literal_text(c) + (r"\allowbreak{}" if c in "./" else "")
+                              for c in match[0]))
+        cursor = match.end()
+    result.append(compounds(text[cursor:]))
+    return "".join(result)
+
+
+def _math_fence_complete(value: str, index: int, fence: str) -> bool:
+    """Prove a nonempty leading abs/norm pair without interpreting its value.
+
+    Only matching visible delimiters and TeX argument groups are balanced here.
+    Unknown, empty or incomplete fences keep their original native boundary.
+    """
+    groups, content, sizing = 0, False, None
+    nested = []
+    while index < len(value):
+        match = _MATH_FENCE_LEXEME.match(value, index)
+        if not match:
+            return False
+        token, index = match[0], match.end()
+        if token in _ASCII_WHITESPACE:
+            continue
+        if token == "{":
+            groups += 1
+            continue
+        if token == "}":
+            if not groups:
+                return False
+            groups -= 1
+            continue
+        command = token[1:] if token.startswith("\\") else None
+        if command is not None:
+            if command.isalpha() and command not in core._MATH_COMMANDS:
+                return False
+            if not command.isalpha() and command not in "\\{}_%#$& ,:;!|/":
+                return False
+            if command in ("begin", "end"):
+                return False
+            if command in _MATH_BOUNDARY_PREFIXES or command in (" ", ",", ":", ";", "!", "strut", "mathstrut"):
+                continue
+        if groups:
+            content = True
+            continue
+        if command in _MATH_BOUNDARY_SIZES or command in _MATH_FENCE_CLOSERS:
+            sizing = 1 if command in _MATH_FENCE_OPENERS else -1 if command in _MATH_FENCE_CLOSERS else 0
+            continue
+        boundary = _MATH_FENCE_TOKENS.get(token)
+        if boundary is None:
+            if sizing is not None:
+                return False
+            content = True
+            continue
+        family, side = boundary
+        if sizing is not None:
+            if sizing and side and sizing != side:
+                return False
+            side, sizing = sizing or side, None
+        if side == 1:
+            nested.append(family)
+        elif nested:
+            if side == 0 and nested[-1] != family:
+                nested.append(family)
+            elif nested[-1] != family:
+                return False
+            else:
+                nested.pop()
+        elif family == fence:
+            return content
+        elif side == 0:
+            nested.append(family)
+        else:
+            return False
+    return False
+
+
+def _math_starts_safe(value: str) -> bool:
+    """Recognize only a proven non-closing leading boundary; never rewrite math.
+
+    This is a leading-token scan of core's finite grammar, not a TeX parser.
+    Groups and math-font/style/space prefixes are transparent. Closing/punct
+    classes stop the scan; other explicit classes also check their contents.
+    Opaque constructions remain native-only rather than assuming a safe class.
+    """
+    index, groups, delimiter, opening_fence = 0, 0, False, False
+    while index < len(value):
+        char = value[index]
+        index += 1
+        if char in _ASCII_WHITESPACE:
+            continue
+        if char == "{":
+            groups += 1
+            continue
+        if char == "}":
+            if not groups:
+                return False
+            groups -= 1
+            continue
+        if char == "\\":
+            if index == len(value):
+                return False
+            end = index
+            while end < len(value) and value[end] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
+                end += 1
+            if end == index:
+                symbol = value[index]
+                index += 1
+                if symbol == "|":
+                    return opening_fence or _math_fence_complete(value, index, "norm")
+                if symbol in " ,:;!":
+                    continue
+                return symbol == "{" if delimiter else symbol in "{_%#$&"
+            command, index = value[index:end], end
+            if command not in core._MATH_COMMANDS:
+                return False
+            fence = _MATH_FENCE_TOKENS.get("\\" + command)
+            if fence and fence[0] in ("abs", "norm") and fence[1] == 0:
+                return opening_fence or _math_fence_complete(value, index, fence[0])
+            if delimiter:
+                return command in _MATH_BOUNDARY_OPEN
+            if command == "operatorname":
+                while index < len(value) and value[index] in _ASCII_WHITESPACE:
+                    index += 1
+                if index < len(value) and value[index] == "*":
+                    index += 1
+                continue
+            if command in _MATH_BOUNDARY_PREFIXES:
+                continue
+            if command in _MATH_BOUNDARY_SIZES:
+                delimiter, opening_fence = True, command in _MATH_FENCE_OPENERS
+                continue
+            return command in _MATH_BOUNDARY_OPEN or command in _MATH_BOUNDARY_SAFE
+        if char in "|‖∣∥":
+            fence = "abs" if char in "|∣" else "norm"
+            if char == "|" and index < len(value) and value[index] == "|":
+                index += 1
+                fence = "norm"
+            return opening_fence or _math_fence_complete(value, index, fence)
+        # Pe/Pf and punctuation are deliberately not positive cases. Ambiguous
+        # fences/active tilde are not proof of a safe beginning either.
+        category = unicodedata.category(char)
+        if delimiter:
+            return category == "Ps"
+        return char not in "|‖∣∥~" and (category[0] in "LN" or category in ("Sm", "Ps") or char in "-/")
+    return False
 
 
 def _cell_text(text: str) -> str:
@@ -96,11 +304,15 @@ class _Renderer:
         self.inline_images: list[dict] = []
         self.asset_pixels: dict[str, dict] = {}
 
-    def protected_text(self, identifier: str) -> str:
+    def protected_text(self, identifier: str, *, before_edge: bool = False) -> str:
         item = self.protected[identifier]
         value = item["value"]
         if item["kind"] in ("math", "variable"):
-            return r"\(" + value + r"\)"
+            # Native xeCJK must see the literal delimiter. The glue cancels unless
+            # this legal before-edge is taken; preserve all original math tokens.
+            edge = (r"\mskip0mu plus1fil\penalty1000\mskip0mu plus-1fil\relax "
+                    if before_edge and _math_starts_safe(value) else "")
+            return r"\(" + edge + value + r"\)"
         if item["kind"] == "code":
             # Unlike normal prose, inline literal spaces and newlines are significant.
             literal = "".join(r"\hspace*{\fontdimen2\font}" if c == " " else
@@ -109,6 +321,29 @@ class _Renderer:
                               for c in value)
             return r"{\ttfamily " + literal + "}"
         return _literal_text(value)
+
+    def _math_before_edge(self, items: list[dict], index: int) -> bool:
+        """Decide from actual typed neighbors, never from generated TeX or math."""
+        for previous in range(index - 1, -1, -1):
+            kind, value = next(iter(items[previous].items()))
+            if kind == "page":
+                continue
+            if kind == "text":
+                text = value.rstrip(_ASCII_WHITESPACE)
+                if not text:
+                    continue
+            elif kind == "term":
+                text = self.terms[value]["target"].rstrip(_ASCII_WHITESPACE)
+                if not text:
+                    return False
+            elif kind == "protected":
+                return self.protected[value]["kind"] in ("math", "variable")
+            else:
+                # Notes and images are not ordinary prose neighbors.
+                return False
+            last = text[-1]
+            return last not in "([{" + _NONBREAKING and unicodedata.category(last) not in ("Ps", "Pi")
+        return False
 
     def term_text(self, identifier: str, literal: str | None = None) -> str:
         term = self.terms[identifier]
@@ -131,14 +366,19 @@ class _Renderer:
         return "".join(result)
 
     def inline(self, items: list[dict], *, location: str = "body", deferred_notes: list[str] | None = None,
-               index_offset: int = 0) -> str:
+               index_offset: int = 0, _literal_fragment: str | None = None) -> str:
         result = []
-        for index, item in enumerate(items, index_offset):
+        for item_index, item in enumerate(items):
+            index = item_index + index_offset
             kind, value = next(iter(item.items()))
             if kind == "text":
-                result.append(escape(value))
+                if _literal_fragment and _literal_fragment in value:
+                    before, _, after = value.partition(_literal_fragment)
+                    result.append(_ordinary_text(before) + _literal_text(_literal_fragment) + _ordinary_text(after))
+                else:
+                    result.append(_ordinary_text(value))
             elif kind == "protected":
-                result.append(self.protected_text(value))
+                result.append(self.protected_text(value, before_edge=self._math_before_edge(items, item_index)))
             elif kind == "image":
                 key = "inline:" + str(len(self.inline_images) + 1)
                 path = self.asset(value["asset"])
@@ -153,14 +393,9 @@ class _Renderer:
                 number = str(self.note_number)
                 note = self.notes[value]
                 fragment = note.get("restoration", {}).get("original_fragment")
-                pieces = []
-                for note_index, token in enumerate(note["target"]):
-                    if fragment and fragment in token.get("text", ""):
-                        before, _, after = token["text"].partition(fragment)
-                        pieces.append(escape(before) + _literal_text(fragment) + escape(after))
-                    else:
-                        pieces.append(self.inline([token], location="notes." + value + ".target", index_offset=note_index))
-                content = (r"\BTPosition{note:" + value + ":start}" + "".join(pieces) +
+                note_text = self.inline(note["target"], location="notes." + value + ".target",
+                                        _literal_fragment=fragment)
+                content = (r"\BTPosition{note:" + value + ":start}" + note_text +
                            r"\BTPosition{note:" + value + ":end}")
                 result.append(r"\BTPosition{callout:" + value + "}")
                 if deferred_notes is not None:
@@ -299,7 +534,7 @@ class _Renderer:
         """Render running labels without terms, notes, source marks, or image effects."""
         return "".join(_literal_text(item["text"]) if "text" in item else
                        _literal_text(self.terms[item["term"]]["target"]) if "term" in item else
-                       self.protected_text(item["protected"]) if "protected" in item else ""
+                       self.protected_text(item["protected"], before_edge=False) if "protected" in item else ""
                        for item in items)
 
     def tex(self) -> str:
@@ -385,9 +620,10 @@ def _physical_text_lines(raw_lines: list[dict], em: float, left: float) -> list[
                 if abs(span["size"] - em) < .4:
                     full_size.append(char)
                     y = char["origin"][1]
-                    # Extension-font origins can be above all of their ink.
-                    # Such a glyph is not an independent prose baseline.
-                    if char["bbox"][1] >= y - .3:
+                    # Extension origins can be above their ink, or within its
+                    # upper half (for example, a raised inline radical). Neither
+                    # is a body baseline; keep the ink for its owning prose row.
+                    if char["bbox"][1] >= y - .3 or y < (char["bbox"][1] + char["bbox"][3]) / 2:
                         continue
                     key = next((value for value in by_baseline if abs(value - y) < .3), y)
                     by_baseline.setdefault(key, []).append(char)
@@ -423,6 +659,37 @@ def _physical_text_lines(raw_lines: list[dict], em: float, left: float) -> list[
 def _layout_evidence(document, manifest: dict, log: str, positions: dict, geometry: dict, fail) -> tuple[list, list]:
     """Check physical-side headers and real PDF paragraph/list glyph placement."""
     import pymupdf
+    import unicodedata
+
+    fonts, ink_left, traced_glyphs = {}, {}, {}
+
+    def hanging_edge(number: int, body: list[dict]) -> float:
+        char = min(body, key=lambda item: item["origin"][0])
+        x = char["origin"][0]
+        # Wide opening punctuation is boundary-trimmed to its painted edge by
+        # the native CJK typesetter. Ordinary text retains its font side bearing.
+        if not (unicodedata.east_asian_width(char["c"]) in ("F", "W") and
+                unicodedata.category(char["c"]) in ("Ps", "Pi")):
+            return x
+        page = document[number - 1]
+        if number not in traced_glyphs:
+            traced_glyphs[number] = {(item[2], chr(item[0])): (span, item[1])
+                                     for span in page.get_texttrace() for item in span["chars"]}
+        span, glyph = traced_glyphs[number][char["origin"], char["c"]]
+        # Embedded subsets need the trace glyph ID, not a Unicode cmap lookup.
+        xref = next(font[0] for font in page.get_fonts()
+                    if font[3].split("+")[-1].removesuffix("-" + font[5]) == span["font"])
+        key = (xref, glyph)
+        if key not in ink_left:
+            if xref not in fonts:
+                fonts[xref] = pymupdf.Font(fontbuffer=document.extract_font(xref)[3])
+            identity = pymupdf.mupdf.FzMatrix(1, 0, 0, 1, 0, 0)
+            outline = pymupdf.mupdf.fz_outline_glyph(fonts[xref].this, glyph, identity)
+            # Font.glyph_bbox and rawdict x bounds can be advance/font-wide
+            # boxes even with TEXT_ACCURATE_BBOXES; bound the filled outline.
+            bounds = pymupdf.mupdf.fz_bound_path(outline, pymupdf.mupdf.FzStrokeState(None), identity)
+            ink_left[key] = bounds.x0
+        return x + span["size"] * ink_left[key]
 
     normalize = lambda text: "".join(text.split())
     epoch = positions.get("mainbody:start")
@@ -552,7 +819,7 @@ def _layout_evidence(document, manifest: dict, log: str, positions: dict, geomet
             for line in physical_lines:
                 if not baseline + .7 * em < line["baseline"] <= last_baseline + .4:
                     continue
-                x = min(char["origin"][0] for char in line["body"])
+                x = hanging_edge(number, line["body"])
                 continuation.append(x)
                 if abs(x - start["x_pt"]) > .5:
                     fail("typography", f"List {key} continuation does not hang beneath its text")

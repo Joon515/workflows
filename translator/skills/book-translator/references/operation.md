@@ -4,7 +4,7 @@
 
 Use the native resource-loading arrangements in [omp-contract.md](omp-contract.md): recommended published --plugin-dir startup loads skill and four task agents; an already-running parent may discover explicit project .omp/agents copies/links and read the skill manually. Both use the same built-in OMP task tool. Native OMP owns models/authentication/retries/fallback/settlement/journals; the translator owns book state and domain checks only.
 
-Run `python3 <skill>/scripts/translator.py doctor`. Python 3.10+ and the libraries pinned in [requirements.txt](../requirements.txt) are required. Install dependencies only into an authorized project environment. PDF composition requires XeLaTeX, the template TeX packages including `unicode-math` and `ucharclasses`, suitable Latin/CJK text fonts, all four JuliaMono TEXT styles listed below and Latin Modern Math selected by the TeX-resolved filename `latinmodern-math.otf`; latexmk is optional. Doctor reports missing prerequisites and never installs or changes global configuration.
+Run `python3 <skill>/scripts/translator.py doctor`. Python 3.10+ and the libraries pinned in [requirements.txt](../requirements.txt) are required. Install dependencies only into an authorized project environment. PDF composition requires XeLaTeX, the template TeX packages including `unicode-math` and `ucharclasses`, the exact text/math font files in the canonical profile below, and the LaTeX build/column/baselineattach output socket API; latexmk is optional. Doctor reports missing prerequisites and never installs or changes global configuration.
 
 OCR requires working Tesseract language data even when PyMuPDF bundles the engine. DjVu requires ddjvu. Missing capabilities block affected inputs. Do not install globally or upload sources without authorization. Local extraction does not make hosted-model translation local.
 
@@ -12,15 +12,21 @@ Use a fresh job directory outside the package, with explicit source/target langu
 
 ### Bounded non-CJK BODY text
 
-Keep ordinary ASCII BODY in Latin Modern Roman, CJK in Fandol, and the existing math selection/`mathrm`/`mathit`/`mathbf` aliases. The single production profile uses ucharclasses only for these eight Unicode blocks: `GreekAndCoptic` (U+0370–03FF), `PhoneticExtensions` (U+1D00–1D7F), `SuperscriptsAndSubscripts` (U+2070–209F), `LetterlikeSymbols` (U+2100–214F), `MathematicalOperators` (U+2200–22FF), `MiscellaneousTechnical` (U+2300–23FF), `LatinExtendedC` (U+2C60–2C7F) and `MathematicalAlphanumericSymbols` (U+1D400–1D7FF). These are ordinary-TEXT routes, not Unicode/input normalization, per-character replacements or a whole math font used as BODY.
+The single canonical profile in [translator.sty](../templates/translator.sty) selects Roman BODY with the four real text faces `FreeSerif.otf`, `FreeSerifBold.otf`, `FreeSerifItalic.otf` and `FreeSerifBoldItalic.otf`. There is no alternate font setting or compatibility profile. CJK remains Fandol; math symbols remain `latinmodern-math.otf`. Standard `setmathrm` explicitly restores the original Latin Modern Roman `mathrm`/`mathit`/`mathbf` text alphabets with the original regular/bold/italic optical-size ranges, including script sizes; changing BODY must not silently change these aliases to FreeSerif. Those ranges are maintained in the style, not in a second font-routing system.
 
-Doctor must resolve `ucharclasses.sty` and all four exact files through `kpsewhich`: `JuliaMono-Regular.ttf`, `JuliaMono-Bold.ttf`, `JuliaMono-RegularItalic.ttf`, `JuliaMono-BoldItalic.ttf`. Fontspec loads the four real TEXT styles directly; the separate JuliaMono LaTeX wrapper is not loaded. Complete transitions connect each routed block to every preexisting native class and boundary 4095, restoring the incoming NFSS family while retaining series/shape. Transitions between routed blocks keep that saved family. Existing CJK assignments and native class-pair token lists are retained; spaces, macros and style/group boundaries do not require source rewriting.
+All explicit faces must resolve by exact filename through `kpsewhich`, not an OS Fontconfig family-name fallback. In addition to the four FreeSerif faces and existing CJK/math/monospace requirements, doctor requires the optical Latin Modern faces: regular sizes 5, 6, 7, 8, 9, 10, 12 and 17 (`lmroman<size>-regular.otf`); bold sizes 5, 6, 7, 8, 9, 10 and 12 (`lmroman<size>-bold.otf`); italic sizes 7, 8, 9, 10 and 12 (`lmroman<size>-italic.otf`); and `lmroman10-bolditalic.otf`. These patterns describe exact filenames, not runtime wildcards. Missing any prerequisite makes `render.ready=false`.
+
+The installed TeX Live 2026 FreeSerif OTFs are the GNU FreeFont 2012 snapshot under `fonts/opentype/public/gnu-freefont/`: regular name-table version 0412.2263, bold/italic/bolditalic version 0412.2268. All four are real distinct faces with OS/2 embedding flags `fsType=0`, licensed GNU GPLv3 or later with the explicit font-embedding exception. Assess font-software redistribution/modification separately from document embedding. The installed ChangeLog begins 2012-04-22; this old shipped snapshot is not evidence of current upstream activity. [GNU FreeFont](https://www.gnu.org/software/freefont/) is the upstream project; the workflow bundles no font files and does not install them.
+
+The existing ucharclasses routing is limited to eight non-CJK ordinary-TEXT blocks: `GreekAndCoptic` (U+0370–03FF), `PhoneticExtensions` (U+1D00–1D7F), `SuperscriptsAndSubscripts` (U+2070–209F), `LetterlikeSymbols` (U+2100–214F), `MathematicalOperators` (U+2200–22FF), `MiscellaneousTechnical` (U+2300–23FF), `LatinExtendedC` (U+2C60–2C7F) and `MathematicalAlphanumericSymbols` (U+1D400–1D7FF). These are ordinary-TEXT routes, not Unicode/input normalization, character replacement maps or a math font used as BODY. Ordinary U+2032 PRIME and U+2003 EM SPACE stay in their native classes and use the main text face; no extra routing is added.
+
+Doctor must also resolve `ucharclasses.sty` and the four exact JuliaMono files: `JuliaMono-Regular.ttf`, `JuliaMono-Bold.ttf`, `JuliaMono-RegularItalic.ttf`, `JuliaMono-BoldItalic.ttf`. Fontspec loads the four real TEXT styles directly; the separate JuliaMono LaTeX wrapper is not loaded. Complete transitions connect each routed block to every preexisting native class and boundary 4095, restoring the incoming NFSS family while retaining series/shape. Transitions between routed blocks keep that saved family. Existing CJK assignments, native glue and class-pair token lists are retained; spaces, macros and style/group boundaries do not require source rewriting.
 
 Observed TeX Live 2026 provenance: TeX resolves the TTFs under `fonts/truetype/public/juliamono/` and ucharclasses under `tex/xelatex/ucharclasses/`. All four installed font name tables identify version 0.062 (the installed JuliaMono README dates that font release 2025/10), the JuliaMono Project Authors and [SIL Open Font License 1.1](https://scripts.sil.org/OFL); their OS/2 `fsType=0` sets no embedding restriction flag, and the ordinary-TEXT smoke embeds font subsets in its PDF. Document embedding does not turn the document into font software under OFL; redistribution/modification of font software remains subject to OFL terms. The wrapper package's separate LPPL license is not the TTF license. Upstream provenance is [the JuliaMono project](https://github.com/cormullion/juliamono), as recorded in the installed binary copyright metadata; no package/font download or global installation is performed by doctor.
 
 The installed ucharclasses identifies itself as 2.6.0 dated 2022-10-20, with Unicode 15.0 block definitions and a Public Domain license. Its installed README explicitly says it needs a maintainer and points to [upstream issue 23](https://github.com/Pomax/ucharclasses/issues/23). Record that maintenance warning rather than claiming current upstream support. These observed versions/licenses are not a guarantee about other environments or a bundled/pinned TeX distribution.
 
-JuliaMono's monospace shapes and distinct metrics can change spacing and line/page breaks in affected runs. The route does not promise every glyph in these blocks, coverage outside them, semantic correctness or whole-book typographic approval. Keep the existing `Missing character` rejection and verify actual current-PDF glyphs, emphasis, family restoration and layout for the intended corpus; dependency readiness or a syntax-only compile is not sufficient.
+FreeSerif deliberately changes ordinary Latin glyphs, space widths, x-height, kerning/ligatures and line/page breaks; JuliaMono retains its distinct monospace metrics in routed runs. Mixed CJK prose, headings, lists, tables, bibliography, captions and notes may all reflow. Unchanged paper, margins and em-based geometry do not preserve old pagination or previous whole-book layout approval. The selected prototype covered 1,584 ordinary input codepoints from its actual manuscript candidate in four styles and 28 bounded math rows, including optical-size aliases; this is not full prose-sequence, arbitrary Unicode/mathversion, semantic or whole-book layout proof. Keep the existing `Missing character` rejection and verify the actual current-PDF glyphs, semantic EM SPACE width, native glue, emphasis, macro/family restoration and complete manuscript layout; dependency readiness or a syntax-only compile is insufficient.
 
 ### Unicode mathematics
 
@@ -29,6 +35,8 @@ Diagnose math prerequisites through TeX file resolution: `kpsewhich unicode-math
 Valid protected math/variable values may contain Unicode mathematical symbols as well as allowed TeX commands. Preserve their sealed bytes and inline/display modes; repair a demonstrated template/font rendering defect in composition rather than escaping or replacing valid source merely to accommodate the old font. The Source3 font defect does not require Source4, resealing or rewriting checkpoint/history bytes.
 
 A successful syntax compile is insufficient: the existing `Missing character` build failure remains mandatory. Glyph coverage is not semantic parity, and changes to math fonts/metrics still require actual current-PDF typography and semantic review.
+
+Measured alignment, running-header attachment and local line-break opportunities follow the [canonical layout policy](format.md#measured-typography-and-local-inline-composition).
 
 ## Model intake and native configuration
 
@@ -68,9 +76,35 @@ task({
 
 Replace every descriptive path/ID and include the actual complete scope, commands/recipes, feedback and constraints in task itself before dispatch. Do not leave them solely in context or solutionSpace and do not instruct the worker to recover them from raw parent tool JSON. Use book-terminology, book-translation or book-review for the other roles. No hidden dispatch token, preparation step or translator-specific model parameter is involved. Workers complete the entire assigned scope, never samples. In unit mode only the controller merges canonical book-source.json, book.json or the whole-book review report. Eligible small whole-role workers receive their specific canonical output paths; terminology writes terms.json and handoff.md.
 
+### Native file and image I/O
+
+Use the actual absolute file path supplied in the task. In the current native JavaScript Eval surface, explicitly print the native read result:
+
+```javascript
+const ABSOLUTE = "/absolute/path/from/the/assignment.json";
+console.log(await tool.read({path: ABSOLUTE}));
+```
+
+Replace the example path before use. In the observed Term14 native session, JavaScript `display(r)` threw `ReferenceError`; `log(r)`, `log(JSON.stringify(await tool.read(...)))` and `log(await tool.bash(...))` produced no visible output. A bare awaited value does not display file text on this surface. The explicit `console.log(await tool.read({path: ABSOLUTE}));` recovery exposed the content. These are current observed surface behaviors, not universal claims across OMP versions; do not mistake a successful call without visible content for inspection.
+
+For structured JSON beyond a formatted preview, the native Eval `read(path)` helper returns the complete UTF-8 text. Parse it before printing selected fields; do not parse the annotated `tool.read(...).text` preview as if it were the original JSON:
+
+```javascript
+const packet = JSON.parse(await read(ABSOLUTE));
+for (const page of packet.pages) {
+  console.log({page_id: page.page_id, image: page.image, image_sha256: page.image_sha256});
+}
+```
+
+Resolve each actual relative packet path against the assigned job directory before opening its image. Print long source/protected strings separately under the chunking rule below. A clipped preview is not evidence that the file or write capability is unavailable.
+
 Long-line/source I/O: authoritative content is the complete file or parsed JSON payload, not a shortened rendered tool preview. This applies equally to source tokens, handoff prose and other long lines. Parsing JSON and then printing an entire long dictionary or line can still hide its contents. Inspect long text tokens or prose lines in bounded, unescaped Unicode chunks of at most 160 codepoints, labeling the token/index or file/line, start/end offsets and total length, or read the full saved artifact through explicit ranges. That bound leaves room for labels under the current 768-byte preview limit even for multibyte Unicode. Check every needed chunk and, for source JSON, the surrounding nontext token positions. Never infer missing source, invent an ellipsis or treat preview clipping as book damage; verify the full payload before stopping on a claimed source-data omission. Edit existing files surgically; never reconstruct untouched file content from rendered previews. Obtain complete parsed/raw string chunks before editing, then reload the written file and inspect its actual complete diff so only intended changes remain. Legitimate ellipses are allowed; neither an ellipsis glyph nor a particular line length is a corruption test. Report a genuine missing-data blocker only when the underlying complete payload, rather than its display, is actually incomplete.
 
-Native image inspection: use ordinary native read on the EXACT packet PNG paths, or use the ORIGINAL Python Eval prelude display(Image.open(path)) after importing Image from PIL. NEVER import display from IPython.display or shadow/rebind the native display helper: that replacement returns IPython handles rather than the native image payload in this environment. A successful call, printed Image object or handle is not actual pixel inspection. If the helper was shadowed, ordinary native read on each exact packet PNG is the direct recovery path; do not invent a tool wrapper or require an IPython installation. Keep the working recipe and actual paths in the coordinator's per-item task text, and record inspection only for images actually opened and inspected.
+For image inspection, use that same native read recipe with each EXACT assigned packet PNG path: native `tool.read` emits the actual image payload. Do not replace it with a printed image object, serialized result, IPython display import or custom wrapper. A successful call without visible pixels is not image inspection. Keep this canonical recipe and the actual paths in the coordinator's per-item task text, and record inspection only for images actually opened and inspected.
+
+For an assigned new filesystem result, native Eval also supports `await write(assignedResultPath, JSON.stringify(completeResult, null, 2) + "\n")`. This is native whole-file creation, not a shell/Python edit or a new executor. Supply the actual assigned path and complete model-authored contract object; preserve historical and sibling artifacts. This file helper does not send `agent://` messages: use the native Write tool for protocol targets.
+
+### Native completion and checkpointing
 
 Incremental authoring: workers may persist their own incomplete drafts in the currently assigned writable result/assets paths while completing a unit. Preserve such unadmitted progress for native continuation instead of requiring all writing to wait until the whole unit is finished. Do not overwrite any checkpointed artifact, canonical file or sibling output. A saved partial row set or inspection list is not an admissible result: do not checkpoint or report completion until every owned block/note, required metadata and inspection is present and the entire result satisfies the canonical contract. An actual successful native exit alone does not supply missing scope.
 
@@ -83,6 +117,21 @@ python3 <skill>/scripts/translator.py checkpoint-role <job> <role> --task-result
 ```
 
 A checkpoint validates completed book data, the expected agent/model metadata, bound inputs and coverage. It records native operator metadata/book progress, not independent engine-authentication, provider-request or visual-perception attestation. Native session/task journals remain native. Do not copy assistant/provider lifecycle capture into another required protocol. Missing actual settlement metadata remains a blocker to checkpointing; preserve authored work and native diagnostics rather than invent success.
+
+### Terminology schema validation
+
+Before a translated book exists, validate only the terminology document through the public core API. Replace `<SKILL>` with the actual absolute skill directory and `<JOB>` with the actual absolute job directory before running this recipe:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="<SKILL>/scripts" \
+  python3 -c 'from pathlib import Path; import core; core.validate_document("terms", core.load_json(Path("<JOB>") / "terms.json")); print("terms document valid")'
+```
+
+This checks the terms schema and document-local invariants, including unique IDs/numbers. It does not require translated-body term usage or prove authority, policy compatibility or terminology quality. There is no `translator.py validate --terms-only` command; ordinary translated-book `validate` requires the book and is not a substitute at this stage. Translated-book validation later checks used/missing terms and protected references.
+
+Derive recorded bindings from actual current files and receipts, and interpolate those values into authored text rather than manually retyping digest strings. Read back the output and compare each recorded binding with its actual value. Schema validation does not establish the factual correctness or semantic compatibility of English handoff prose.
+
+Read-only verification of retained terms or handoff policy is not native terminology authorship, a fresh role checkpoint or permission to silently carry old decisions into a new source/policy context. An authoring or revision task must cover the complete sealed aggregate source, every retained/new term decision and the whole handoff policy, not just a changed subset. Retaining valid term bytes is allowed or required by the applicable transition, but current compatibility judgments and handoff authorship must come from the selected native whole-role terminology task with its actual settled origin. See the [source-rebase contract](format.md#translation-rebase-after-source-revision) for its stricter entire-terms byte identity and explicit policy acceptance.
 
 ## Durable units and aggregate transitions
 

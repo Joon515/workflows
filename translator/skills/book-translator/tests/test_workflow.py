@@ -99,6 +99,18 @@ class DoctorPrerequisiteTests(unittest.TestCase):
                 self.assertIsNone(resources[missing])
                 self.assertTrue(all(value for name, value in resources.items() if name != missing))
 
+    def test_doctor_blocks_missing_roman_text_and_optical_math_faces(self):
+        self.assertTrue(self.doctor_with_missing()["render"]["ready"])
+        # Exercise body styles and distinct math-alphabet optical selections, not a resource-list snapshot.
+        for missing in ("FreeSerif.otf", "FreeSerifBold.otf", "FreeSerifItalic.otf", "FreeSerifBoldItalic.otf",
+                        "lmroman5-regular.otf", "lmroman17-regular.otf", "lmroman12-bold.otf",
+                        "lmroman7-italic.otf", "lmroman10-bolditalic.otf"):
+            with self.subTest(resource=missing):
+                report = self.doctor_with_missing(missing)
+                self.assertFalse(report["render"]["ready"])
+                self.assertIsNone(report["render"]["fonts"][missing])
+                self.assertTrue(all(value for name, value in report["render"]["fonts"].items() if name != missing))
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
