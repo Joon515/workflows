@@ -20,6 +20,7 @@ import core
 import translator as workflow
 import units
 import test_workflow as domain_fixtures
+import test_render as render_fixtures
 
 
 PROVIDER = "opencode-go"
@@ -175,6 +176,32 @@ class UnitContractTests(unittest.TestCase):
         self.admit_terminology(job)
         self.admit_translation(job, self.plan(job, "translation"), pdf_pages)
         return job
+
+    def graphic_translation_job(self, relation):
+        """Admit the canonical graphic fixture through real extraction-owned units."""
+        fixture = render_fixtures.make_graphic_boundary_job(
+            self.root / f"graphic-fixture-{self.case_number + 1}", relation)
+        job = self.new_job(page_count=3)
+        draft = core.load_json(fixture / "book-source.json")
+        pages = core.extraction_inventory(job)["pages"]
+        page_ids = {original["id"]: page["id"]
+                    for original, page in zip(draft["source_pages"], pages, strict=True)}
+        for block in draft["blocks"]:
+            block["source_pages"] = [page_ids[page] for page in block["source_pages"]]
+        for item in draft["blocks"] + draft["notes"]:
+            for token in item["source"]:
+                if "page" in token:
+                    token["page"] = page_ids[token["page"]]
+        draft["source_pages"] = []
+        core.save_json(fixture / "draft.json", draft)
+        source_plan = self.plan(job, draft=fixture / "draft.json")
+        for spec in source_plan["units"]:
+            prepared, _, _, output = self.prepare(job, "source", spec["unit_id"])
+            self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        workflow.seal_job(job)
+        self.admit_terminology(job)
+        return job, self.plan(job, "translation")
 
     def pending_translation_job(self, page_count=18, spans=None, terms=None, draft_update=None, source_update=None):
         job = self.new_job(page_count=page_count)
@@ -1521,6 +1548,77 @@ class UnitContractTests(unittest.TestCase):
         self.assertTrue(all(item["target"] for item in book["blocks"]))
     
     
+    def test_caption_before_graphic_page_token_rejects_complete_translation_before_publication(self):
+        for relation in (None, "column"):
+            with self.subTest(kind="image" if relation is None else "group"):
+                job, plan = self.graphic_translation_job(relation)
+                for spec in plan["units"]:
+                    prepared, _, packet, output = self.prepare(job, "translation", spec["unit_id"])
+                    for block in output["blocks"]:
+                        if block["id"] == "InlineBody":
+                            original = next(item for item in packet["blocks"] if item["id"] == block["id"])
+                            self.assertEqual(block["target"][0], original["source"][0])
+                            self.assertIn("page", block["target"][0])
+                            self.assertIn("text", block["target"][1])
+                            block["target"][0], block["target"][1] = block["target"][1], block["target"][0]
+                    self.finish(job, prepared, output)
+                progress = units.status(job, "translation")
+                self.assertTrue(progress["complete"])
+                self.assertEqual(progress["admitted"], [spec["unit_id"] for spec in plan["units"]])
+                self.assertFalse((job / "book.json").exists())
+                before = {path.relative_to(job).as_posix(): path.read_bytes()
+                          for path in job.rglob("*") if path.is_file()}
+                with patch("render.build", side_effect=synthetic_build), self.assertRaisesRegex(
+                        ValueError, "Graphic block InlineBody has inconsistent leading source/target page tokens"):
+                    workflow.assemble_units(job, "translation")
+                self.assertEqual({path.relative_to(job).as_posix(): path.read_bytes()
+                                  for path in job.rglob("*") if path.is_file()}, before)
+                self.assertFalse((job / "book.json").exists())
+                self.assertFalse(any(event["event"] in {"translation_content_authored", "stage_translation"}
+                                     for event in workflow.load_job(job)["history"]))
+
+    def test_exact_graphic_page_prefix_preserves_complete_translation_and_member_origins(self):
+        for relation in (None, "column"):
+            with self.subTest(kind="image" if relation is None else "group"):
+                job, plan = self.graphic_translation_job(relation)
+                source_bytes = (job / "book-source.json").read_bytes()
+                source = json.loads(source_bytes)
+                expected = copy.deepcopy(source)
+                for spec in plan["units"]:
+                    prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+                    for category in ("blocks", "notes"):
+                        for item in output[category]:
+                            next(original for original in expected[category] if original["id"] == item["id"]).update(item)
+                    expected.update(output.get("metadata", {}))
+                    self.finish(job, prepared, output)
+                members = [{"path": spec["checkpoint"], "sha256": workflow.digest_file(job / spec["checkpoint"])}
+                           for spec in plan["units"]]
+                evidence = {name: (job / name).read_bytes() for spec in plan["units"]
+                            for name in (spec["packet"], spec["result"], spec["checkpoint"])}
+                with patch("render.build", side_effect=synthetic_build):
+                    result = workflow.assemble_units(job, "translation")
+                self.assertEqual((result["state"], result["round"]), ("translated", 1))
+                book = core.validate_book(job, translated=True)
+                self.assertEqual(book, expected)
+                graphic = next(block for block in book["blocks"] if block["id"] == "InlineBody")
+                self.assertEqual(graphic["target"][0], graphic["source"][0])
+                self.assertEqual([token for token in graphic["target"] if "page" in token],
+                                 [token for token in graphic["source"] if "page" in token])
+                current = workflow.load_job(job)
+                authored = [event for event in current["history"] if event["event"] == "translation_content_authored"]
+                self.assertEqual(len(authored), 1)
+                aggregate = core.load_json(job / authored[0]["receipt"])
+                self.assertEqual(aggregate["unit_checkpoints"], members)
+                self.assertEqual(aggregate["merged_document"], "book.json")
+                self.assertEqual(aggregate["merged_document_sha256"], workflow.digest_file(job / "book.json"))
+                self.assertEqual(aggregate["content_digest"], core.content_digest(job))
+                units.validate_aggregate(job, aggregate, "translation")
+                workflow.translation_ready(job, current)
+                self.assertEqual((job / "book-source.json").read_bytes(), source_bytes)
+                for name, content in evidence.items():
+                    self.assertEqual((job / name).read_bytes(), content, name)
+
+
     def test_duplicate_source_page_union_cannot_merge(self):
         job = self.new_job()
         plan = self.plan(job)

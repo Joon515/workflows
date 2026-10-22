@@ -2086,6 +2086,10 @@ def assemble_units(job, role: str) -> dict:
         core._validate_structure(document, job, terms, role == "translation", languages_differ=source_language != target_language)
         if role == "translation" and core._immutable(document) != core._immutable(core.load_json(job / "book-source.json")):
             raise ValueError("Assembled translation changed immutable source")
+        if role == "translation":
+            import render
+
+            render._source_page_plan(document)
         name = "book-source.json" if role == "source" else "book.json"
     core.save_json(_path(job, name), document)
     aggregate = {"version": 1, "kind": "unit-role-completed", "execution": "units", "role": role,
