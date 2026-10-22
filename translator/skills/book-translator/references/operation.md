@@ -6,6 +6,8 @@ Use the native resource-loading arrangements in [omp-contract.md](omp-contract.m
 
 Run `python3 <skill>/scripts/translator.py doctor`. Python 3.10+ and the libraries pinned in [requirements.txt](../requirements.txt) are required. Install dependencies only into an authorized project environment. PDF composition requires XeLaTeX, the template TeX packages including `unicode-math` and `ucharclasses`, the exact text/math font files in the canonical profile below, and the LaTeX build/column/baselineattach output socket API; latexmk is optional. Doctor reports missing prerequisites and never installs or changes global configuration.
 
+Doctor checks static dependency resolution; it does not replace the compiler-time [native seam compatibility boundary](format.md#literal-preserving-seam-compatibility). An unsupported xeCJK profile is an explicit composition blocker, not permission to alter book data or disable verification.
+
 OCR requires working Tesseract language data even when PyMuPDF bundles the engine. DjVu requires ddjvu. Missing capabilities block affected inputs. Do not install globally or upload sources without authorization. Local extraction does not make hosted-model translation local.
 
 Use a fresh job directory outside the package, with explicit source/target languages and PDF, EPUB, MOBI or DjVu input. Init copies and hashes the original; do not overwrite an existing job. Assets remain inside the job. Dependency upgrades require relevant full tests and copy/compile smoke by the verification owner; do not silently change the executed OMP contract.

@@ -78,6 +78,65 @@
   \textbf{\textit{\CJKfamily{BTTerm}#1\nobreak\usebox{\BTTempBox}}}\endgroup}
 % Preserve a literal compound hyphen while restoring native word hyphenation.
 \newcommand{\BTLiteralHyphen}{\leavevmode\nobreak\hskip0pt-\discretionary{}{}{}\nobreak\hskip0pt\relax}
+% Strict protected-name seam: the source hyphen is the only legal split.
+\newcommand{\BTNameHyphen}{\char45{}\nobreak\hskip0pt plus1fil\penalty1000\hskip0pt plus-1fil\relax}
+% The arm must not add a node before xeCJK computes its native opener glue.
+% Compatibility boundary: xeCJK 3.9.1 (2022/08/05), three private callbacks.
+\RequirePackage{xeCJK}
+\ExplSyntaxOn
+\msg_new:nnn { book-translator } { unsupported-xecjk }
+  { Unsupported~xeCJK~opener~callback~#1.~Review~the~native~FullLeft~glue~contract. }
+\str_if_eq:eeF { \use:c { ver@xeCJK.sty } }
+  { 2022/08/05~v3.9.1~Typesetting~CJK~scripts~with~XeLaTeX }
+  { \msg_fatal:nnn { book-translator } { unsupported-xecjk } { version } }
+% Exact protected meanings check both signature and native glue implementation.
+\cs_new_protected:Npn \__bt_native_cjk_fullleft_glue:N #1
+  {
+    \CJKglue
+    \__xeCJK_punct_glue:NN \c__xeCJK_left_tl #1
+  }
+\cs_new_protected:Npn \__bt_native_boundary_fullleft_glue:N #1
+  {
+    \tl_set_eq:NN \l__xeCJK_alignii_tl \c__xeCJK_left_tl
+    \group_begin: \exp_args:NNc \group_end: \cs_if_exist_use:NTF
+      { __xeCJK_bound_type_ \int_use:N \tex_lastnodetype:D _glue:Nn }
+      {#1}
+      { \use:n }
+      { \__xeCJK_punct_glue:NN \c__xeCJK_left_tl #1 }
+  }
+\cs_new_protected:Npn \__bt_native_default_fullleft_glue:N #1
+  { \__xeCJK_punct_glue:NN \c__xeCJK_left_tl #1 }
+\cs_if_eq:NNF \__bt_native_cjk_fullleft_glue:N \__xeCJK_CJK_and_FullLeft_glue:N
+  { \msg_fatal:nnn { book-translator } { unsupported-xecjk } { CJK } }
+\cs_if_eq:NNF \__bt_native_boundary_fullleft_glue:N \__xeCJK_Boundary_and_FullLeft_glue:N
+  { \msg_fatal:nnn { book-translator } { unsupported-xecjk } { Boundary } }
+\cs_if_eq:NNF \__bt_native_default_fullleft_glue:N \__xeCJK_Default_and_FullLeft_glue:N
+  { \msg_fatal:nnn { book-translator } { unsupported-xecjk } { Default } }
+\cs_set_eq:NN \__bt_native_cjk_fullleft_glue:N \__xeCJK_CJK_and_FullLeft_glue:N
+\cs_set_eq:NN \__bt_native_boundary_fullleft_glue:N \__xeCJK_Boundary_and_FullLeft_glue:N
+\cs_set_eq:NN \__bt_native_default_fullleft_glue:N \__xeCJK_Default_and_FullLeft_glue:N
+\bool_new:N \g__bt_math_opener_armed_bool
+\cs_new_protected:Npn \__bt_emit_armed_math_opener:
+  {
+    \bool_if:NT \g__bt_math_opener_armed_bool
+      {
+        \bool_gset_false:N \g__bt_math_opener_armed_bool
+        \nobreak\hskip0pt~plus1fil\penalty1000\hskip0pt~plus-1fil\relax
+      }
+  }
+\cs_set_protected:Npn \__xeCJK_CJK_and_FullLeft_glue:N #1
+  { \__bt_native_cjk_fullleft_glue:N #1 \__bt_emit_armed_math_opener: }
+\cs_set_protected:Npn \__xeCJK_Boundary_and_FullLeft_glue:N #1
+  { \__bt_native_boundary_fullleft_glue:N #1 \__bt_emit_armed_math_opener: }
+\cs_set_protected:Npn \__xeCJK_Default_and_FullLeft_glue:N #1
+  { \__bt_native_default_fullleft_glue:N #1 \__bt_emit_armed_math_opener: }
+% Plain macros consume the empty argument without xparse's boundary-changing
+% parsing layer or an executed group before the actual opener glyph.
+\cs_new_protected:Npn \BTArmMathOpener #1
+  { \bool_gset_true:N \g__bt_math_opener_armed_bool }
+\cs_new_protected:Npn \BTDisarmMathOpener #1
+  { \bool_gset_false:N \g__bt_math_opener_armed_bool }
+\ExplSyntaxOff
 \setlength{\parindent}{2em}
 \setlength{\parskip}{3pt}
 \setlength{\emergencystretch}{1em}

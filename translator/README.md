@@ -71,6 +71,8 @@ The canonical Roman BODY family is **FreeSerif**, using four real regular/bold/i
 
 FreeSerif changes ordinary Latin shapes, spaces, kerning and line/page breaks, including mixed CJK text, headings, lists, tables, bibliography, captions and notes. Old pagination and previous whole-book layout approval do not survive this cutover; unchanged paper, margins and em-based geometry do not imply unchanged fit. These fonts/packages are external environment dependencies, not bundled assets or claims of current upstream maintenance. Bounded glyph/math evidence is not universal Unicode coverage or whole-book approval: retain the existing `Missing character` build rejection and review the actual current PDF.
 
+The typed opener fallback uses a deliberately bounded [native xeCJK compatibility profile](skills/book-translator/references/format.md#literal-preserving-seam-compatibility). Static prerequisite readiness does not replace the style-load/compiler check; unsupported native interfaces fail explicitly.
+
 PyMuPDF/MuPDF uses AGPL or commercial licensing; independently assess compatibility with intended distribution/service use. Other dependencies retain their licenses. The package ships no upstream binaries, OCR language data or third-party books.
 
 ## Operations and artifacts

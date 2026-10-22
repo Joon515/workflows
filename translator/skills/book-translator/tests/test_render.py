@@ -1875,6 +1875,503 @@ class RenderTests(unittest.TestCase):
                                report["compiled_geometry_pt"]["text_width"])
         self.assertFalse((job / "output.pdf").exists())
 
+    def remaining_overflow_root(self, name):
+        """Keep opt-in focused evidence outside the disposable unittest job."""
+        import os
+        evidence = os.environ.get("BT_REMAINING_OVERFLOW_EVIDENCE")
+        return (Path(evidence).resolve() / (self._testMethodName + "-" + name)
+                if evidence else self.job / name)
+
+    def save_remaining_overflow_pdf(self, root, pdf):
+        """Retain actual painted pages, glyph identities and per-glyph ink counts."""
+        import pymupdf
+        evidence = []
+        with pymupdf.open(pdf) as document:
+            for page in document:
+                page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).save(
+                    root / ("actual-page-%02d.png" % (page.number + 1)))
+                glyphs = []
+                for trace in page.get_texttrace():
+                    for char in trace["chars"]:
+                        symbol = chr(char[0])
+                        if not symbol.strip():
+                            continue
+                        self.assertGreater(char[1], 0, symbol + " must not be .notdef")
+                        self.assertEqual(trace["type"], 0)
+                        self.assertGreater(trace["opacity"], 0)
+                        ink = page.get_pixmap(matrix=pymupdf.Matrix(3, 3),
+                                              clip=pymupdf.Rect(char[3]), colorspace=pymupdf.csGRAY,
+                                              alpha=False)
+                        painted = sum(value < 200 for value in ink.samples)
+                        self.assertGreater(painted, 2, symbol + " must paint actual ink")
+                        glyphs.append({"symbol": symbol, "font": trace["font"], "glyph": char[1],
+                                       "size_pt": trace["size"], "origin_pt": char[2],
+                                       "bounds_pt": char[3], "ink_pixels_at_216dpi": painted})
+                evidence.append({"page": page.number + 1, "glyphs": glyphs})
+        core.save_json(root / "actual-glyph-and-ink-evidence.json", {"pages": evidence})
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for actual slash seam evidence")
+    def test_remaining_ordinary_slash_wraps_without_changing_literal_consumers(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        compound = "input/output"
+        url = "https://www.example.org/input/output"
+        book["protected"] = [{"id": "Literal", "kind": "name", "value": compound},
+                             {"id": "Code", "kind": "code", "value": compound}]
+        cases = [("Ordinary", [{"text": compound}], render.escape(compound)),
+                 ("Literal", [{"protected": "Literal"}], render._literal_text(compound)),
+                 ("Code", [{"protected": "Code"}], r"{\ttfamily " + compound + "}"),
+                 ("Url", [{"text": url}], render._literal_text(url)),
+                 ("NbspBefore", [{"text": "input\u00a0/output"}], "input\u00a0/output"),
+                 ("NbspAfter", [{"text": "input/\u00a0output"}], "input/\u00a0output")]
+        body = [r"\newdimen\BTSlashMeasure\begin{document}\pagestyle{empty}"]
+        for style, command in enumerate((r"\normalfont", r"\normalfont\bfseries",
+                                         r"\normalfont\itshape", r"\normalfont\bfseries\itshape")):
+            if style:
+                body.append(r"\clearpage")
+            body.append("{" + command)
+            for label, tokens, native in cases:
+                actual = render._Renderer(self.job, book, {"terms": []}).inline(tokens)
+                for suffix, tex in (("N", native), ("P", actual)):
+                    body.append(r"\BTTestMetric{" + str(style) + label + suffix + "}{" + tex + "}")
+                    body.append(r"\noindent\makebox[80pt][l]{" + label + suffix + r"}\hbox{" + tex + r"}\par\vspace{5pt}")
+            actual = render._Renderer(self.job, book, {"terms": []}).inline([{"text": compound}])
+            body.append(r"\sbox{\BTTempBox}{output}\BTSlashMeasure=\wd\BTTempBox")
+            body.append(r"\noindent\makebox[80pt][l]{Wrap}\begin{minipage}[t]{\dimexpr\BTSlashMeasure+1pt\relax}"
+                        r"\parindent=0pt\noindent " + actual + r"\par\end{minipage}\par\vspace{15pt}")
+            actual_url = render._Renderer(self.job, book, {"terms": []}).inline([{"text": url}])
+            body.append(r"\BTSlashMeasure=0pt")
+            for piece in re.findall(r"[^./]*[./]|[^./]+$", url):
+                body.append(r"\sbox{\BTTempBox}{" + render._literal_text(piece) +
+                            r"}\ifdim\wd\BTTempBox>\BTSlashMeasure\BTSlashMeasure=\wd\BTTempBox\fi")
+            body.append(r"\noindent\makebox[80pt][l]{UrlWrap}\begin{minipage}[t]{\dimexpr\BTSlashMeasure+1pt\relax}"
+                        r"\parindent=0pt\noindent " + actual_url + r"\par\end{minipage}\par}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture(self.remaining_overflow_root("slash"), body)
+        self.assertNotIn("Missing character:", log)
+        metrics = {key: int(value) for key, value in re.findall(r"BTFONTMETRIC\|([^|\s]+)\|(\d+)", log)}
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), 4)
+            for style, page in enumerate(document):
+                for label, _, _ in cases:
+                    native = self.font_row_glyphs(page, label + "N")
+                    actual = self.font_row_glyphs(page, label + "P")
+                    self.assertEqual([(s, t["font"], c[1], t["size"]) for s, t, c in actual],
+                                     [(s, t["font"], c[1], t["size"]) for s, t, c in native])
+                    self.assertAlmostEqual(metrics[str(style) + label + "N"],
+                                           metrics[str(style) + label + "P"], delta=2)
+                    for (_, _, a), (_, _, n) in zip(actual, native):
+                        self.assertAlmostEqual(a[2][0] - actual[0][2][2][0],
+                                               n[2][0] - native[0][2][2][0], delta=.02)
+                marker, = [word for word in page.get_text("words") if word[4] == "Wrap"]
+                url_marker, = [word for word in page.get_text("words") if word[4] == "UrlWrap"]
+                chars = [(chr(c[0]), c) for t in page.get_texttrace() for c in t["chars"]
+                         if c[2][0] > marker[2] + .5 and marker[1] <= c[2][1] < url_marker[1] - 5 and chr(c[0]).strip()]
+                lines = ["".join(s for s, c in chars if abs(c[2][1] - y) < .05)
+                         for y in sorted({round(c[2][1], 2) for _, c in chars})]
+                self.assertEqual(lines, ["input/", "output"])
+                url_chars = [(chr(c[0]), c) for t in page.get_texttrace() for c in t["chars"]
+                             if c[2][0] > url_marker[2] + .5 and c[2][1] >= url_marker[1] and chr(c[0]).strip()]
+                url_lines = ["".join(s for s, c in url_chars if abs(c[2][1] - y) < .05)
+                             for y in sorted({round(c[2][1], 2) for _, c in url_chars})]
+                self.assertGreater(len(url_lines), 1)
+                self.assertEqual("".join(url_lines), url)
+                self.assertTrue(all(line.endswith((".", "/")) for line in url_lines[:-1]), url_lines)
+                evidence.append({"style": style, "wrapped_lines": lines, "url_lines": url_lines})
+        core.save_json(root / "slash-consumer-evidence.json", {"metrics_sp": metrics, "cases": evidence})
+        self.save_remaining_overflow_pdf(root, root / "book.pdf")
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for original-name seam evidence")
+    def test_remaining_source_hyphen_names_wrap_only_at_original_seams_in_all_styles(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        names = ("Kernighan-Lin", "Fiduccia-Mattheyses", "Kernighan-Lin-Fiduccia")
+        book["protected"] = [{"id": "Name" + str(i), "kind": "name", "value": name}
+                             for i, name in enumerate(names)]
+        body = [r"\newdimen\BTNameMeasure\begin{document}\pagestyle{empty}"]
+        for style, command in enumerate((r"\normalfont", r"\normalfont\bfseries",
+                                         r"\normalfont\itshape", r"\normalfont\bfseries\itshape")):
+            if style:
+                body.append(r"\clearpage")
+            body.append("{" + command)
+            for index, name in enumerate(names):
+                native = render._literal_text(name)
+                actual = render._Renderer(self.job, book, {"terms": []}).inline([{"protected": "Name" + str(index)}])
+                for suffix, tex in (("N", native), ("P", actual)):
+                    label = "Name" + str(index) + suffix
+                    body.append(r"\BTTestMetric{" + str(style) + label + "}{" + tex + "}")
+                    body.append(r"\noindent\makebox[60pt][l]{" + label + r"}\hbox{" + tex + r"}\par\vspace{5pt}")
+                body.append(r"\BTNameMeasure=0pt")
+                for constituent in name.split("-"):
+                    body.append(r"\sbox{\BTTempBox}{" + render._literal_text(constituent + "-") +
+                                r"}\ifdim\wd\BTTempBox>\BTNameMeasure\BTNameMeasure=\wd\BTTempBox\fi")
+                body.append(r"\noindent\makebox[60pt][l]{Wrap" + str(index) +
+                            r"}\begin{minipage}[t]{\dimexpr\BTNameMeasure+1pt\relax}\parindent=0pt\noindent " +
+                            actual + r"\par\end{minipage}\par\vspace{16pt}")
+            body.append("}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture(self.remaining_overflow_root("source-names"), body)
+        self.assertNotIn("Missing character:", log)
+        metrics = {key: int(value) for key, value in re.findall(r"BTFONTMETRIC\|([^|\s]+)\|(\d+)", log)}
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), 4)
+            fonts = set()
+            for style, page in enumerate(document):
+                for index, name in enumerate(names):
+                    native = self.font_row_glyphs(page, "Name" + str(index) + "N")
+                    actual = self.font_row_glyphs(page, "Name" + str(index) + "P")
+                    signature = lambda chars: [(s, t["font"], c[1], t["size"]) for s, t, c in chars if s.strip()]
+                    self.assertEqual("".join(s for s, _, _ in native), name)
+                    self.assertEqual(signature(actual), signature(native))
+                    fonts.add(native[0][1]["font"])
+                    self.assertAlmostEqual(metrics[str(style) + "Name" + str(index) + "N"],
+                                           metrics[str(style) + "Name" + str(index) + "P"], delta=2)
+                    for (_, _, a), (_, _, n) in zip(actual, native):
+                        self.assertAlmostEqual(a[2][0] - actual[0][2][2][0],
+                                               n[2][0] - native[0][2][2][0], delta=.02)
+                    marker, = [word for word in page.get_text("words") if word[4] == "Wrap" + str(index)]
+                    next_marker = page.search_for("Name" + str(index + 1) + "N") if index + 1 < len(names) else []
+                    end = next_marker[0].y0 - 4 if next_marker else page.rect.height
+                    wrapped = [(chr(c[0]), t, c) for t in page.get_texttrace() for c in t["chars"]
+                               if c[2][0] > marker[2] + .5 and marker[1] <= c[2][1] < end and chr(c[0]).strip()]
+                    self.assertEqual(signature(wrapped), signature(native), "No constituent hyphen may be invented")
+                    lines = ["".join(s for s, _, c in wrapped if abs(c[2][1] - y) < .05)
+                             for y in sorted({round(c[2][1], 2) for _, _, c in wrapped})]
+                    self.assertGreater(len(lines), 1)
+                    self.assertTrue(all(line.endswith("-") for line in lines[:-1]), lines)
+                    self.assertEqual("".join(lines), name)
+                    evidence.append({"style": style, "name": name, "lines": lines})
+            self.assertEqual(fonts, {"FreeSerif", "FreeSerifBold", "FreeSerifItalic", "FreeSerifBoldItalic"})
+        core.save_json(root / "source-name-consumer-evidence.json", {"metrics_sp": metrics, "cases": evidence})
+        self.save_remaining_overflow_pdf(root, root / "book.pdf")
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for native FullLeft glue and glyph evidence")
+    def test_remaining_generated_opener_preserves_native_glue_glyphs_and_line_ownership(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        formula = r"\mathrm{M}+\mathrm{N}"
+        book["protected"] = [{"id": "Math", "kind": "math", "value": formula}]
+        cases = [("Cjk", [{"text": "甲（"}], "甲（"),
+                 ("Default", [{"text": "A（"}], "A（"),
+                 ("Boundary", [{"text": "甲"}, {"page": "P1"}, {"text": "（"}],
+                  r"甲\BTPosition{native-boundary}（")]
+        # Record actual dispatch, not a callback-identity acceptance rule.
+        # Generated seams may use native Boundary predecessor recovery. The
+        # consumer invariant is the complete natural/stretch/shrink geometry.
+        # Observe only after compatibility setup; delegation adds no nodes.
+        body = [r"\def\BTTestCase{setup}\ExplSyntaxOn"]
+        for path in ("CJK", "Boundary", "Default"):
+            body.append(r"\cs_new_eq:cc {bt_test_" + path + r":N}{__xeCJK_" + path + r"_and_FullLeft_glue:N}")
+            body.append(r"\cs_set_protected:cpn {__xeCJK_" + path + r"_and_FullLeft_glue:N} #1"
+                        r"{\typeout{BTOPENERPATH|" + path + r"|\BTTestCase|"
+                        r"\bool_if:NTF\g__bt_math_opener_armed_bool{armed}{idle}}"
+                        r"\use:c{bt_test_" + path + r":N}#1}")
+        body.extend([r"\ExplSyntaxOff\begin{document}\pagestyle{empty}",
+                     r"\xeCJKsetup{CJKglue={\hskip3pt plus2pt minus1pt},CJKecglue={\hskip4pt plus3pt minus2pt}}"])
+        for style, command in enumerate((r"\normalfont", r"\normalfont\bfseries",
+                                         r"\normalfont\itshape", r"\normalfont\bfseries\itshape")):
+            if style:
+                body.append(r"\clearpage")
+            body.append("{" + command)
+            for label, prefix, native_prefix in cases:
+                tokens = prefix + [{"protected": "Math"}, {"text": "）后"}]
+                actual = render._Renderer(self.job, book, {"terms": []}).inline(tokens)
+                native = native_prefix + r"\(" + formula + r"\)）后"
+                for mode, adjustment in (("U", None), ("S", "+2pt"), ("C", "-1pt")):
+                    for suffix, tex in (("N", native), ("P", actual)):
+                        key = label + mode + suffix
+                        body.append(r"\def\BTTestCase{" + str(style) + key + "}")
+                        body.append(r"\BTTestMetric{" + str(style) + key + "}{" + tex + "}")
+                        target = "" if adjustment is None else r" to \dimexpr\wd0" + adjustment + r"\relax"
+                        body.append(r"\setbox0=\hbox{" + native + "}")
+                        body.append(r"\noindent\makebox[80pt][l]{" + key + r"}\hbox" + target +
+                                    "{" + tex + r"}\par\vspace{5pt}")
+            body.append("}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture(self.remaining_overflow_root("opener-native-glue"), body)
+        self.assertNotIn("Missing character:", log)
+        paths = re.findall(r"BTOPENERPATH\|([^|]+)\|([^|]+)\|(armed|idle)", log)
+
+        metrics = {key: int(value) for key, value in re.findall(r"BTFONTMETRIC\|([^|\s]+)\|(\d+)", log)}
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), 4)
+            for style, page in enumerate(document):
+                for label, _, _ in cases:
+                    for mode in ("U", "S", "C"):
+                        key = label + mode
+                        native = self.font_row_glyphs(page, key + "N")
+                        actual = self.font_row_glyphs(page, key + "P")
+                        self.assertEqual([(s, t["font"], c[1], t["size"]) for s, t, c in actual],
+                                         [(s, t["font"], c[1], t["size"]) for s, t, c in native])
+                        self.assertAlmostEqual(metrics[str(style) + key + "N"],
+                                               metrics[str(style) + key + "P"], delta=2)
+                        for (_, _, a), (_, _, n) in zip(actual, native):
+                            self.assertAlmostEqual(a[2][0] - actual[0][2][2][0],
+                                                   n[2][0] - native[0][2][2][0], delta=.02,
+                                                   msg="Native natural, stretch and shrink glue must all survive")
+                        self.assertEqual({t["font"] for s, t, _ in actual if s in "MN"}, {"LMRoman10-Regular"})
+                        evidence.append({"style": style, "path": label, "mode": mode,
+                                         "native_width_sp": metrics[str(style) + key + "N"],
+                                         "actual_width_sp": metrics[str(style) + key + "P"]})
+        core.save_json(root / "native-glue-consumer-evidence.json", {"paths": paths, "cases": evidence})
+        self.save_remaining_overflow_pdf(root, root / "book.pdf")
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for typed opener fallback evidence")
+    def test_remaining_opener_fallback_keeps_math_contiguous_and_internal_breaks_native(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        atom = r"\mathrm{" + "M" * 16 + "}"
+        internal = "+".join(r"\mathrm{M}" for _ in range(48))
+        book["protected"] = [{"id": "Atom", "kind": "math", "value": atom},
+                             {"id": "Sum", "kind": "math", "value": internal}]
+        body = [r"\newdimen\BTOpenerMeasure\begin{document}\pagestyle{empty}"]
+        for label, prefix in (("Cjk", [{"text": "甲" * 8 + "（"}]), ("Default", [{"text": "A" * 12 + "（"}]),
+                              ("Boundary", [{"text": "甲" * 8}, {"page": "P1"}, {"text": "（"}])):
+            actual = render._Renderer(self.job, book, {"terms": []}).inline(
+                prefix + [{"text": ""}, {"page": "P2"}, {"protected": "Atom"}, {"text": "）"}])
+            self.assertIn(r"\(" + atom + r"\)", actual, "The exact math value must remain one contiguous native run")
+            body.append(r"\sbox{\BTTempBox}{（\(" + atom + r"\)）}\BTOpenerMeasure=\wd\BTTempBox")
+            body.append(r"\noindent\makebox[70pt][l]{" + label +
+                        r"}\begin{minipage}[t]{\dimexpr\BTOpenerMeasure+1pt\relax}\parindent=0pt\noindent " +
+                        actual + r"\par\end{minipage}\par\vspace{20pt}")
+        body.append(r"\clearpage")
+        for label, tex in (("Native", "甲（" + r"\(" + internal + r"\)）后文。"),
+                           ("Policy", render._Renderer(self.job, book, {"terms": []}).inline(
+                               [{"text": "甲（"}, {"protected": "Sum"}, {"text": "）后文。"}]))):
+            if label == "Policy":
+                body.append(r"\clearpage")
+                self.assertIn(r"\(" + internal + r"\)", tex)
+            body.append(r"\BTParagraph{" + label + "}{" + tex + "}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture(self.remaining_overflow_root("opener-fallback"), body)
+        self.assertNotIn("Missing character:", log)
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), 3)
+            page = document[0]
+            markers = [next(word for word in page.get_text("words") if word[4] == label)
+                       for label in ("Cjk", "Default", "Boundary")]
+            for index, marker in enumerate(markers):
+                end = markers[index + 1][1] - 5 if index < 2 else page.rect.height
+                glyphs = [(chr(c[0]), t, c) for t in page.get_texttrace() for c in t["chars"]
+                          if c[2][0] > marker[2] + .5 and marker[1] <= c[2][1] < end and chr(c[0]).strip()]
+                self.assertEqual("".join(s for s, _, _ in glyphs), ("A" * 12 if index == 1 else "甲" * 8) + "（" + "M" * 16 + "）")
+                opener, = [c for s, _, c in glyphs if s == "（"]
+                math = [(t, c) for s, t, c in glyphs if s == "M"]
+                self.assertGreater(opener[2][1], glyphs[0][2][2][1] + 5,
+                                   "The pre-opener fallback must actually move the intact opener/math run")
+                self.assertTrue(all(abs(c[2][1] - opener[2][1]) < .02 for _, c in math))
+                self.assertEqual({t["font"] for t, _ in math}, {"LMRoman10-Regular"})
+                lines = ["".join(s for s, _, c in glyphs if abs(c[2][1] - y) < .05)
+                         for y in sorted({round(c[2][1], 2) for _, _, c in glyphs})]
+                self.assertTrue(all(not line.endswith("（") for line in lines), lines)
+                evidence.append({"path": marker[4], "lines": lines})
+            signatures = []
+            for page in (document[1], document[2]):
+                chars = [(chr(c[0]), t, c) for t in page.get_texttrace() for c in t["chars"] if chr(c[0]).strip()]
+                math = [(t, c) for s, t, c in chars if s == "M"]
+                self.assertEqual(len(math), 48)
+                self.assertGreater(len({round(c[2][1], 2) for _, c in math}), 2)
+                signatures.append([(s, t["font"], c[1], round(c[2][0] - chars[0][2][2][0], 2),
+                                    round(c[2][1] - chars[0][2][2][1], 2)) for s, t, c in chars])
+            self.assertEqual([entry[:3] for entry in signatures[0]], [entry[:3] for entry in signatures[1]])
+            for native, actual in zip(*signatures):
+                for axis in (3, 4):
+                    self.assertAlmostEqual(native[axis], actual[axis], delta=.02,
+                                           msg="Native internal math breaks and glyph positions must survive")
+        core.save_json(root / "opener-fallback-evidence.json", {"cases": evidence, "internal_signatures": signatures})
+        self.save_remaining_overflow_pdf(root, root / "book.pdf")
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for unchanged negative opener consumers")
+    def test_remaining_unsupported_opener_neighbors_are_native_and_cannot_leak_an_arm(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        formula = r"\mathrm{M}"
+        book["protected"] = [{"id": "Math", "kind": "math", "value": formula},
+                             {"id": "Close", "kind": "math", "value": r"\mathclose{\rbrace}"},
+                             {"id": "Literal", "kind": "name", "value": "甲（"}]
+        cases = [("Ascii", [{"text": "A("}, {"protected": "Math"}, {"text": ")后"}],
+                  r"A(\(" + formula + r"\))后"),
+                 ("Nbsp", [{"text": "A\u00a0（"}, {"protected": "Math"}, {"text": "）后"}],
+                  "A\u00a0（" + r"\(" + formula + r"\)）后"),
+                 ("Space", [{"text": "甲（ "}, {"protected": "Math"}, {"text": "）后"}],
+                  "甲（ " + r"\(" + formula + r"\)）后"),
+                 ("Unsafe", [{"text": "甲（"}, {"protected": "Close"}, {"text": "）后"}],
+                  r"甲（\(\mathclose{\rbrace}\)）后"),
+                 ("Literal", [{"protected": "Literal"}, {"protected": "Math"}, {"text": "）后"}],
+                  r"甲（\(" + formula + r"\)）后")]
+        body = [r"\def\BTTestCase{setup}\ExplSyntaxOn",
+                r"\cs_new_eq:NN\bt_test_emit:\__bt_emit_armed_math_opener:",
+                r"\cs_set_protected:Npn\__bt_emit_armed_math_opener:"
+                r"{\bool_if:NT\g__bt_math_opener_armed_bool{\typeout{BTUNEXPECTEDARM|\BTTestCase}}\bt_test_emit:}",
+                r"\ExplSyntaxOff\begin{document}\pagestyle{empty}"]
+        for label, tokens, native in cases:
+            actual = render._Renderer(self.job, book, {"terms": []}).inline(tokens)
+            for suffix, tex in (("N", native), ("P", actual)):
+                key = label + suffix
+                body.append(r"\def\BTTestCase{" + key + "}")
+                body.append(r"\BTTestMetric{" + key + "}{" + tex + "}")
+                body.append(r"\noindent\makebox[65pt][l]{" + key + r"}\hbox{" + tex + r"}\par\vspace{8pt}")
+        # A real non-hooked class transition must consume no later ordinary
+        # opener's opportunity, even when the typed arm was initially eligible.
+        body.append(r'\xeCJKDeclareCharClass{Default}{"201C}')
+        tokens = [{"text": "A“"}, {"protected": "Math"}, {"text": "”甲（后）"}]
+        actual = render._Renderer(self.job, book, {"terms": []}).inline(tokens)
+        native = r"A“\(" + formula + r"\)”甲（后）"
+        for suffix, tex in (("N", native), ("P", actual)):
+            key = "Bypass" + suffix
+            body.append(r"\def\BTTestCase{" + key + "}")
+            body.append(r"\BTTestMetric{" + key + "}{" + tex + "}")
+            body.append(r"\noindent\makebox[65pt][l]{" + key + r"}\hbox{" + tex + r"}\par\vspace{8pt}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture(self.remaining_overflow_root("opener-negatives"), body)
+        self.assertNotIn("BTUNEXPECTEDARM|", log, "An unsupported seam must never arm an unrelated native opener")
+        self.assertNotIn("Missing character:", log)
+        metrics = {key: int(value) for key, value in re.findall(r"BTFONTMETRIC\|([^|\s]+)\|(\d+)", log)}
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), 1)
+            for label in [case[0] for case in cases] + ["Bypass"]:
+                native = self.font_row_glyphs(document[0], label + "N")
+                actual = self.font_row_glyphs(document[0], label + "P")
+                self.assertEqual([(s, t["font"], c[1], t["size"]) for s, t, c in actual],
+                                 [(s, t["font"], c[1], t["size"]) for s, t, c in native])
+                self.assertAlmostEqual(metrics[label + "N"], metrics[label + "P"], delta=2)
+                for (_, _, a), (_, _, n) in zip(actual, native):
+                    self.assertAlmostEqual(a[2][0] - actual[0][2][2][0],
+                                           n[2][0] - native[0][2][2][0], delta=.02)
+        core.save_json(root / "unsupported-consumer-evidence.json", {"metrics_sp": metrics, "unexpected_arms": 0})
+        self.save_remaining_overflow_pdf(root, root / "book.pdf")
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for actual missing native callback rejection")
+    def test_remaining_missing_native_opener_callbacks_fail_closed_in_the_compiler(self):
+        import os
+        import subprocess
+        for path in ("CJK", "Boundary", "Default"):
+            with self.subTest(native_callback=path):
+                root = self.remaining_overflow_root("missing-" + path)
+                root.mkdir()
+                shutil.copyfile(render.TEMPLATE.with_name("translator.sty"), root / "translator.sty")
+                tex = (r"\documentclass[a5paper,twoside,openany,10pt,fontset=fandol]{ctexbook}" + "\n" +
+                       r"\newcommand{\BTInner}{20}\newcommand{\BTOuter}{8}\newcommand{\BTTop}{15}"
+                       r"\newcommand{\BTBottom}{15}\newcommand{\BTMarkEdge}{3}" + "\n" +
+                       r"\ExplSyntaxOn\cs_undefine:c{__xeCJK_" + path + r"_and_FullLeft_glue:N}\ExplSyntaxOff" + "\n" +
+                       r"\usepackage{translator}\begin{document}甲（\(M\)）\end{document}")
+                (root / "book.tex").write_text(tex, encoding="utf-8")
+                result = subprocess.run([shutil.which("xelatex"), "-no-shell-escape", "-halt-on-error",
+                                         "-interaction=batchmode", "book.tex"], cwd=root,
+                                        env={**os.environ, "SOURCE_DATE_EPOCH": "1609459200", "FORCE_SOURCE_DATE": "1"},
+                                        capture_output=True, text=True, timeout=30)
+                (root / "compiler.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+                log = (root / "book.log").read_text(encoding="utf-8")
+                self.assertNotEqual(result.returncode, 0)
+                diagnostic = re.sub(r"\s+", "", log.replace("(book-translator)", ""))
+                self.assertIn("UnsupportedxeCJKopenercallback" + path + ".", diagnostic)
+                self.assertNotIn("Undefined control sequence", log)
+                self.assertFalse((root / "book.pdf").exists())
+                core.save_json(root / "failclosed-consumer-evidence.json",
+                               {"missing_callback": path, "compiler_returncode": result.returncode,
+                                "pdf_emitted": False})
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for complete typed source-anchor evidence")
+    def test_remaining_opener_source_anchors_and_all_three_classes_pass_real_build_without_state_mutation(self):
+        import pymupdf
+        atom = r"\mathrm{" + "M" * 32 + "}"
+        content = [{"text": "甲（"}, {"page": "After"}, {"text": ""},
+                   {"protected": "Math"}, {"text": "）后文。"}]
+        blocks = [{"id": "Heading", "kind": "heading", "level": 2, "source_pages": ["InlineSource"],
+                   "source": [{"text": "Native composition consumers"}], "target": [{"text": "Native composition consumers"}]},
+                  {"id": "Opener", "kind": "paragraph", "source_pages": ["InlineSource", "After"],
+                   "source": copy.deepcopy(content), "target": copy.deepcopy(content)},
+                  {"id": "Slash", "kind": "paragraph", "source_pages": ["After"],
+                   "source": [{"text": "输入输出说明。" * 12 + "MOSIS/MCNC 的普通复合词保持原样。"}],
+                   "target": [{"text": "输入输出说明。" * 12 + "MOSIS/MCNC 的普通复合词保持原样。"}]},
+                  {"id": "NameParagraph", "kind": "paragraph", "source_pages": ["After"],
+                   "source": [{"protected": "Name"}, {"text": " 方法保持原始姓名拼写与连字符。"}],
+                   "target": [{"protected": "Name"}, {"text": " 方法保持原始姓名拼写与连字符。"}]}]
+        root = make_inline_job(self.remaining_overflow_root("real-build"))
+        for filename in ("book-source.json", "book.json"):
+            manuscript = core.load_json(root / filename)
+            manuscript.update(blocks=copy.deepcopy(blocks), notes=[], main_body_start="Heading",
+                              protected=[{"id": "Math", "kind": "math", "value": atom},
+                                         {"id": "Name", "kind": "name", "value": "Kernighan-Lin"}])
+            if filename == "book-source.json":
+                manuscript["agent_preface"] = []
+                for block in manuscript["blocks"]:
+                    block["target"] = []
+            manuscript["source_pages"].append({"id": "After", "locator": "inline-source.pdf:1",
+                                               "printed_label": "S2", "label_verified": True,
+                                               "evidence": "Synthetic boundary between ordinary opener and exact math."})
+            core.save_json(root / filename, manuscript)
+        core.seal_source(root)
+        names = ("job.json", "book-source.json", "book.json", "terms.json")
+        before = {name: (root / name).read_bytes() for name in names}
+        pdf = render.build(root)
+        self.assertEqual({name: (root / name).read_bytes() for name in names}, before)
+        report = core.load_json(root / "build/verification.json")
+        self.assertTrue(report["passed"], report["errors"])
+        self.assertTrue(all(report["checks"].values()), report["checks"])
+        self.assertNotRegex((root / "build/book.log").read_text(encoding="utf-8"),
+                            r"Overfull \\[hv]box|Underfull \\hbox|Missing character:")
+        row, = [row for row in report["typography"] if row["id"] == "Opener"]
+        mark, = [mark for mark in report["source_marks"] if mark["source_page"] == "After"]
+        self.assertEqual(mark["page"], row["start"]["page"])
+        with pymupdf.open(pdf) as document:
+            page = document[mark["page"] - 1]
+            glyphs = [(chr(c[0]), t, c) for t in page.get_texttrace() for c in t["chars"]
+                      if chr(c[0]) == "M" and t["font"] == "LMRoman10-Regular"]
+            self.assertEqual(len(glyphs), 32)
+            self.assertEqual({t["font"] for _, t, _ in glyphs}, {"LMRoman10-Regular"})
+            self.assertEqual(len({round(c[2][1], 2) for _, _, c in glyphs}), 1)
+            baseline = glyphs[0][2][2][1]
+            self.assertGreater(baseline, page.rect.height - row["start"]["y_from_bottom_pt"] + 5)
+            self.assertAlmostEqual(page.rect.height - mark["y_from_bottom_pt"], baseline, delta=.1)
+            opener, = [c for t in page.get_texttrace() for c in t["chars"]
+                       if chr(c[0]) == "（" and abs(c[2][1] - baseline) < .1]
+            self.assertLessEqual(opener[2][0], mark["x_pt"])
+            self.assertLessEqual(mark["x_pt"], glyphs[0][2][2][0] + .1)
+        core.save_json(root / "unchanged-input-evidence.json",
+                       {name: hashlib.sha256(value).hexdigest() for name, value in before.items()})
+        self.save_remaining_overflow_pdf(root, pdf)
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for genuine indivisibility controls")
+    def test_remaining_indivisible_literal_nbsp_name_constituent_and_opener_math_still_fail_overflow(self):
+        import pymupdf
+        half = "M" * 25
+        controls = [("LiteralSlash", [{"protected": "Value"}], "name", half + "/" + half),
+                    ("CodeSlash", [{"protected": "Value"}], "code", "M" * 40 + "/" + "M" * 40),
+                    ("NbspSlash", [{"text": half + "/\u00a0" + half}], None, None),
+                    ("NameConstituent", [{"protected": "Value"}], "name", "W" * 80 + "-Lin"),
+                    ("OpenerMath", [{"text": "甲（"}, {"protected": "Value"}, {"text": "）"}],
+                     "math", r"\mathrm{" + "W" * 80 + "}")]
+        for label, content, kind, value in controls:
+            with self.subTest(indivisible=label):
+                blocks = [{"id": "Control", "kind": "paragraph", "source_pages": ["InlineSource"],
+                           "source": copy.deepcopy(content), "target": copy.deepcopy(content)}]
+                root = make_layout_regression_job(self.remaining_overflow_root(label), blocks,
+                                                  protected=([{"id": "Value", "kind": kind, "value": value}]
+                                                             if kind else []))
+                with self.assertRaisesRegex(ValueError, "overfull output"):
+                    render.build(root)
+                report = core.load_json(root / "build/verification.json")
+                self.assertFalse(report["checks"]["overflow"])
+                self.assertRegex((root / "build/book.log").read_text(encoding="utf-8"), r"Overfull \\hbox")
+                self.assertFalse((root / "output.pdf").exists())
+                with pymupdf.open(root / "build/book.pdf") as document:
+                    chars = [(chr(c[0]), t["font"], c) for page in document for t in page.get_texttrace()
+                             for c in t["chars"] if chr(c[0]) == ("W" if label in ("NameConstituent", "OpenerMath") else "M")]
+                    self.assertEqual(len(chars), 80 if label in ("CodeSlash", "NameConstituent", "OpenerMath") else 50)
+                    self.assertGreater(max(c[3][2] for _, _, c in chars) - min(c[2][0] for _, _, c in chars),
+                                       report["compiled_geometry_pt"]["text_width"])
+                    for page in document:
+                        page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False).save(
+                            root / ("rejected-actual-page-%02d.png" % (page.number + 1)))
+                core.save_json(root / "indivisible-consumer-evidence.json",
+                               {"case": label, "painted_pdf_glyphs": [(s, f, c[1], c[2], c[3]) for s, f, c in chars],
+                                "overflow_gate_passed": report["checks"]["overflow"]})
+
     def compile_font_fixture(self, name, body):
         """Compile an isolated copy of the production style, retaining real PDF evidence."""
         import os

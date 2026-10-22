@@ -19,8 +19,12 @@ _LITERAL_ESCAPE = {**_ESCAPE, "'": r"\textquotesingle{}", '"': r"\textquotedbl{}
                    "<": r"\textless{}", ">": r"\textgreater{}"}
 _URL = re.compile(r"(?<![A-Za-z0-9_])(?:https?://|www\.)[!-~]+")
 _COMPOUND_HYPHEN = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])")
+_COMPOUND_SLASH = re.compile(r"(?<=[A-Za-z0-9])/(?=[A-Za-z0-9])")
+_NAME_COMPOUND = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
 _ASCII_WHITESPACE = " \t\r\n\f\v"
 _NONBREAKING = "\u00a0\u2007\u2011\u202f\u2060\ufeff"
+# Ordinary native xeCJK FullLeft openers, not currency/ASCII delimiters.
+_MATH_TEXT_OPENERS = frozenset("‘“〈《「『【〔〖〘〚〝（［｛｟｢")
 # Positive boundary vocabulary, restricted to the same finite grammar as core.
 # Newly admitted or structurally opaque commands do not acquire an opportunity.
 _MATH_BOUNDARY_PREFIXES = frozenset("""
@@ -84,7 +88,9 @@ def _literal_text(text: str) -> str:
 def _ordinary_text(text: str) -> str:
     """Add local prose opportunities without interpreting or changing literal URLs."""
     def compounds(value: str) -> str:
-        return r"\BTLiteralHyphen{}".join(escape(piece) for piece in _COMPOUND_HYPHEN.split(value))
+        return r"\BTLiteralHyphen{}".join(
+            r"/\allowbreak{}".join(escape(part) for part in _COMPOUND_SLASH.split(piece))
+            for piece in _COMPOUND_HYPHEN.split(value))
 
     result = []
     cursor = 0
@@ -320,7 +326,31 @@ class _Renderer:
                               r"\newline{}" if c == "\n" else _literal_text(c)
                               for c in value)
             return r"{\ttfamily " + literal + "}"
+        if item["kind"] == "name" and _NAME_COMPOUND.fullmatch(value):
+            # Source hyphens only: constituent names never acquire hyphenation.
+            return r"\BTNameHyphen{}".join(r"\hbox{" + _literal_text(part) + "}"
+                                           for part in value.split("-"))
         return _literal_text(value)
+
+    def _math_opener_edge(self, items: list[dict], index: int, text: str) -> bool:
+        """Recognize a typed ordinary opener/math seam, not generated TeX."""
+        if not text or text[-1] not in _MATH_TEXT_OPENERS:
+            return False
+        prefix = text[:-1].rstrip(_ASCII_WHITESPACE)
+        if prefix:
+            last = prefix[-1]
+            if last in "([{" + _NONBREAKING or unicodedata.category(last) in ("Ps", "Pi"):
+                return False
+        elif not self._math_before_edge(items, index):
+            # In particular, never create an empty first line before an opener.
+            return False
+        for following in items[index + 1:]:
+            kind, value = next(iter(following.items()))
+            if kind == "page" or (kind == "text" and not value):
+                continue
+            return (kind == "protected" and self.protected[value]["kind"] in ("math", "variable")
+                    and _math_starts_safe(self.protected[value]["value"]))
+        return False
 
     def _math_before_edge(self, items: list[dict], index: int) -> bool:
         """Decide from actual typed neighbors, never from generated TeX or math."""
@@ -372,11 +402,17 @@ class _Renderer:
             index = item_index + index_offset
             kind, value = next(iter(item.items()))
             if kind == "text":
-                if _literal_fragment and _literal_fragment in value:
-                    before, _, after = value.partition(_literal_fragment)
+                opener_edge = (not (_literal_fragment and value.endswith(_literal_fragment))
+                               and self._math_opener_edge(items, item_index, value))
+                text = value[:-1] if opener_edge else value
+                if _literal_fragment and _literal_fragment in text:
+                    before, _, after = text.partition(_literal_fragment)
                     result.append(_ordinary_text(before) + _literal_text(_literal_fragment) + _ordinary_text(after))
                 else:
-                    result.append(_ordinary_text(value))
+                    result.append(_ordinary_text(text))
+                if opener_edge:
+                    # Assignments only before the real glyph: xeCJK owns its glue.
+                    result.append(r"\BTArmMathOpener{}" + escape(value[-1]) + r"\BTDisarmMathOpener{}")
             elif kind == "protected":
                 result.append(self.protected_text(value, before_edge=self._math_before_edge(items, item_index)))
             elif kind == "image":
