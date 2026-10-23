@@ -226,6 +226,23 @@ Use the canonical [translation reopening contract](format.md#reopening-completed
 
 For first-use defects, correct the genuine earliest occurrence using the existing canonical term ID and approved translation, then check later occurrences for consistency. Adding a convenient later token merely to satisfy the used-term check does not repair first use; removing a genuine glossary entry does not repair annotation. Preserve source structure, token order and protected content throughout.
 
+### Correcting completed unpublished review units
+
+For an evidenced defect discovered after a unit completed but BEFORE current-round aggregate/report publication, use the canonical [review reopening contract](format.md#reopening-completed-unpublished-review-units). Preserve the old report/checkpoint and evidence; do not alter source, translation, PDF, verification, policy or models.
+
+1. Read current review unit-status and the active plan. Select only completed IDs and retain their actual prior checkpoint path/SHA256. Require translated state, the same positive round, unchanged active page/context bounds and no aggregate report, role-review receipt or submission. No --draft, --revise, --replan-pending or rebase option may accompany this request.
+2. Run the existing planner, then read the returned successor and actual pending status:
+
+   ```sh
+   python3 <skill>/scripts/translator.py plan-units <job> review --pages-per-unit "$CURRENT_N" --reopen "$COMPLETED_ID"
+   # Append other explicit completed IDs as separate arguments if required.
+   python3 <skill>/scripts/translator.py unit-status <job> review
+   ```
+
+3. Dispatch selected work with the unchanged exact native review model, full source/PDF/context scope, defect evidence, immutable packet path/SHA256 and NEW writable result/assets/checkpoint paths. A historical packet.plan_id is valid only through the typed parent chain; never rewrite it. Retain every old selected artifact. Require a fresh full native result and normal checkpoint, not a finding append, patch-only result, reused inspection or fabricated settlement.
+4. Do not redispatch unselected completed units. Unselected pending workers may continue using their EXACT unchanged packet/result/assets paths, including assignments already in flight, and checkpoint normally against the successor; preserve any pending draft. Read the successor before any new assignment, and never treat an old selected checkpoint as a replacement.
+5. Only after all pending work is complete, assemble the exact whole-plan review, retaining every unselected report/check/finding/evidence and original native checkpoint identity. Submit that same aggregate through the normal review command. Reopening itself changes no state/round, source/build/proof/report or approval and makes no independent claim of perception or engine attestation.
+
 ### Revising selected sealed source and rebasing translation
 
 Use the canonical [source revision and translation rebase contract](format.md#targeted-sealed-source-revision) when source-image evidence requires a legitimate sealed-source correction before initial translation assembly. A target-only rewrite, removed seal, hand-edited hash or false old handoff is not a source correction.

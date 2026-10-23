@@ -436,8 +436,8 @@ def plan_units(job: Path, role: str, pages_per_unit: int, *, draft: Path | None 
         raise ValueError("Pending replanning requires translation without draft import or revision")
     if source_revision and (draft is not None or replan_pending or rebase_source is not None or accept_policy_compatibility is not None):
         raise ValueError("Selective source revision cannot combine draft/resize/rebase options")
-    if reopen_units is not None and not source_revision and (role != "translation" or draft is not None or revise or replan_pending):
-        raise ValueError("Reopening requires selected source revision or eligible prebuild translation")
+    if reopen_units is not None and not source_revision and (role not in {"translation", "review"} or draft is not None or revise or replan_pending):
+        raise ValueError("Reopening requires selected source revision, eligible prebuild translation or unpublished current review")
     if (rebase_source is None) != (accept_policy_compatibility is None):
         raise ValueError("Source rebase requires explicit handoff-policy acceptance")
     if rebase_source is not None and (role != "translation" or draft is not None or revise or replan_pending or reopen_units is not None):
@@ -855,7 +855,8 @@ def parser() -> argparse.ArgumentParser:
                 action.add_argument("--draft", type=Path)
                 action.add_argument("--revise", action="store_true")
                 action.add_argument("--replan-pending", action="store_true")
-                action.add_argument("--reopen", dest="reopen_units", nargs="+", metavar="UNIT_ID")
+                action.add_argument("--reopen", dest="reopen_units", nargs="+", metavar="UNIT_ID",
+                                    help="Reopen selected completed preassembly translation/current unpublished review units, or selected source units with --revise")
                 action.add_argument("--rebase-source", type=Path)
                 action.add_argument("--accept-policy-compatibility")
         elif name == "review":
