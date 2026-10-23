@@ -7,6 +7,7 @@ attestation. The controller owns stage transitions, seals, builds and review.
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from functools import lru_cache
 from datetime import datetime, timezone
 import hashlib
@@ -779,7 +780,7 @@ def _admitted_artifacts(job: Path, roots: list[dict]) -> dict:
         if not isinstance(value, dict):
             return
         if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
-            add(value["path"], value["sha256"], field in {"source_receipt", "terminology_receipt", "checkpoint", "base", "unit_checkpoints", "target_checkpoints"})
+            add(value["path"], value["sha256"], field in {"source_receipt", "terminology_receipt", "checkpoint", "base", "unit_checkpoints", "target_checkpoints", "authoring_receipt", "finalization_receipt", "reviewer_receipt", "submitted_review"})
         if isinstance(value.get("plan"), str) and isinstance(value.get("plan_sha256"), str):
             add(value["plan"], value["plan_sha256"], True)
         for name, digest, follow in (("packet", "packet_sha256", True), ("result", "result_sha256", False),
@@ -803,6 +804,323 @@ def _check_admitted_artifacts(job: Path, artifacts: dict) -> None:
     for name, digest in artifacts.items():
         if not _path(job, name).is_file() or _hash(_path(job, name)) != digest:
             raise ValueError("Frozen admitted member/packet/result/asset/evidence changed")
+
+
+def _strict_ref(job: Path, value: dict) -> dict:
+    if (not isinstance(value, dict) or set(value) != {"path", "sha256"}
+            or not isinstance(value.get("sha256"), str) or len(value["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in value["sha256"])):
+        raise ValueError("Post-review scope requires exact contained path/sha256 references")
+    _bound_bytes(job, value)
+    return value
+
+
+def _expected_source(job: Path, old: dict, expected: dict, changes: dict, plan: dict, reopened: list) -> None:
+    if not isinstance(changes, dict) or set(changes) != {"block_ids", "allowed_fields"}:
+        raise ValueError("Post-review source_changes must name block_ids and allowed_fields")
+    ids, fields = changes["block_ids"], changes["allowed_fields"]
+    for values in (ids, fields):
+        if (not isinstance(values, list) or not values or any(not isinstance(value, str) or not value for value in values)
+                or len(set(values)) != len(values)):
+            raise ValueError("Post-review source scope requires unique nonempty block IDs and fields")
+    if not set(fields) <= {"kind", "source", "label", "list_type", "list_level"}:
+        raise ValueError("Unsupported post-review structural source field authority")
+    core._validate_structure(expected, job, None, False)
+    if ({key: value for key, value in old.items() if key != "blocks"}
+            != {key: value for key, value in expected.items() if key != "blocks"}
+            or [item["id"] for item in old["blocks"]] != [item["id"] for item in expected["blocks"]]):
+        raise ValueError("Expected source changed non-block data or ordered block identities")
+    owners = {name: spec["unit_id"] for spec in plan["units"] for name in spec["owned_block_ids"]}
+    if not set(ids) <= set(owners) or any(owners[name] not in reopened for name in ids):
+        raise ValueError("Expected source block scope lies outside selected existing source owners")
+    changed = set()
+    for before, after in zip(old["blocks"], expected["blocks"]):
+        delta = {key for key in before.keys() | after.keys() if (key in before) != (key in after) or before.get(key) != after.get(key)}
+        if delta:
+            changed.add(before["id"])
+            if before["id"] not in ids or not delta <= set(fields):
+                raise ValueError("Expected source exceeded explicit block/field authority")
+    if changed != set(ids):
+        raise ValueError("Expected source must contain exactly the declared nonempty source correction, not a no-op")
+    if core._asset_hashes(job, old) != core._asset_hashes(job, expected):
+        raise ValueError("Expected source changed source asset identity")
+
+
+def _scope_request(job: Path, path) -> tuple[dict, dict]:
+    path = Path(path)
+    if path.is_absolute():
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(job):
+            raise ValueError("Post-review scope request must be contained by this job")
+    else:
+        path = _path(job, str(path))
+    request = core.load_json(path)
+    if (not isinstance(request, dict) or set(request) != {"version", "kind", "submitted_review", "expected_source", "source_changes"}
+            or type(request.get("version")) is not int or request["version"] != 1 or request.get("kind") != "post-review-source-scope"):
+        raise ValueError("Invalid strict post-review source scope request")
+    for key in ("submitted_review", "expected_source"):
+        _strict_ref(job, request[key])
+    return _ref(job, path), request
+
+
+def _admit_post_review(job: Path, data: dict, scope, source: dict, plan: dict, reopened: list) -> dict:
+    import translator
+
+    request_ref, request = _scope_request(job, scope)
+    expected = _checked(job, request["expected_source"]["path"], request["expected_source"]["sha256"])
+    _expected_source(job, source, expected, request["source_changes"], plan, reopened)
+    admitted = translator.admit_post_review(job, data, request["submitted_review"])
+    if (job / "build").is_symlink() or not (job / "build").is_dir():
+        raise ValueError("Post-review build root must be a contained regular directory")
+    build_files = {}
+    for path in sorted((job / "build").rglob("*")):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ValueError("Post-review build must contain only regular files and directories")
+        if path.is_file():
+            build_files[_relative(job, path)] = _ref(job, path)
+    post = {**admitted, "scope_request": request_ref, "expected_source": request["expected_source"],
+            "target_document": _ref(job, job / "book.json"), "build_files": build_files,
+            "original_round": data["round"], "original_max_rounds": data["max_rounds"], "derivation_version": 1}
+    temporary = {"post_review": post, "target_plan": post["target_plan"]}
+    failed, forced = _post_review_feedback(job, temporary, source)
+    post.update(failed_review_units=failed, forced_pending=forced)
+    return post
+
+
+def _post_review_feedback(job: Path, base: dict, source: dict) -> tuple[list, dict]:
+    """Conservative structured closure; freeform finding locations grant no authority."""
+    post = base["post_review"]
+    pointer = post["review_plan"]
+    review = _checked(job, pointer["plan"], pointer["plan_sha256"])
+    receipt = _checked(job, post["reviewer_receipt"]["path"], post["reviewer_receipt"]["sha256"])
+    checkpoints, outputs = _members(job, review, pointer["plan"], pointer["plan_sha256"])
+    report = _checked(job, post["report"]["path"], post["report"]["sha256"])
+    if (receipt.get("unit_checkpoints") != checkpoints or _review_report(review, outputs) != report
+            or receipt.get("merged_document_digest") != _canonical(report)):
+        raise ValueError("Submitted review differs from its complete immutable member report reassembly")
+    target_pointer = base["target_plan"]
+    target = _checked(job, target_pointer["plan"], target_pointer["plan_sha256"])
+    declarations, _, ownership = _logical_layout(source, target)
+    block_owners, note_owners, protected_users, _ = ownership
+    all_targets = {spec["unit_id"] for spec in target["units"]}
+    verification_ref = post["build_files"].get("build/verification.json")
+    if verification_ref is None:
+        raise ValueError("Post-review archive lacks exact build verification")
+    verification = _checked(job, verification_ref["path"], verification_ref["sha256"])
+    physical = [item.get("physical_pdf_page", item.get("page")) for item in verification.get("pages", [])]
+    ranges, mapped_blocks, mapped_notes = [], set(), set()
+    trustworthy = bool(physical) and physical == list(range(1, len(physical) + 1))
+    for category, records, owners in (("blocks", verification.get("block_boundaries", []), block_owners),
+                                      ("notes", verification.get("notes", []), note_owners)):
+        for row in records:
+            start, end = row.get("start", {}).get("page"), row.get("end", {}).get("page")
+            valid = row.get("id") in owners and type(start) is int and type(end) is int and 1 <= start <= end <= len(physical)
+            if not valid:
+                trustworthy = False
+                continue
+            pages = set(range(start, end + 1))
+            if category == "notes":
+                callout = row.get("callout", {}).get("page")
+                if type(callout) is not int or callout not in physical:
+                    trustworthy = False
+                else:
+                    pages.add(callout)
+                mapped_notes.add(row["id"])
+            else:
+                mapped_blocks.add(row["id"])
+            ranges.append((category, row["id"], pages))
+    trustworthy &= mapped_blocks == {item["id"] for item in source["blocks"] if item["kind"] != "blank"}
+    trustworthy &= mapped_notes == set(note_owners)
+    special = set(verification.get("agent_preface_pages", []))
+    special.update(row.get("physical_pdf_page", row.get("page")) for row in verification.get("glossary_rows", []))
+    mapped_physical = {page for _, _, pages in ranges for page in pages}
+    failed, forced = [], {}
+    for spec, output in zip(review["units"], outputs):
+        bad = {name for name in _REVIEW_CHECKS if output["checks"].get(name) is not True}
+        if output["verdict"] != "changes_requested" and not bad and not output["findings"]:
+            continue
+        unit = spec["unit_id"]
+        failed.append(unit)
+        packet = _checked(job, spec["packet"], spec["packet_sha256"])
+        pdf_pages = set(packet["pdf_pages"] + packet["context_pdf_pages"])
+        uncertain = (not trustworthy or packet["metadata_owner"]
+                     or spec.get("source_unit_id") == review["metadata_owner"] or not packet["owned_pages"]
+                     or bool(bad & {"terminology", "preface"}) or (not bad and bool(output["findings"]))
+                     or bool(pdf_pages & special) or not pdf_pages <= set(physical) or not pdf_pages <= mapped_physical)
+        pages = set(packet["owned_pages"] + packet["context_pages"])
+        blocks = {item["id"] for item in packet["blocks"] + packet.get("context_blocks", [])}
+        notes = {item["id"] for item in packet["notes"] + packet.get("context_notes", [])}
+        for category, name, physical_pages in ranges:
+            if physical_pages & pdf_pages:
+                (blocks if category == "blocks" else notes).add(name)
+        for item in source["blocks"]:
+            if set(item["source_pages"]) & pages or item["id"] in blocks:
+                blocks.add(item["id"])
+                pages.update(item["source_pages"])
+                notes.update(_references(item, "note"))
+        users = set()
+        for category, names, owners in (("blocks", blocks, block_owners), ("notes", notes, note_owners)):
+            for name in names:
+                if name not in owners or name not in declarations[category]:
+                    uncertain = True
+                    continue
+                users.add(owners[name])
+                for protected in _references(declarations[category][name], "protected"):
+                    if protected not in protected_users:
+                        uncertain = True
+                    users.update(protected_users.get(protected, set()))
+        for definition in packet.get("protected", []) + packet.get("context_protected", []):
+            users.update(protected_users.get(definition["id"], set()))
+        users.update(spec["unit_id"] for spec in target["units"] if set(spec["owned_pages"]) & pages)
+        if uncertain or not users:
+            users = all_targets
+        for target_id in sorted(users):
+            forced.setdefault(target_id, []).append(unit)
+    if not failed:
+        raise ValueError("Submitted changes_requested review has no failed immutable member")
+    return failed, forced
+
+
+def _post_review_base(job: Path, base: dict, source: dict) -> None:
+    post = base["post_review"]
+    keys = {"scope_request", "expected_source", "original_round", "original_max_rounds", "target_document",
+            "authoring_receipt", "finalization_receipt", "submitted_review", "report", "reviewer_receipt", "review_plan",
+            "build_files", "failed_review_units", "forced_pending", "derivation_version"}
+    if not isinstance(post, dict) or set(post) != keys or type(post.get("derivation_version")) is not int or post["derivation_version"] != 1:
+        raise ValueError("Invalid strict admitted post_review source-revision tag")
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    if (old_job["state"] != "changes_requested" or type(post["original_round"]) is not int
+            or not 0 < post["original_round"] < post["original_max_rounds"]
+            or old_job["round"] != post["original_round"] or old_job["max_rounds"] != post["original_max_rounds"]):
+        raise ValueError("Post-review base lost original changes_requested round/cap")
+    for key in ("scope_request", "expected_source", "target_document", "authoring_receipt", "finalization_receipt", "submitted_review", "report", "reviewer_receipt"):
+        _strict_ref(job, post[key])
+    request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
+    if (set(request) != {"version", "kind", "submitted_review", "expected_source", "source_changes"}
+            or request.get("version") != 1 or request.get("kind") != "post-review-source-scope"
+            or request["submitted_review"] != post["submitted_review"] or request["expected_source"]["sha256"] != post["expected_source"]["sha256"]):
+        raise ValueError("Frozen post-review scope request changed")
+    for reference in post["build_files"].values():
+        _strict_ref(job, reference)
+    submitted = _checked(job, post["submitted_review"]["path"], post["submitted_review"]["sha256"])
+    event = next((item for item in reversed(old_job["history"]) if item.get("event") == "review_submitted"), {})
+    report = _checked(job, post["report"]["path"], post["report"]["sha256"])
+    reviewer = _checked(job, post["reviewer_receipt"]["path"], post["reviewer_receipt"]["sha256"])
+    core.validate_document("review", report)
+    if (event.get("round") != old_job["round"] or event.get("verdict") != "changes_requested"
+            or {"path": event.get("receipt"), "sha256": event.get("receipt_sha256")} != post["submitted_review"]
+            or submitted.get("round") != old_job["round"] or submitted.get("source_digest") != base["source_digest"]
+            or report["round"] != old_job["round"] or report["verdict"] != "changes_requested"
+            or submitted.get("review_sha256") != post["report"]["sha256"]
+            or {"path": submitted.get("reviewer_receipt"), "sha256": submitted.get("reviewer_receipt_sha256")} != post["reviewer_receipt"]
+            or {"plan": reviewer.get("plan"), "plan_sha256": reviewer.get("plan_sha256")} != post["review_plan"]
+            or reviewer.get("selector") != core.admit_model(**old_job["models"]["review"])
+            or any(reviewer.get(key) != old_job["models"]["review"][key] for key in ("provider", "model"))
+            or reviewer.get("review_sha256") != post["report"]["sha256"]
+            or any(submitted.get(key) != reviewer.get(key) for key in ("content_digest", "pdf_sha256", "verification_sha256"))
+            or any(submitted.get(key) != report.get(key) for key in ("content_digest", "pdf_sha256"))
+            or post["build_files"]["build/book.pdf"]["sha256"] != submitted.get("pdf_sha256")
+            or post["build_files"]["build/verification.json"]["sha256"] != submitted.get("verification_sha256")):
+        raise ValueError("Frozen post-review submission/model/report/build authority changed")
+    failed, forced = _post_review_feedback(job, base, source)
+    if post["failed_review_units"] != failed or post["forced_pending"] != forced:
+        raise ValueError("Post-review forced-pending feedback derivation changed")
+
+
+def _post_review_target(job: Path, base: dict, source: dict, cache: dict) -> tuple[dict, dict]:
+    post = base["post_review"]
+    pointer = base["target_plan"]
+    plan = _checked(job, pointer["plan"], pointer["plan_sha256"])
+    proof = _checked(job, post["authoring_receipt"]["path"], post["authoring_receipt"]["sha256"])
+    final = _checked(job, post["finalization_receipt"]["path"], post["finalization_receipt"]["sha256"])
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    event = next((item for item in old_job["history"] if item.get("event") == "translation_content_authored"
+                  and item.get("receipt") == post["authoring_receipt"]["path"] and item.get("receipt_sha256") == post["authoring_receipt"]["sha256"]), None)
+    if event is None:
+        raise ValueError("Frozen completed target has no original authoring history")
+    import translator
+
+    before = {**old_job, "state": proof["base_state"], "round": proof["base_round"], "history": old_job["history"][:old_job["history"].index(event)]}
+    if (proof.get("execution") != "units" or proof.get("authoring_complete") is not True
+            or proof.get("kind") != "translation-content-authored" or proof.get("completed") is not False
+            or proof.get("job_context_sha256") != translator.translation_context_digest(before)
+            or {"plan": proof.get("plan"), "plan_sha256": proof.get("plan_sha256")} != pointer
+            or plan["base_round"] != proof["base_round"] or plan["base_state"] != proof["base_state"]
+            or proof["base_round"] + 1 != post["original_round"] or final.get("round") != post["original_round"]
+            or final.get("authoring_receipt") != post["authoring_receipt"]["path"]
+            or final.get("authoring_receipt_sha256") != post["authoring_receipt"]["sha256"]
+            or final.get("completed") is not True or final.get("kind") != "translation-completed"
+            or plan["selected_model"] != old_job["models"]["translation"]
+            or plan["source_digest"] != base["source_digest"] or proof.get("source_digest") != base["source_digest"]
+            or any(final.get(key) != proof.get(key) for key in ("plan", "plan_sha256", "unit_checkpoints", "merged_document_digest", "merged_document_sha256", "content_digest"))):
+        raise ValueError("Frozen completed target lost original authoring/finalization ancestry")
+    checkpoints, outputs = _members(job, plan, pointer["plan"], pointer["plan_sha256"], cache=cache)
+    target = _checked(job, post["target_document"]["path"], post["target_document"]["sha256"])
+    if (checkpoints != proof["unit_checkpoints"] or checkpoints != [{"path": item["path"], "sha256": item["sha256"]} for item in base["target_checkpoints"]]
+            or proof["merged_document_sha256"] != post["target_document"]["sha256"]
+            or proof["merged_document_digest"] != _canonical(target) or _merge(job, plan, outputs, source=source) != target):
+        raise ValueError("Frozen complete target differs from its exact original native member merge")
+    return plan, {spec["unit_id"]: output for spec, output in zip(plan["units"], outputs)}
+
+
+def _active_post_review(job: Path, data: dict) -> dict | None:
+    active = job / "units/source/active.json"
+    if not active.is_file():
+        return None
+    _, plan, _ = _current_plan(job, "source")
+    revision = plan.get("source_revision")
+    if revision is None:
+        return None
+    base = _checked(job, revision["base"]["path"], revision["base"]["sha256"])
+    if "post_review" not in base:
+        return None
+    post = base["post_review"]
+    if type(post.get("original_round")) is not int:
+        raise ValueError("Invalid post-review recovery round")
+    if data["round"] > post["original_round"]:
+        old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+        completions = []
+        for event in data["history"][len(old_job["history"]):]:
+            if event.get("event") != "stage_translation":
+                continue
+            final = _checked(job, event["receipt"], event["receipt_sha256"])
+            if final.get("execution") == "units":
+                target = _checked(job, final["plan"], final["plan_sha256"])
+                if target.get("source_rebase", {}).get("base") == revision["base"]:
+                    completions.append(final)
+        if (len(completions) != 1 or completions[0].get("kind") != "translation-completed"
+                or completions[0].get("completed") is not True
+                or completions[0].get("round") != post["original_round"] + 1
+                or completions[0].get("base_round") != post["original_round"]
+                or data["history"][:len(old_job["history"])] != old_job["history"]
+                or data["max_rounds"] != post["original_max_rounds"]):
+            raise ValueError("Post-review recovery round changed without its complete finalized rebase")
+        _, latest = _journal_ref(job, data, "stage_translation")
+        if latest.get("round") != data["round"]:
+            raise ValueError("Post-review recovery current round differs from actual finalization")
+        return None
+    source = _checked(job, base["source"]["path"], base["source"]["sha256"])
+    _post_review_base(job, base, source)
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    _same_rebase_intent(old_job, data, post)
+    return revision["base"]
+
+
+def _fresh_post_review_terminology(job: Path, base: dict, task: dict) -> None:
+    old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
+    for event in old_job["history"]:
+        if event.get("event") == "stage_terminology":
+            prior = _checked(job, event["receipt"], event["receipt_sha256"])
+            if task.get("id") == prior.get("task", {}).get("id"):
+                raise ValueError("Post-review terminology must have a genuinely fresh native task, not any historical task replay")
+
+
+def _post_review_term(job: Path, reference: dict, base: dict, data: dict, term_ref: dict) -> None:
+    term = _checked(job, term_ref["path"], term_ref["sha256"])
+    _fresh_post_review_terminology(job, base, term.get("task", {}))
+    if (term_ref == base["terminology_receipt"] or term.get("bindings", {}).get("post_review_base") != reference
+            or data["state"] != "changes_requested" or data["round"] != base["post_review"]["original_round"]):
+        raise ValueError("Post-review recovery requires fresh native whole-source terminology bound to its new seal/base")
 
 
 def _initial_prebuild(data: dict) -> None:
@@ -837,6 +1155,8 @@ def _term_proof(job: Path, data: dict, digest: str, terms: bytes, handoff: bytes
 
 
 def _old_target_context(job: Path, base: dict, source: dict, cache: dict) -> tuple[dict, dict]:
+    if base.get("post_review") is not None:
+        return _post_review_target(job, base, source, cache)
     pointer = base["target_plan"]
     plan = _checked(job, pointer["plan"], pointer["plan_sha256"])
     old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
@@ -915,14 +1235,19 @@ def _archived_source(job: Path, base_reference: dict, cache: dict) -> tuple[dict
     core._validate_structure(source, job, None, False)
     if core._source_digest(job, old_job, source) != seal:
         raise ValueError("Archived source seal or immutable source assets changed")
+    if base.get("post_review") is not None:
+        _post_review_base(job, base, source)
     cache[key] = (base, source)
     return base, source
 
 
-def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[str]) -> dict:
+def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[str], *, post_review_scope=None) -> dict:
     reopened = _translation_reopen_ids(reopen_units)
     data = _job(job)
-    _initial_prebuild(data)
+    if post_review_scope is None:
+        _initial_prebuild(data)
+    elif _active_post_review(job, data) is not None:
+        raise ValueError("Post-review source recovery already admitted; resume its exact source plan")
     source = core.validate_book(job, translated=False)
     digest = (job / "source.sha256").read_text(encoding="ascii").strip()
     source_reference, source_receipt = _journal_ref(job, data, "role_source")
@@ -944,8 +1269,18 @@ def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[
         "source_seal_sha256": _hash(job / "source.sha256"), "terminology_receipt": term_reference["path"],
         "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": _hash(job / "terms.json"),
         "handoff_sha256": _hash(job / "handoff.md")}}
-    _, _, completed = _prepare_pending_translation(job, target_plan["pages_per_unit"], target_plan["max_context_pages"],
-                                                 target_readiness, reduce_pending=False)
+    post = None
+    if post_review_scope is not None:
+        post = _admit_post_review(job, data, post_review_scope, source, source_plan, reopened)
+        if post["target_plan"] != {"plan": _relative(job, target_path), "plan_sha256": target_sha}:
+            raise ValueError("Post-review recovery requires the exact completed active target plan")
+        post.pop("target_plan")
+        proofs = _checked(job, post["authoring_receipt"]["path"], post["authoring_receipt"]["sha256"])["unit_checkpoints"]
+        completed = {spec["unit_id"]: {**spec, "carried_checkpoint": next(ref for ref in proofs if ref["path"] == spec["checkpoint"])}
+                     for spec in target_plan["units"]}
+    else:
+        _, _, completed = _prepare_pending_translation(job, target_plan["pages_per_unit"], target_plan["max_context_pages"],
+                                                     target_readiness, reduce_pending=False)
     drafts = {}
     for spec in target_plan["units"]:
         if spec["unit_id"] not in completed and _path(job, spec["result"]).is_file():
@@ -954,6 +1289,11 @@ def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[
              {"plan": _relative(job, target_path), "plan_sha256": target_sha},
              {"path": data["source_file"], "sha256": data["source_sha256"]}]
     roots.append({"target_checkpoints": [spec["carried_checkpoint"] for spec in completed.values()], "target_drafts": drafts})
+    if post is not None:
+        roots.extend([{key: post[key]} for key in ("authoring_receipt", "finalization_receipt", "submitted_review", "report", "reviewer_receipt")])
+        roots.append(post["review_plan"])
+        roots.extend({"terminology_receipt": {"path": event["receipt"], "sha256": event["receipt_sha256"]}}
+                     for event in data["history"] if event.get("event") == "stage_terminology")
     artifacts = _admitted_artifacts(job, [{"source_receipt": source_reference, "terminology_receipt": term_reference}, *roots])
     for ref in [source_reference, term_reference, *[spec["carried_checkpoint"] for spec in completed.values()]]:
         artifacts[ref["path"]] = ref["sha256"]
@@ -963,7 +1303,7 @@ def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[
             "terminology_receipt": term_reference,
             "target_plan": {"plan": _relative(job, target_path), "plan_sha256": target_sha},
             "target_checkpoints": [{"unit_id": unit, **spec["carried_checkpoint"]} for unit, spec in completed.items()],
-            "target_drafts": drafts, "reopened": reopened}
+            "target_drafts": drafts, "reopened": reopened, "post_review": post}
 
 
 def _freeze_source_base(job: Path, directory: Path, context: dict) -> dict:
@@ -975,6 +1315,20 @@ def _freeze_source_base(job: Path, directory: Path, context: dict) -> dict:
         base[key] = _snapshot(job, directory, relative, name)
     if (job / "book.json").is_file():
         base["book_candidate"] = _snapshot(job, directory, "book.json", "before-book.json")
+    if context.get("post_review") is not None:
+        post = deepcopy(context["post_review"])
+        for key, filename in (("scope_request", "scope-request.json"), ("expected_source", "expected-source.json"),
+                              ("target_document", "before-complete-target.json")):
+            original = post[key]
+            post[key] = _snapshot(job, directory, original["path"], filename)
+            if post[key]["sha256"] != original["sha256"]:
+                raise ValueError("Post-review input changed while freezing")
+        post["build_files"] = {name: _snapshot(job, directory, name, "before-build/" + name.removeprefix("build/"))
+                               for name in post["build_files"]}
+        if any(ref["sha256"] != context["post_review"]["build_files"][name]["sha256"]
+               for name, ref in post["build_files"].items()):
+            raise ValueError("Post-review build changed while freezing")
+        base["post_review"] = post
     path = directory / "revision-base.json"
     _write_once(path, base)
     return _ref(job, path)
@@ -1003,8 +1357,25 @@ def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
     source = _checked(job, base["source"]["path"], base["source"]["sha256"])
     old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
     original = _checked(job, base["source_plan"]["plan"], base["source_plan"]["plan_sha256"])
-    if (plan["role"] != "source" or plan["revision"] is not True or plan["base_round"] != 0
-            or plan["base_state"] != "terminology_ready" or plan["job_sha256"] != base["job"]["sha256"]
+    post = base.get("post_review")
+    if post is not None:
+        _post_review_base(job, base, source)
+        if _hash(job / "job.json") == plan["job_sha256"]:
+            if _hash(job / "book.json") != post["target_document"]["sha256"]:
+                raise ValueError("Admitted complete target changed during post-review source authoring")
+            live = {}
+            for path in (job / "build").rglob("*"):
+                if path.is_symlink():
+                    raise ValueError("Admitted build changed to a symlink during source authoring")
+                if path.is_file():
+                    live[_relative(job, path)] = _hash(path)
+            if live != {name: ref["sha256"] for name, ref in post["build_files"].items()}:
+                raise ValueError("Admitted build changed during post-review source authoring")
+        request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
+        expected = _checked(job, post["expected_source"]["path"], post["expected_source"]["sha256"])
+        _expected_source(job, source, expected, request["source_changes"], original, reopened)
+    if (plan["role"] != "source" or plan["revision"] is not True or plan["base_round"] != (post["original_round"] if post is not None else 0)
+            or plan["base_state"] != ("changes_requested" if post is not None else "terminology_ready") or plan["job_sha256"] != base["job"]["sha256"]
             or plan["source_digest"] != base["source_digest"] or plan["selected_model"] != old_job["models"]["source"]
             or plan["pages_per_unit"] != original["pages_per_unit"]
             or [(spec["unit_id"], spec["owned_pages"]) for spec in plan["units"]]
@@ -1043,6 +1414,10 @@ def _source_carried_member(job: Path, plan: dict, spec: dict, cache: dict) -> tu
 
 def _source_revision_scope(job: Path, plan: dict, document: dict, cache: dict) -> None:
     base, old = _archived_source(job, plan["source_revision"]["base"], cache)
+    if base.get("post_review") is not None:
+        expected = _checked(job, base["post_review"]["expected_source"]["path"], base["post_review"]["expected_source"]["sha256"])
+        if document != expected:
+            raise ValueError("Native complete source candidate differs from the exact expected_source")
     selected = set(plan["source_revision"]["reopened"])
     untouched = {page for spec in plan["units"] if spec["unit_id"] not in selected for page in spec["owned_pages"]}
     if (document["title"] != old["title"] or document["main_body_start"] != old["main_body_start"]
@@ -1067,9 +1442,9 @@ def _source_revision_scope(job: Path, plan: dict, document: dict, cache: dict) -
         raise ValueError("Source revision changed a shared definition outside its explicit closure")
 
 
-def _same_rebase_intent(old: dict, current: dict) -> None:
+def _same_rebase_intent(old: dict, current: dict, post_review: dict | None = None) -> None:
     keys = ("version", "title", "source_language", "target_language", "source_file", "source_sha256", "models", "layout", "max_rounds", "round")
-    if (any(old[key] != current[key] for key in keys) or old["round"] != 0
+    if (any(old[key] != current[key] for key in keys) or old["round"] != (post_review["original_round"] if post_review is not None else 0)
             or current["history"][:len(old["history"])] != old["history"]):
         raise ValueError("Source rebase changed original evidence/model/language/layout/cap/round or prior history")
 
@@ -1107,7 +1482,7 @@ def _rebase_view(job: Path, revision_pointer: dict, base_reference: dict, curren
     base, old_source = _archived_source(job, base_reference, cache)
     old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
     new_job = _checked(job, current["job"]["path"], current["job"]["sha256"])
-    _same_rebase_intent(old_job, new_job)
+    _same_rebase_intent(old_job, new_job, base.get("post_review"))
     new_source = _checked(job, current["source"]["path"], current["source"]["sha256"])
     seal = _bound_bytes(job, current["seal"]).decode("ascii").strip()
     revision = _checked(job, revision_pointer["plan"], revision_pointer["plan_sha256"])
@@ -1140,6 +1515,8 @@ def _rebase_view(job: Path, revision_pointer: dict, base_reference: dict, curren
             or acceptance.get("handoff_sha256") != current["handoff"]["sha256"]
             or acceptance.get("scope") != ["forms", "meanings", "style", "register", "names", "first_use", "index", "source_quality", "metadata", "preface"]):
         raise ValueError("Source rebase requires explicit acceptance of the exact fresh native handoff compatibility claim")
+    if base.get("post_review") is not None:
+        _post_review_term(job, base_reference, base, new_job, term_ref)
     terms = core.load_json(_path(job, current["terms"]["path"]))
     _term_source_names(terms, old_source, new_source)
     if (old_source["title"] != new_source["title"] or old_source["main_body_start"] != new_source["main_body_start"]
@@ -1161,6 +1538,7 @@ def _rebase_view(job: Path, revision_pointer: dict, base_reference: dict, curren
                                   old_job, baseline_before, None, old_target["max_context_pages"])
     new_builder = _packet_builder(job, "translation", new_source, new_defs, old_target["page_ids"], extraction,
                                   new_job, baseline_after, None, old_target["max_context_pages"])
+    exclusions = _post_review_feedback(job, base, old_source)[1] if base.get("post_review") is not None else {}
     footprints, packets = {}, {}
     for original, before_spec, after_spec in zip(old_target["units"], old_specs, new_specs):
         actual = _checked(job, original["packet"], original["packet_sha256"])
@@ -1169,10 +1547,13 @@ def _rebase_view(job: Path, revision_pointer: dict, base_reference: dict, curren
         before = _source_footprint(actual, old_source, before_packet)
         canonical_before = _source_footprint(before_packet, old_source, before_packet)
         after = _source_footprint(after_packet, new_source, after_packet)
-        carried = original["unit_id"] in completed and before == canonical_before == after
+        forced = exclusions.get(original["unit_id"], [])
+        carried = original["unit_id"] in completed and before == canonical_before == after and not forced
         reason = "exact unchanged owned/read-only source footprint" if carried else (
-            "no completed checkpoint" if original["unit_id"] not in completed else "changed or uncertain source footprint")
+            "submitted review requires fresh native work" if forced else "no completed checkpoint" if original["unit_id"] not in completed else "changed or uncertain source footprint")
         footprints[original["unit_id"]] = {"before": before, "after": after, "decision": "carried" if carried else "pending", "reason": reason}
+        if base.get("post_review") is not None:
+            footprints[original["unit_id"]]["review_exclusions"] = forced
         packets[original["unit_id"]] = (after_spec, after_packet)
     return {"base": base, "old_source": old_source, "new_source": new_source, "old_target": old_target,
             "completed": completed, "footprints": footprints, "packets": packets, "new_job": new_job}
@@ -1202,7 +1583,7 @@ def _source_rebase_inputs(job: Path, plan: dict) -> None:
     current = bridge["current"]
     current_job = _checked(job, current["job"]["path"], current["job"]["sha256"])
     old_job = _checked(job, base["job"]["path"], base["job"]["sha256"])
-    _same_rebase_intent(old_job, current_job)
+    _same_rebase_intent(old_job, current_job, base.get("post_review"))
     for record in (base, current):
         for key in ("source", "seal", "terms", "handoff", "source_receipt", "terminology_receipt"):
             _bound_bytes(job, record[key])
@@ -1213,12 +1594,16 @@ def _source_rebase_inputs(job: Path, plan: dict) -> None:
     bindings = {"source_seal_sha256": current["seal"]["sha256"], "terminology_receipt": term_reference["path"],
                 "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": current["terms"]["sha256"],
                 "handoff_sha256": current["handoff"]["sha256"]}
+    post = base.get("post_review")
+    if post is not None:
+        bindings["post_review_base"] = bridge["base"]
     if (terms != _bound_bytes(job, base["terms"]) or term_reference != current["terminology_receipt"]
             or acceptance.get("accepted") is not True or acceptance.get("handoff_sha256") != current["handoff"]["sha256"]
             or acceptance.get("scope") != ["forms", "meanings", "style", "register", "names", "first_use", "index", "source_quality", "metadata", "preface"]
             or plan["readiness"] != {"source_digest": seal, "bindings": bindings}):
         raise ValueError("Source rebase policy acceptance or exact terminology/readiness binding changed")
-    if (plan["job_sha256"] != current["job"]["sha256"] or plan["base_state"] != "terminology_ready" or plan["base_round"] != 0
+    if (plan["job_sha256"] != current["job"]["sha256"] or plan["base_state"] != ("changes_requested" if post is not None else "terminology_ready")
+            or plan["base_round"] != (post["original_round"] if post is not None else 0)
             or plan["selected_model"] != current_job["models"]["translation"] or plan["source_digest"] != seal
             or any(plan["baseline"][name] != current[key]["sha256"] for name, key in
                    (("book-source.json", "source"), ("source.sha256", "seal"), ("terms.json", "terms"), ("handoff.md", "handoff")))):
@@ -1234,7 +1619,7 @@ def _source_rebase_inputs(job: Path, plan: dict) -> None:
     original = _checked(job, base["target_plan"]["plan"], base["target_plan"]["plan_sha256"])
     unchanged = ("pages_per_unit", "max_context_pages", "metadata_owner", "source_file_sha256", "extraction_sha256", "page_ids", "pages")
     if (bridge["prior_target_plan"] != base["target_plan"] or any(plan[key] != original[key] for key in unchanged)
-            or plan["baseline"]["book.json"] != original["baseline"]["book.json"]
+            or plan["baseline"]["book.json"] != (post["target_document"]["sha256"] if post is not None else original["baseline"]["book.json"])
             or [(spec["unit_id"], spec["owned_pages"]) for spec in plan["units"]]
                 != [(spec["unit_id"], spec["owned_pages"]) for spec in original["units"]]):
         raise ValueError("Source rebase changed target ownership, metadata authority or immutable evidence/page bounds")
@@ -1247,6 +1632,8 @@ def _source_rebase_inputs(job: Path, plan: dict) -> None:
         reference = carried.get(spec["unit_id"])
         if spec.get("carried_checkpoint") != reference or (reference is not None and reference["path"] != spec["checkpoint"]):
             raise ValueError("Source rebase carried checkpoint identity changed")
+    if post is not None:
+        _rebase_context(job, plan, {})
 
 
 def _rebased_member(job: Path, plan: dict, spec: dict, cache: dict) -> tuple[dict, dict]:
@@ -1264,7 +1651,6 @@ def _rebased_member(job: Path, plan: dict, spec: dict, cache: dict) -> tuple[dic
 def _rebase_translation(job: Path, pages_per_unit: int, max_context_pages: int, readiness: dict,
                         revision_path, accept_policy_compatibility) -> dict:
     data = _job(job)
-    _initial_prebuild(data)
     if not isinstance(revision_path, (str, Path)):
         raise ValueError("Source rebase requires an absolute or job-relative source revision plan path")
     path = Path(revision_path)
@@ -1277,6 +1663,12 @@ def _rebase_translation(job: Path, pages_per_unit: int, max_context_pages: int, 
     revision_pointer = {"plan": _relative(job, path), "plan_sha256": _hash(path)}
     base_reference = revision["source_revision"]["base"]
     base, old_source = _archived_source(job, base_reference, {})
+    post = base.get("post_review")
+    if post is None:
+        _initial_prebuild(data)
+    elif (_active_post_review(job, data) != base_reference or data["state"] != "changes_requested"
+          or data["round"] != post["original_round"]):
+        raise ValueError("Post-review source rebase requires its admitted current recovery")
     source = core.validate_book(job, translated=False)
     digest = (job / "source.sha256").read_text(encoding="ascii").strip()
     source_reference, source_receipt = _journal_ref(job, data, "role_source")
@@ -1295,12 +1687,14 @@ def _rebase_translation(job: Path, pages_per_unit: int, max_context_pages: int, 
             or core.load_json(job / "units/translation/active.json") != base["target_plan"]):
         raise ValueError("Source rebase must use the frozen active target plan and unchanged page/context bounds")
     candidate_sha = _hash(job / "book.json") if (job / "book.json").is_file() else None
-    if candidate_sha != old_target["baseline"]["book.json"]:
+    if candidate_sha != (post["target_document"]["sha256"] if post is not None else old_target["baseline"]["book.json"]):
         raise ValueError("Unadmitted canonical target baseline changed during source correction")
     expected_readiness = {"source_digest": digest, "bindings": {
         "source_seal_sha256": _hash(job / "source.sha256"), "terminology_receipt": term_reference["path"],
         "terminology_receipt_sha256": term_reference["sha256"], "terms_sha256": _hash(job / "terms.json"),
         "handoff_sha256": _hash(job / "handoff.md")}}
+    if post is not None:
+        expected_readiness["bindings"]["post_review_base"] = base_reference
     if readiness != expected_readiness:
         raise ValueError("Source rebase requires current source/terminology readiness")
     identifier = uuid.uuid4().hex
@@ -1368,7 +1762,7 @@ def _rebase_translation(job: Path, pages_per_unit: int, max_context_pages: int, 
 def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, revise: bool = False,
                 max_context_pages: int = 4, readiness: dict | None = None, replan_pending: bool = False,
                 reopen_units: list[str] | None = None, rebase_source: Path | None = None,
-                accept_policy_compatibility: str | None = None) -> dict:
+                accept_policy_compatibility: str | None = None, post_review_scope: Path | None = None) -> dict:
     """Snapshot bounded page evidence and untrusted draft slices without admission.
 
     A complete block belongs to its first source page's unit. Notes follow their
@@ -1385,6 +1779,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
     if replan_pending and (role != "translation" or draft_path is not None or revise):
         raise ValueError("Pending replanning requires translation without draft import or revision")
     source_revision_requested = role == "source" and revise is True and reopen_units is not None
+    if post_review_scope is not None and not source_revision_requested:
+        raise ValueError("Post-review scope requires source --revise --reopen")
     if source_revision_requested and (draft_path is not None or replan_pending or rebase_source is not None or accept_policy_compatibility is not None):
         raise ValueError("Selective source revision cannot combine draft/resize/rebase options")
     if reopen_units is not None and not source_revision_requested and (role not in {"translation", "review"} or draft_path is not None or revise or replan_pending):
@@ -1397,6 +1793,8 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
     if any(not data["models"].get(name, {}).get("provider") or not data["models"].get(name, {}).get("model")
            for name in ("source", "terminology", "translation", "review")):
         raise ValueError("Every exact role model must be configured before unit planning")
+    if role == "source" and data["round"] > 0 and post_review_scope is None:
+        raise ValueError("Positive-round source planning requires explicit post-review scope")
     sealed = (job / "source.sha256").is_file()
     if role == "source":
         if (revise and not sealed) or (not revise and (data["state"] != "extracted" or sealed)):
@@ -1410,9 +1808,12 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         core.validate_document("terms", core.load_json(job / "terms.json"))
         if not (job / "handoff.md").read_text(encoding="utf-8").strip():
             raise ValueError("Translation units require a substantive terminology handoff")
+    recovery = _active_post_review(job, data) if role == "translation" else None
+    if recovery is not None and rebase_source is None:
+        raise ValueError("Post-review source recovery requires feedback-bound source rebase")
     if rebase_source is not None:
         return _rebase_translation(job, pages_per_unit, max_context_pages, readiness, rebase_source, accept_policy_compatibility)
-    source_context = _source_revision_context(job, pages_per_unit, reopen_units) if source_revision_requested else None
+    source_context = _source_revision_context(job, pages_per_unit, reopen_units, post_review_scope=post_review_scope) if source_revision_requested else None
     if reopen_units is not None and not source_revision_requested:
         if role == "review":
             return _reopen_review(job, pages_per_unit, max_context_pages, readiness, reopen_units)
@@ -2116,10 +2517,10 @@ def _members(job: Path, plan: dict, plan_name: str, plan_digest: str, *, cache: 
     return checkpoints, outputs
 
 
-def _merge(job: Path, plan: dict, outputs: list) -> dict:
+def _merge(job: Path, plan: dict, outputs: list, *, source: dict | None = None) -> dict:
     metadata = next(output["metadata"] for output in outputs if output["unit_id"] == plan["metadata_owner"])
     if plan["role"] == "translation":
-        book = core.load_json(job / "book-source.json")
+        book = deepcopy(source) if source is not None else core.load_json(job / "book-source.json")
         for category in ("blocks", "notes"):
             patches = {item["id"]: item for output in outputs for item in output[category]}
             for item in book[category]:

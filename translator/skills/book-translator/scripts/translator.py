@@ -323,6 +323,56 @@ def archive_reviews(job: Path, data: dict, previous_seal: str) -> str | None:
 
 
 
+def admit_post_review(job: Path, data: dict, submitted_reference: dict) -> dict:
+    """Admit live submitted failure using normal stage/build/member authority, before freezing."""
+    units = importlib.import_module("units")
+    if (data != load_job(job) or data["state"] != "changes_requested" or type(data["round"]) is not int
+            or not 0 < data["round"] < data["max_rounds"]):
+        raise ValueError("Post-review source recovery requires current submitted changes_requested with original cap remaining")
+    require_models(data)
+    seal = source_digest(job)
+    final, build = translation_ready(job, data)
+    if final.get("execution") != "units" or not final.get("authoring_receipt"):
+        raise ValueError("Post-review recovery requires complete bounded target authoring/finalization provenance")
+    authoring_ref = {"path": final["authoring_receipt"], "sha256": final["authoring_receipt_sha256"]}
+    event = next((entry for entry in data["history"] if entry.get("event") == "translation_content_authored"
+                  and entry.get("receipt") == authoring_ref["path"] and entry.get("receipt_sha256") == authoring_ref["sha256"]), None)
+    if event is None:
+        raise ValueError("Current target lacks its original complete authoring history")
+    proof = translation_authoring_proof(job, data, event)
+    target_pointer = {"plan": proof["plan"], "plan_sha256": proof["plan_sha256"]}
+    if (proof["base_round"] + 1 != data["round"] or event.get("unit_plan") != proof["plan"]
+            or core.load_json(job / "units/translation/active.json") != target_pointer):
+        raise ValueError("Post-review recovery requires the exact COMPLETE CONSUMED current target plan")
+    final_ref, journal_final = units._journal_ref(job, data, "stage_translation")
+    if journal_final != final:
+        raise ValueError("Current target finalization authority changed")
+    event = next((entry for entry in reversed(data["history"]) if entry.get("event") == "review_submitted"), {})
+    if (event.get("round") != data["round"] or event.get("verdict") != "changes_requested"
+            or {"path": event.get("receipt"), "sha256": event.get("receipt_sha256")} != submitted_reference
+            or event.get("receipt") != f"reviews/round-{data['round']}.receipt.json"):
+        raise ValueError("Post-review scope must bind the exact current SUBMITTED changes_requested review")
+    units._strict_ref(job, submitted_reference)
+    receipt = units._checked(job, submitted_reference["path"], submitted_reference["sha256"])
+    report_path = job / f"reviews/round-{data['round']}.json"
+    report = core.load_json(report_path)
+    core.validate_document("review", report)
+    reviewer = latest_role_receipt(job, data, "review")
+    reviewer_ref, admitted_reviewer = units._journal_ref(job, data, "role_review")
+    if (reviewer.get("execution") != "units" or reviewer != admitted_reviewer
+            or receipt.get("round") != data["round"] or receipt.get("source_digest") != seal
+            or report["round"] != data["round"] or report["verdict"] != "changes_requested"
+            or {"path": receipt.get("reviewer_receipt"), "sha256": receipt.get("reviewer_receipt_sha256")} != reviewer_ref
+            or digest_file(report_path) != receipt.get("review_sha256") or reviewer.get("review_sha256") != receipt["review_sha256"]
+            or reviewer.get("round") != data["round"]
+            or any(receipt.get(key) != value or reviewer.get(key) != value for key, value in build.items())
+            or any(report.get(key) != build[key] for key in ("content_digest", "pdf_sha256"))):
+        raise ValueError("Submitted changes_requested report/reviewer/source/build authority is stale or changed")
+    return {"target_plan": target_pointer, "authoring_receipt": authoring_ref, "finalization_receipt": final_ref,
+            "submitted_review": submitted_reference, "report": units._ref(job, report_path), "reviewer_receipt": reviewer_ref,
+            "review_plan": {"plan": reviewer["plan"], "plan_sha256": reviewer["plan_sha256"]}}
+
+
 def seal_job(job: Path, reseal: bool = False) -> dict:
     data = load_job(job)
     already = (job / "source.sha256").exists()
@@ -342,15 +392,37 @@ def seal_job(job: Path, reseal: bool = False) -> dict:
             or source_receipt.get("source_document_sha256") != digest_file(job / "book-source.json")
             or source_receipt.get("revision") is not reseal):
         raise ValueError("Source correction lacks a current complete source checkpoint; record source with explicit revision intent")
+    units = importlib.import_module("units")
+    recovery = units._active_post_review(job, data) if already else None
+    if data["round"] > 0 and recovery is None:
+        raise ValueError("Positive-round source reseal requires admitted post-review scope; review budget cannot reset")
+    if recovery is not None:
+        base, old_source = units._archived_source(job, recovery, {})
+        post = base["post_review"]
+        plan = units._checked(job, source_receipt["plan"], source_receipt["plan_sha256"])
+        if (data["state"] != "changes_requested" or data["round"] != post["original_round"]
+                or plan.get("source_revision", {}).get("base") != recovery
+                or source_receipt.get("base_round") != post["original_round"]
+                or digest_file(job / "book.json") != post["target_document"]["sha256"]
+                or previous_seal != base["source_digest"]
+                or any(digest_file(job / name) != base[key]["sha256"] for name, key in (("terms.json", "terms"), ("handoff.md", "handoff")))):
+            raise ValueError("Post-review reseal changed its admitted source/target/round/policy lineage")
+        live_build = {path.relative_to(job).as_posix(): digest_file(path) for path in (job / "build").rglob("*") if path.is_file() and not path.is_symlink()}
+        if live_build != {name: ref["sha256"] for name, ref in post["build_files"].items()}:
+            raise ValueError("Post-review current build changed before deliberate reseal")
     source_event = next(item for item in reversed(data["history"]) if item.get("event") == "role_source")
+    if recovery is not None and source_event.get("post_review_base") != recovery:
+        raise ValueError("Post-review source completion lacks its exact admitted base tag")
     seal = core.seal_source(job)
-    archive = archive_reviews(job, data, previous_seal) if already else None
+    archive = archive_reviews(job, data, previous_seal) if already and recovery is None else None
     invalidate_build(job)
     data["state"] = "source_ready"
     # A deliberate source revision starts a new pipeline, with old receipts retained for audit.
-    data["round"] = 0
+    if recovery is None:
+        data["round"] = 0
+    details = {"post_review_base": recovery} if recovery is not None else {}
     save_job(job, data, "source_resealed" if already else "source_sealed", source_digest=seal, archived_reviews=archive,
-             source_receipt=source_event["receipt"], source_receipt_sha256=source_event["receipt_sha256"])
+             source_receipt=source_event["receipt"], source_receipt_sha256=source_event["receipt_sha256"], **details)
     return data
 
 
@@ -424,14 +496,24 @@ def role_readiness(job: Path, role: str, *, revise: bool = False) -> tuple[dict,
             _, bindings["build"] = translation_ready(job, data)
         seal = source_digest(job)
         bindings["source_seal_sha256"] = digest_file(job / "source.sha256")
+    recovery = importlib.import_module("units")._active_post_review(job, data)
+    if recovery is not None and role in {"terminology", "translation"}:
+        reseal = next((event for event in reversed(data["history"]) if event.get("event") == "source_resealed"), {})
+        if reseal.get("post_review_base") != recovery or reseal.get("source_digest") != seal:
+            raise ValueError("Post-review recovery requires its exact admitted round-preserving reseal")
+        bindings["post_review_base"] = recovery
+    elif role == "terminology" and data["round"] > 0:
+        raise ValueError("Positive-round terminology requires an admitted post-review source recovery")
     return data, selected, selector, seal, bindings
 
 
 def plan_units(job: Path, role: str, pages_per_unit: int, *, draft: Path | None = None, revise: bool = False,
                replan_pending: bool = False, reopen_units: list[str] | None = None,
-               rebase_source: Path | None = None, accept_policy_compatibility: str | None = None) -> dict:
+               rebase_source: Path | None = None, accept_policy_compatibility: str | None = None, post_review_scope: Path | None = None) -> dict:
     job = Path(job).resolve(strict=True)
     source_revision = role == "source" and revise is True and reopen_units is not None
+    if post_review_scope is not None and not source_revision:
+        raise ValueError("Post-review scope requires source --revise --reopen")
     if replan_pending and (role != "translation" or draft is not None or revise):
         raise ValueError("Pending replanning requires translation without draft import or revision")
     if source_revision and (draft is not None or replan_pending or rebase_source is not None or accept_policy_compatibility is not None):
@@ -444,14 +526,14 @@ def plan_units(job: Path, role: str, pages_per_unit: int, *, draft: Path | None 
         raise ValueError("Source rebase cannot combine role/draft/revision/resize/reopen options")
     data, _, _, seal, bindings = role_readiness(job, role, revise=revise)
     units = importlib.import_module("units")
-    if source_revision or rebase_source is not None:
+    if source_revision and post_review_scope is None:
         units._initial_prebuild(data)
     if source_revision:
         source_digest(job)
         terminology_ready(job, data)
     return units.create_plan(job, role, pages_per_unit=pages_per_unit, draft_path=draft, revise=revise,
         readiness={"source_digest": seal, "bindings": bindings}, replan_pending=replan_pending, reopen_units=reopen_units,
-        rebase_source=rebase_source, accept_policy_compatibility=accept_policy_compatibility)
+        rebase_source=rebase_source, accept_policy_compatibility=accept_policy_compatibility, post_review_scope=post_review_scope)
 
 
 def validate_checkpoint(job: Path, receipt: dict, role: str) -> None:
@@ -551,6 +633,10 @@ def assemble_units(job: Path, role: str) -> dict:
     core.save_json(receipt_path, aggregate)
     details = {"receipt": receipt_path.relative_to(job).as_posix(), "receipt_sha256": digest_file(receipt_path),
                "unit_plan": aggregate["plan"], "unit_plan_sha256": aggregate["plan_sha256"]}
+    plan = unit_module._checked(job, aggregate["plan"], aggregate["plan_sha256"])
+    recovery = plan.get("source_revision", {}).get("base") if role == "source" else None
+    if recovery is not None and unit_module._checked(job, recovery["path"], recovery["sha256"]).get("post_review") is not None:
+        details["post_review_base"] = recovery
     if role == "translation":
         save_job(job, data, "translation_content_authored", **details, round=data["round"], state=data["state"])
         return {**finalize_translation(job), "role": role}
@@ -566,6 +652,11 @@ def checkpoint_role(job: Path, role: str, task_result: Path, *, revise: bool = F
     unit_module = importlib.import_module("units")
     if role in {"source", "translation", "review"} and unit_module.page_count(job) > 8:
         raise ValueError("Whole-role checkpoint exceeds eight source pages; checkpoint and assemble bounded units")
+    if role == "source" and data["round"] > 0:
+        raise ValueError("Positive-round source correction requires admitted bounded post-review scope")
+    recovery = unit_module._active_post_review(job, data)
+    if recovery is not None and role in {"source", "translation"}:
+        raise ValueError("Post-review recovery requires its full native bounded source/rebase units")
     task = unit_module.task_metadata(core.load_json(task_result), role, selected)
     receipt = {"version": 1, "kind": "book-role-checkpoint", "role": role, "stage": role, "completed": True,
                **selected, "selector": selector, "task": task, "source_digest": seal,
@@ -578,6 +669,12 @@ def checkpoint_role(job: Path, role: str, task_result: Path, *, revise: bool = F
         core.validate_document("terms", core.load_json(job / "terms.json"))
         if not (job / "handoff.md").read_text(encoding="utf-8").strip():
             raise ValueError("Terminology did not produce a substantive handoff")
+        if recovery is not None:
+            base, old_source = unit_module._archived_source(job, recovery, {})
+            if (job / "terms.json").read_bytes() != unit_module._bound_bytes(job, base["terms"]):
+                raise ValueError("Post-review selective rebase requires exact old terminology bytes")
+            unit_module._fresh_post_review_terminology(job, base, task)
+            unit_module._term_source_names(core.load_json(job / "terms.json"), old_source, core.load_json(job / "book-source.json"))
         receipt.update(terms_sha256=digest_file(job / "terms.json"), handoff_sha256=digest_file(job / "handoff.md"))
     elif role == "translation":
         event = next(item for item in reversed(data["history"]) if item.get("event") == "stage_terminology")
@@ -605,7 +702,9 @@ def checkpoint_role(job: Path, role: str, task_result: Path, *, revise: bool = F
         save_job(job, data, "translation_content_authored", **details, round=data["round"], state=data["state"])
         return {**finalize_translation(job), "role": role}
     if role == "terminology":
-        data["state"] = "terminology_ready"
+        data["state"] = "changes_requested" if recovery is not None else "terminology_ready"
+        if recovery is not None:
+            details["post_review_base"] = recovery
         save_job(job, data, "stage_terminology", **details, round=data["round"], revision=revise)
     else:
         save_job(job, data, f"role_{role}", **details)
@@ -664,6 +763,13 @@ def finalize_translation(job: Path) -> dict:
     proof = translation_authoring_proof(job, data, event)
     if data["state"] != proof["base_state"] or data["round"] != proof["base_round"]:
         raise ValueError("Pending translation authoring state/round changed")
+    recovery = importlib.import_module("units")._active_post_review(job, data)
+    if recovery is not None:
+        units = importlib.import_module("units")
+        plan = units._checked(job, proof.get("plan", ""), proof.get("plan_sha256", ""))
+        if proof.get("execution") != "units" or plan.get("source_rebase", {}).get("base") != recovery:
+            raise ValueError("Post-review recovery finalization requires complete feedback-bound rebase authoring")
+        units._rebase_context(job, plan, {})
     if any(item.get("event") == "stage_translation" and item.get("authoring_receipt") == event["receipt"] for item in data["history"]):
         raise ValueError("Translation authoring proof already finalized; replay is prohibited")
     original_job = digest_file(job / "job.json")
@@ -859,6 +965,7 @@ def parser() -> argparse.ArgumentParser:
                                     help="Reopen selected completed preassembly translation/current unpublished review units, or selected source units with --revise")
                 action.add_argument("--rebase-source", type=Path)
                 action.add_argument("--accept-policy-compatibility")
+                action.add_argument("--post-review-scope", type=Path)
         elif name == "review":
             action.add_argument("report", type=Path)
     return result
@@ -919,7 +1026,8 @@ def main(argv=None) -> int:
                     elif args.command == "plan-units":
                         output = plan_units(job, args.role, args.pages_per_unit, draft=args.draft, revise=args.revise,
                                             replan_pending=args.replan_pending, reopen_units=args.reopen_units,
-                                            rebase_source=args.rebase_source, accept_policy_compatibility=args.accept_policy_compatibility)
+                                            rebase_source=args.rebase_source, accept_policy_compatibility=args.accept_policy_compatibility,
+                                            post_review_scope=args.post_review_scope)
                     elif args.command == "assemble-units":
                         output = assemble_units(job, args.role)
                     elif args.command == "finalize-translation":

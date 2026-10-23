@@ -1,7 +1,7 @@
 """Domain checkpoint/state tests; task metadata fixtures never claim real inference."""
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import copy
 import io
 import itertools
@@ -836,7 +836,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Terminology/handoff"):
             self.submit(passing_review(self.job, 1))
 
-    def test_explicit_reseal_invalidates_downstream_and_preserves_unrelated_files(self):
+    def test_positive_round_reseal_refuses_reset_and_preserves_release_history_and_files(self):
         self.translate()
         self.submit(passing_review(self.job, 1))
         workflow.accept_job(self.job)
@@ -845,25 +845,40 @@ class WorkflowTests(unittest.TestCase):
         book = core.load_json(self.job / "book-source.json")
         book["blocks"][0]["source"].append({"text": "Explicit source correction."})
         core.save_json(self.job / "book-source.json", book)
-        with self.assertRaisesRegex(ValueError, "reseal"):
+        with self.assertRaises(ValueError):
             workflow.seal_job(self.job)
+        task = save_task_result(self.root / "coordinator-results", "source")
+        before = self.job_artifacts()
+        with self.assertRaises(ValueError):
+            workflow.checkpoint_role(self.job, "source", task, revise=True)
+        self.assertEqual(self.job_artifacts(), before)
+        with self.assertRaises(ValueError):
+            workflow.seal_job(self.job, reseal=True)
+        self.assertEqual(self.job_artifacts(), before)
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("approved", 1))
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "User-owned notes")
+        self.assertTrue((self.job / "reviews/round-1.receipt.json").is_file())
+        self.assertFalse((self.job / "reviews/archive").exists())
+
+    def test_round_zero_reseal_invalidates_downstream_but_retains_unrelated_files_and_history(self):
+        self.author_and_checkpoint("terminology")
+        unrelated = self.job / "build/user-notes.txt"
+        unrelated.parent.mkdir(exist_ok=True)
+        unrelated.write_text("User-owned notes", encoding="utf-8")
+        (self.job / "output.pdf").write_bytes(b"Unreleased fixture")
+        (self.job / "build/verification.json").write_bytes(b"Stale fixture")
+        book = core.load_json(self.job / "book-source.json")
+        book["blocks"][0]["source"].append({"text": "Explicit initial source correction."})
+        core.save_json(self.job / "book-source.json", book)
         self.author_and_checkpoint("source", revise=True)
+        before = workflow.load_job(self.job)
         workflow.seal_job(self.job, reseal=True)
-        self.assertEqual(workflow.load_job(self.job)["state"], "source_ready")
-        self.assertEqual(workflow.load_job(self.job)["round"], 0)
-        self.assertTrue(unrelated.exists())
+        after = workflow.load_job(self.job)
+        self.assertEqual((after["state"], after["round"], after["max_rounds"]), ("source_ready", 0, 3))
+        self.assertEqual(after["history"][:-1], before["history"])
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "User-owned notes")
         self.assertFalse((self.job / "output.pdf").exists())
         self.assertFalse((self.job / "build/verification.json").exists())
-        with self.assertRaises(ValueError):
-            workflow.accept_job(self.job)
-        archived = list((self.job / "reviews/archive").glob("source-*/round-1.receipt.json"))
-        self.assertEqual(len(archived), 1)
-        self.assertFalse((self.job / "reviews/round-1.receipt.json").exists())
-        old_event = next(item for item in workflow.load_job(self.job)["history"] if item.get("event") == "review_submitted")
-        self.assertEqual(self.job / old_event["receipt"], archived[0])
-        self.translate()
-        self.assertEqual(self.submit(passing_review(self.job, 1))["state"], "approved")
-        self.assertTrue(workflow.accept_job(self.job).is_file())
 
     def test_unchanged_reseal_cannot_reset_round_limit(self):
         self.translate()
@@ -907,7 +922,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse((job / "book.json").exists())
 
 
-    def test_old_unsubmitted_review_rejected_after_source_revision_same_round(self):
+    def test_unsubmitted_review_does_not_authorize_positive_round_source_reset(self):
         self.translate()
         old_report = passing_review(self.job, 1)
         old_path = self.root / "authored-old-report.json"
@@ -915,15 +930,16 @@ class WorkflowTests(unittest.TestCase):
         source = core.load_json(self.job / "book-source.json")
         source["blocks"][0]["source"].append({"text": "A reviewed source correction changes the manuscript."})
         core.save_json(self.job / "book-source.json", source)
-        self.author_and_checkpoint("source", revise=True)
-        workflow.seal_job(self.job, reseal=True)
-        self.translate()
-        current = workflow.current_build(self.job)
-        self.assertEqual(workflow.load_job(self.job)["round"], old_report["round"])
-        self.assertNotEqual(old_report["content_digest"], current["content_digest"])
-        self.assertNotEqual(old_report["pdf_sha256"], current["pdf_sha256"])
+        task = save_task_result(self.root / "coordinator-results", "source")
+        before = self.job_artifacts()
         with self.assertRaises(ValueError):
-            workflow.submit_review(self.job, old_path)
+            workflow.checkpoint_role(self.job, "source", task, revise=True)
+        self.assertEqual(self.job_artifacts(), before)
+        with self.assertRaises(ValueError):
+            workflow.seal_job(self.job, reseal=True)
+        self.assertEqual(self.job_artifacts(), before)
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("translated", 1))
+        self.assertEqual(core.load_json(old_path), old_report)
         self.assertFalse((self.job / "reviews/round-1.receipt.json").exists())
 
     def test_review_from_different_translated_job_same_round_rejected(self):
@@ -1085,13 +1101,13 @@ class WorkflowTests(unittest.TestCase):
                     finally:
                         path.write_bytes(original)
 
-    def test_identical_source_reinspection_preserves_round_cap_and_seal(self):
+    def test_noop_positive_round_source_reinspection_refuses_without_changing_budget_or_seal(self):
         self.translate()
         data = workflow.load_job(self.job)
         before = (data["state"], data["round"], data["max_rounds"])
         seal = (self.job / "source.sha256").read_bytes()
         build = workflow.current_build(self.job)
-        self.author_and_checkpoint("source", revise=True)
+        self.assert_stage_rejected_without_mutation("source", revise=True)
         current = workflow.load_job(self.job)
         self.assertEqual((current["state"], current["round"], current["max_rounds"]), before)
         self.assertEqual((self.job / "source.sha256").read_bytes(), seal)
@@ -1099,6 +1115,430 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unchanged"):
             workflow.seal_job(self.job, reseal=True)
         self.assertEqual(workflow.load_job(self.job)["round"], data["round"])
+
+class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
+    """Public lifecycle proofs with synthetic native data, not rendering/inference evidence."""
+
+    def setUp(self):
+        import pymupdf
+        import units
+        self.units = units
+        temporary = tempfile.TemporaryDirectory(prefix="post-review-controller-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        original = self.root / "source.pdf"
+        with pymupdf.open() as document:
+            for number in (1, 2):
+                page = document.new_page()
+                page.insert_text((60, 60), f"Original structural correction fixture paragraph {number}.")
+            document.save(original)
+        self.job = self.root / "job"
+        workflow.init_job(original, self.job, "Post-review controller fixture", "en", "en")
+        for role in workflow.ROLES:
+            workflow.configure_model(self.job, role, PROVIDER, MODEL)
+        workflow.extract_job(self.job, ocr="never", dpi=72)
+        (self.job / ".controller.lock").touch()
+        self.build_patch = patch("render.build", side_effect=self.synthetic_build)
+        self.build_patch.start()
+        self.addCleanup(self.build_patch.stop)
+        self.plan("source")
+        self.complete_units("source")
+        workflow.assemble_units(self.job, "source")
+        workflow.seal_job(self.job)
+        core.save_json(self.job / "terms.json", {"version": 1, "terms": []})
+        (self.job / "handoff.md").write_text("Synthetic native terminology fixture: no governed terms.\n", encoding="utf-8")
+        self.initial_term_task = self.task("terminology")
+        workflow.checkpoint_role(self.job, "terminology", self.initial_term_task)
+
+    def task(self, role):
+        return save_task_result(self.root / "coordinator-results", role)
+
+    def files(self):
+        return {path.relative_to(self.job).as_posix(): path.read_bytes()
+                for path in self.job.rglob("*") if path.is_file()}
+
+    def cli(self, *arguments, success=True):
+        capture, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(capture), redirect_stderr(errors):
+            try:
+                code = workflow.main([str(value) for value in arguments])
+            except SystemExit as error:
+                code = error.code
+        if success:
+            self.assertEqual(code, 0, errors.getvalue())
+            return json.loads(capture.getvalue())
+        self.assertNotEqual(code, 0, capture.getvalue())
+
+    def refuse(self, callback):
+        before = self.files()
+        with self.assertRaises((ValueError, OSError, RuntimeError)):
+            callback()
+        self.assertEqual(self.files(), before)
+
+    def refuse_cli(self, *arguments):
+        before = self.files()
+        self.cli(*arguments, success=False)
+        self.assertEqual(self.files(), before)
+
+    def plan(self, role, **options):
+        reference = workflow.plan_units(self.job, role, 1, **options)
+        return core.load_json(self.job / reference["plan"])
+
+    def complete_units(self, role, *, expected=None, failed_review=False):
+        for identifier in self.units.status(self.job, role)["pending"]:
+            binding = self.units.unit_binding(self.job, role, identifier)
+            packet = core.load_json(self.job / binding["packet"])
+            output = {
+                "version": 1, "kind": role + "-unit-result", "unit_id": identifier,
+                "packet_sha256": binding["packet_sha256"],
+                "inspection": [
+                    {"page_id": page["page_id"], "image_sha256": page["image_sha256"],
+                     "findings": [], "protected_checked": True,
+                     "regions": [{"index": index, "classification": "nonprose"}
+                                 for index in range(page["raster_region_count"])]}
+                    for page in packet["pages"] if page["page_id"] in packet["owned_pages"]],
+            }
+            if role == "source":
+                output.update(
+                    source_pages=[{"id": page["page_id"], "locator": page["locator"], "printed_label": None,
+                                   "label_verified": False, "evidence": "Synthetic source inspection declaration."}
+                                  for page in packet["pages"] if page["page_id"] in packet["owned_pages"]],
+                    blocks=copy.deepcopy(packet["blocks"]), notes=copy.deepcopy(packet["notes"]),
+                    protected=copy.deepcopy(packet["protected"]))
+                if expected is not None:
+                    replacements = {block["id"]: block for block in expected["blocks"]}
+                    output["blocks"] = [copy.deepcopy(replacements[block["id"]]) for block in output["blocks"]]
+                if packet["metadata_owner"]:
+                    output["metadata"] = {key: value for key, value in packet["metadata"].items() if value is not None}
+                    if packet["metadata"]["main_body_start"] is None:
+                        output["body_start"] = output["blocks"][0]["id"]
+            elif role == "translation":
+                for category in ("blocks", "notes"):
+                    output[category] = [{"id": item["id"], "target": copy.deepcopy(item["source"])}
+                                        for item in packet[category]]
+                if packet["metadata_owner"]:
+                    output["metadata"] = {"title": "Synthetic current target", "human_preface": None,
+                                          "agent_preface": [{"text": "Synthetic controller data; no model quality claim."}]}
+            else:
+                output.update(
+                    pdf_inspection=[{"page": page, "evidence": "Synthetic PDF inspection declaration."}
+                                    for page in packet["pdf_pages"]],
+                    checks={name: True for name in workflow.REVIEW_CHECKS},
+                    verdict="changes_requested" if failed_review else "pass", findings=[],
+                    evidence=["Synthetic native review fixture, not visual quality evidence."])
+                if failed_review:
+                    output["checks"]["coverage"] = False
+                    output["findings"] = [{"id": identifier + "_fix", "severity": "minor",
+                                           "location": "Synthetic source scope", "detail": "Correct structural source data."}]
+            core.save_json(self.job / binding["result"], output)
+            workflow.checkpoint_unit(self.job, role, identifier, self.task(role))
+
+    def synthetic_build(self, job):
+        """Native-controller state proof only; never a glyph or renderer assertion."""
+        import pymupdf
+        book = core.validate_book(job, translated=True)
+        build = job / "build"
+        build.mkdir(exist_ok=True)
+        pdf = build / "book.pdf"
+        with pymupdf.open() as document:
+            for number in (1, 2):
+                page = document.new_page()
+                page.insert_text((60, 60), f"Synthetic controller build {next(FAKE_BUILD_SEQUENCE)} page {number}.")
+            document.save(pdf)
+        core.save_json(build / "verification.json", {
+            "version": 1, "content_digest": core.content_digest(job), "pdf_sha256": workflow.digest_file(pdf),
+            "passed": True, "checks": {name: True for name in workflow.BUILD_CHECKS},
+            "pages": [{"physical_pdf_page": number} for number in (1, 2)],
+            "block_boundaries": [{"id": block["id"], "start": {"page": min(index + 1, 2)},
+                                  "end": {"page": min(index + 1, 2)}}
+                                 for index, block in enumerate(book["blocks"])],
+            "notes": [], "agent_preface_pages": [1]})
+        (build / "book.tex").write_text("Synthetic generated build evidence.\n", encoding="utf-8")
+        (build / "nested").mkdir(exist_ok=True)
+        (build / "nested/layout.dat").write_bytes(b"Synthetic nested layout evidence")
+        return pdf
+
+    def reviewed_job(self):
+        self.original_target_plan = self.plan("translation")
+        self.complete_units("translation")
+        workflow.assemble_units(self.job, "translation")
+        self.plan("review")
+        self.complete_units("review", failed_review=True)
+        workflow.assemble_units(self.job, "review")
+        workflow.submit_review(self.job, self.job / "reviews/round-1.json")
+        self.original_job = workflow.load_job(self.job)
+        self.original_files = self.files()
+        self.expected = core.load_json(self.job / "book-source.json")
+        block = self.expected["blocks"][0]
+        block.update(kind="list_item", label="1.", list_type="ordered", list_level=0)
+        self.scope = self.job / "work/recovery-scope.json"
+        proposal = self.job / "work/expected-source.json"
+        core.save_json(proposal, self.expected)
+        self.request = {"version": 1, "kind": "post-review-source-scope",
+                        "submitted_review": {"path": "reviews/round-1.receipt.json",
+                                             "sha256": workflow.digest_file(self.job / "reviews/round-1.receipt.json")},
+                        "expected_source": {"path": "work/expected-source.json", "sha256": workflow.digest_file(proposal)},
+                        "source_changes": {"block_ids": [block["id"]],
+                                           "allowed_fields": ["kind", "label", "list_type", "list_level"]}}
+        core.save_json(self.scope, self.request)
+
+    def admission_arguments(self):
+        return ["plan-units", self.job, "source", "--pages-per-unit", "1", "--revise", "--reopen", "u0001",
+                "--post-review-scope", self.scope]
+
+    def admit_and_reseal(self):
+        reference = self.cli(*self.admission_arguments())
+        self.revision_path = self.job / reference["plan"]
+        self.revision = core.load_json(self.revision_path)
+        self.base_reference = self.revision["source_revision"]["base"]
+        self.base = core.load_json(self.job / self.base_reference["path"])
+        self.complete_units("source", expected=self.expected)
+        self.cli("assemble-units", self.job, "source")
+        self.assertEqual(core.load_json(self.job / "book-source.json"), self.expected)
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("changes_requested", 1))
+        self.cli("seal-source", self.job, "--reseal")
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("source_ready", 1))
+
+    def fresh_terminology(self):
+        (self.job / "handoff.md").write_text(
+            f"Synthetic native terminology reinspection of {len(self.expected['blocks'])} current source blocks.\n"
+            "The unchanged complete terms table, target language, genre, domain, protected names, register, "
+            "numbering and formatting policy remain compatible; this declaration is not semantic proof.\n", encoding="utf-8")
+        result = self.cli("checkpoint-role", self.job, "terminology", "--task-result", self.task("terminology"))
+        self.assertEqual((result["state"], result["round"]), ("changes_requested", 1))
+        self.new_term_event = workflow.load_job(self.job)["history"][-1]
+        return result
+
+    def rebase(self):
+        return self.plan("translation", rebase_source=self.revision_path,
+                         accept_policy_compatibility=workflow.digest_file(self.job / "handoff.md"))
+
+    def test_cli_scope_exclusivity_and_controller_admission_refuse_before_writes(self):
+        self.reviewed_job()
+        for role, flags in (
+                ("source", []), ("source", ["--revise"]), ("source", ["--reopen", "u0001"]),
+                ("translation", ["--revise", "--reopen", "u0001"]),
+                ("review", ["--revise", "--reopen", "u0001"]),
+                ("source", ["--revise", "--reopen", "u0001", "--draft", self.job / "book-source.json"]),
+                ("source", ["--revise", "--reopen", "u0001", "--replan-pending"]),
+                ("source", ["--revise", "--reopen", "u0001", "--rebase-source", self.job / "absent.json",
+                            "--accept-policy-compatibility", "0" * 64])):
+            with self.subTest(role=role, flags=flags):
+                self.refuse_cli("plan-units", self.job, role, "--pages-per-unit", "1", *flags,
+                                "--post-review-scope", self.scope)
+        self.refuse_cli("checkpoint-role", self.job, "source", "--task-result", self.task("source"),
+                        "--post-review-scope", self.scope)
+        self.refuse(lambda: self.plan("source", revise=True, reopen_units=["u0001"]))
+        for state, number, cap in (("translated", 1, 3), ("approved", 1, 3), ("exhausted", 3, 3),
+                                   ("changes_requested", 0, 3), ("changes_requested", 1, 1)):
+            original = (self.job / "job.json").read_bytes()
+            try:
+                data = json.loads(original)
+                data.update(state=state, round=number, max_rounds=cap)
+                core.save_json(self.job / "job.json", data)
+                with self.subTest(state=state, number=number, cap=cap):
+                    self.refuse_cli(*self.admission_arguments())
+            finally:
+                (self.job / "job.json").write_bytes(original)
+        before = self.files()
+        self.cli(*self.admission_arguments())
+        self.assertEqual(workflow.load_job(self.job), self.original_job)
+        for name, content in before.items():
+            if name != "units/source/active.json":
+                self.assertEqual((self.job / name).read_bytes(), content, name)
+
+    def test_recovery_preserves_round_bindings_history_and_frozen_build_until_next_review(self):
+        self.reviewed_job()
+        self.admit_and_reseal()
+        tag = self.base["post_review"]
+        self.assertEqual((tag["original_round"], tag["original_max_rounds"]), (1, 3))
+        self.assertEqual(tag["submitted_review"], self.request["submitted_review"])
+        self.assertEqual((self.job / tag["target_document"]["path"]).read_bytes(), self.original_files["book.json"])
+        for name, content in self.original_files.items():
+            if name.startswith("build/"):
+                reference = tag["build_files"][name]
+                self.assertEqual((self.job / reference["path"]).read_bytes(), content, name)
+                self.assertEqual(workflow.digest_file(self.job / reference["path"]), reference["sha256"])
+        self.assertFalse((self.job / "build/verification.json").exists())
+        self.assertFalse((self.job / "reviews/archive").exists())
+        self.fresh_terminology()
+        term = core.load_json(self.job / self.new_term_event["receipt"])
+        self.assertEqual(term["source_digest"], workflow.source_digest(self.job))
+        self.assertNotEqual(term["source_digest"], self.original_files["source.sha256"].decode("ascii").strip())
+        self.assertEqual(term["bindings"]["post_review_base"], self.base_reference)
+        self.assertEqual((self.job / "terms.json").read_bytes(), self.original_files["terms.json"])
+        self.rebase()
+        self.complete_units("translation")
+        with patch("render.build", side_effect=ValueError("synthetic recovery build failure")):
+            self.refuse_pending_assembly()
+        pending = workflow.load_job(self.job)
+        event = pending["history"][-1]
+        proof = workflow.translation_authoring_proof(self.job, pending, event)
+        self.assertEqual((proof["base_state"], proof["base_round"]), ("changes_requested", 1))
+        self.assertEqual(proof["terminology_receipt"], self.new_term_event["receipt"])
+        self.assertEqual(proof["source_digest"], workflow.source_digest(self.job))
+        before = self.files()
+        with patch("render.build", side_effect=ValueError("synthetic recovery build failure")):
+            with self.assertRaises(ValueError):
+                workflow.finalize_translation(self.job)
+        self.assertEqual(self.files(), before)
+        self.refuse(lambda: workflow.assemble_units(self.job, "translation"))
+        for change in ({"max_rounds": 4}, {"max_rounds": 1}, {"round": 0}):
+            old = (self.job / "job.json").read_bytes()
+            try:
+                core.save_json(self.job / "job.json", {**json.loads(old), **change})
+                self.refuse(lambda: workflow.finalize_translation(self.job))
+            finally:
+                (self.job / "job.json").write_bytes(old)
+        task_files = {path.name: path.read_bytes() for path in (self.root / "coordinator-results").glob("*.json")}
+        result = self.cli("finalize-translation", self.job)
+        self.assertEqual((result["state"], result["round"], workflow.load_job(self.job)["max_rounds"]), ("translated", 2, 3))
+        self.assertEqual({path.name: path.read_bytes() for path in (self.root / "coordinator-results").glob("*.json")}, task_files)
+        self.assertEqual((self.job / event["receipt"]).read_bytes(), before[event["receipt"]])
+        finalized = core.load_json(Path(result["receipt"]))
+        self.assertEqual((finalized["authoring_receipt"], finalized["authoring_receipt_sha256"]),
+                         (event["receipt"], event["receipt_sha256"]))
+        self.assertEqual(finalized["source_digest"], proof["source_digest"])
+        self.assertEqual(finalized["terminology_receipt_sha256"], self.new_term_event["receipt_sha256"])
+        self.assertEqual(finalized["content_digest"], workflow.current_build(self.job)["content_digest"])
+        current = workflow.load_job(self.job)
+        self.assertEqual(current["history"][:len(self.original_job["history"])], self.original_job["history"])
+        old_plan_path = self.original_target_plan["units"][0]["packet"].rsplit("/packets/", 1)[0] + "/plan.json"
+        self.assertEqual((self.job / old_plan_path).read_bytes(), self.original_files[old_plan_path])
+        self.assertEqual(self.original_target_plan["base_round"], 0)
+        for name, content in self.original_files.items():
+            if name.startswith(("reviews/", "provenance/", "units/")) and not name.endswith("active.json"):
+                self.assertEqual((self.job / name).read_bytes(), content, name)
+        self.refuse_cli("finalize-translation", self.job)
+        self.refuse_cli("review", self.job, self.job / "reviews/round-1.json")
+        stale = json.loads(self.original_files["reviews/round-1.json"])
+        stale["round"] = 2
+        stale_path = self.root / "relabeled-old-review.json"
+        core.save_json(stale_path, stale)
+        self.refuse_cli("review", self.job, stale_path)
+        self.refuse_cli("accept", self.job)
+        self.assertFalse((self.job / "reviews/round-2.receipt.json").exists())
+        self.plan("review")
+        self.complete_units("review")
+        self.cli("assemble-units", self.job, "review")
+        self.cli("review", self.job, self.job / "reviews/round-2.json")
+        self.cli("accept", self.job)
+        self.assertEqual(workflow.digest_file(self.job / "output.pdf"), workflow.current_build(self.job)["pdf_sha256"])
+        report = core.load_json(self.job / "reviews/round-2.json")
+        self.assertEqual((report["round"], report["content_digest"], report["pdf_sha256"]),
+                         (2, finalized["content_digest"], finalized["pdf_sha256"]))
+        for name, reference in tag["build_files"].items():
+            self.assertEqual((self.job / reference["path"]).read_bytes(), self.original_files[name], name)
+
+    def refuse_pending_assembly(self):
+        with self.assertRaisesRegex(ValueError, "synthetic recovery build failure"):
+            workflow.assemble_units(self.job, "translation")
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("changes_requested", 1))
+
+    def test_fresh_native_terminology_cannot_reuse_old_task_or_relabel_old_receipt(self):
+        self.reviewed_job()
+        old_event = next(item for item in reversed(self.original_job["history"]) if item["event"] == "stage_terminology")
+        old_receipt = self.job / old_event["receipt"]
+        old_bytes = old_receipt.read_bytes()
+        self.admit_and_reseal()
+        self.refuse(self.rebase)
+        self.refuse_cli("checkpoint-role", self.job, "terminology", "--task-result", self.initial_term_task)
+        self.assertEqual(old_receipt.read_bytes(), old_bytes)
+        self.fresh_terminology()
+        new_receipt = self.job / self.new_term_event["receipt"]
+        fresh_bytes = new_receipt.read_bytes()
+        try:
+            new_receipt.write_bytes(old_bytes)
+            self.refuse(self.rebase)
+        finally:
+            new_receipt.write_bytes(fresh_bytes)
+        self.assertNotEqual(core.load_json(new_receipt)["source_digest"], core.load_json(old_receipt)["source_digest"])
+        self.rebase()
+        self.assertEqual(old_receipt.read_bytes(), old_bytes)
+
+    def test_recovery_rejects_noop_replay_and_untagged_target_bypasses(self):
+        self.reviewed_job()
+        proposal = self.job / self.request["expected_source"]["path"]
+        original_proposal = proposal.read_bytes()
+        core.save_json(proposal, core.load_json(self.job / "book-source.json"))
+        noop = copy.deepcopy(self.request)
+        noop["expected_source"]["sha256"] = workflow.digest_file(proposal)
+        core.save_json(self.scope, noop)
+        self.refuse_cli(*self.admission_arguments())
+        proposal.write_bytes(original_proposal)
+        core.save_json(self.scope, self.request)
+        self.admit_and_reseal()
+        self.refuse_cli(*self.admission_arguments())
+        self.refuse_cli("seal-source", self.job, "--reseal")
+        self.fresh_terminology()
+        self.refuse(lambda: self.plan("translation"))
+        self.refuse(lambda: workflow.checkpoint_role(self.job, "translation", self.task("translation")))
+        self.refuse_cli("finalize-translation", self.job)
+        original_job = (self.job / "job.json").read_bytes()
+        try:
+            drifted = json.loads(original_job)
+            drifted["round"] = 2
+            core.save_json(self.job / "job.json", drifted)
+            self.refuse(lambda: self.plan("translation"))
+            self.refuse(lambda: workflow.checkpoint_role(self.job, "translation", self.task("translation")))
+            self.refuse_cli("finalize-translation", self.job)
+        finally:
+            (self.job / "job.json").write_bytes(original_job)
+        self.rebase()
+
+    def test_malformed_recovery_base_cannot_fall_back_to_generic_round_reset(self):
+        self.reviewed_job()
+        reference = self.cli(*self.admission_arguments())
+        revision = core.load_json(self.job / reference["plan"])
+        self.complete_units("source", expected=self.expected)
+        workflow.assemble_units(self.job, "source")
+        path = self.job / revision["source_revision"]["base"]["path"]
+        old = path.read_bytes()
+        try:
+            base = core.load_json(path)
+            del base["post_review"]["submitted_review"]
+            core.save_json(path, base)
+            self.refuse_cli("seal-source", self.job, "--reseal")
+        finally:
+            path.write_bytes(old)
+        self.cli("seal-source", self.job, "--reseal")
+        self.assertEqual(workflow.load_job(self.job)["round"], 1)
+
+    def test_initial_round_zero_source_recovery_still_uses_ordinary_rebase(self):
+        self.plan("translation")
+        self.complete_units("translation")
+        expected = core.load_json(self.job / "book-source.json")
+        expected["blocks"][0].update(kind="list_item", label="1.", list_type="ordered", list_level=0)
+        reference = workflow.plan_units(self.job, "source", 1, revise=True, reopen_units=["u0001"])
+        revision = self.job / reference["plan"]
+        base_ref = core.load_json(revision)["source_revision"]["base"]
+        self.assertNotIn("post_review", core.load_json(self.job / base_ref["path"]))
+        self.complete_units("source", expected=expected)
+        workflow.assemble_units(self.job, "source")
+        workflow.seal_job(self.job, reseal=True)
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("source_ready", 0))
+        (self.job / "handoff.md").write_text("Synthetic fresh native terminology: initial structural correction; unchanged terms and compatible policy.\n", encoding="utf-8")
+        workflow.checkpoint_role(self.job, "terminology", self.task("terminology"))
+        self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("terminology_ready", 0))
+        self.plan("translation", rebase_source=revision,
+                  accept_policy_compatibility=workflow.digest_file(self.job / "handoff.md"))
+        self.complete_units("translation")
+        result = workflow.assemble_units(self.job, "translation")
+        self.assertEqual((result["state"], result["round"]), ("translated", 1))
+        self.assertEqual(workflow.load_job(self.job)["max_rounds"], 3)
+
+    def test_no_source_translation_revision_keeps_ordinary_native_unit_route(self):
+        self.reviewed_job()
+        before = self.files()
+        plan = self.plan("translation")
+        self.assertNotIn("source_rebase", plan)
+        self.complete_units("translation")
+        result = workflow.assemble_units(self.job, "translation")
+        self.assertEqual((result["state"], result["round"]), ("translated", 2))
+        self.assertEqual(workflow.load_job(self.job)["max_rounds"], 3)
+        for name in ("book-source.json", "source.sha256", "terms.json", "handoff.md",
+                     "reviews/round-1.json", "reviews/round-1.receipt.json"):
+            self.assertEqual((self.job / name).read_bytes(), before[name], name)
 
 
 @unittest.skipUnless(shutil.which("xelatex"), "real XeLaTeX required for standalone CLI recovery smoke")

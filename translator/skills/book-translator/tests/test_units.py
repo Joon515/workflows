@@ -5,6 +5,7 @@ from collections import Counter
 import copy
 import io
 import json
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
@@ -293,6 +294,614 @@ class UnitContractTests(unittest.TestCase):
             core.save_json(job / binding["result"], output)
             drafts[spec["result"]] = (job / spec["result"]).read_bytes()
         return job, original, pending, drafts
+
+    def recovery_tree(self, job):
+        """Include empty directories so rejection also proves no partial plan writes."""
+        return {path.relative_to(job).as_posix():
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                for path in job.rglob("*")}
+
+    def recovery_build(self, job, overflow=False, overlap=False):
+        """Real PDF bytes and explicit synthetic ranges; never glyph/render evidence."""
+        book = core.validate_book(job, translated=True)
+        pages = {page["id"]: index + 2 for index, page in enumerate(book["source_pages"])}
+        pdf = synthetic_build(job, len(pages) + (16 if overflow else 2))
+        verification = core.load_json(job / "build/verification.json")
+        verification["block_boundaries"] = [
+            {"id": block["id"], "start": {"page": min(pages[page] for page in block["source_pages"])},
+             "end": {"page": max(pages[page] for page in block["source_pages"])}}
+            for block in book["blocks"] if block["kind"] != "blank"]
+        callers = {token["note"]: block for block in book["blocks"]
+                   for token in block["source"] if "note" in token}
+        verification["notes"] = [
+            {"id": note["id"], "start": {"page": pages[callers[note["id"]]["source_pages"][-1]]},
+             "end": {"page": pages[callers[note["id"]]["source_pages"][-1]]},
+             "callout": {"page": pages[callers[note["id"]]["source_pages"][0]]}}
+            for note in book["notes"]]
+        if overlap:
+            next(row for row in verification["block_boundaries"] if row["id"] == "paragraph32").update(
+                start={"page": 26}, end={"page": 28})
+            next(row for row in verification["notes"] if row["id"] == "note18").update(
+                start={"page": 27}, end={"page": 28})
+        core.save_json(job / "build/verification.json", verification)
+        core.save_json(job / "build/render-manifest.json", {"fixture": "synthetic ranges", "round": workflow.load_job(job)["round"]})
+        (job / "build/book.tex").write_text("% Synthetic retained build input, not compiled TeX.\n", encoding="utf-8")
+        return pdf
+
+    def recovery_review(self, job, failures=None):
+        plan = self.plan(job, "review", pages_per_unit=3)
+        if callable(failures):
+            failures = failures(plan)
+
+        if failures is None:
+            # ACK-like source-unchanged content; no inference from this location string.
+            failures = {next(spec["unit_id"] for spec in plan["units"]
+                             if "paragraph26" in spec["owned_block_ids"]): "coverage"}
+        expected_findings = []
+        for spec in plan["units"]:
+            prepared, _, _, output = self.prepare(job, "review", spec["unit_id"])
+            check = failures.get(spec["unit_id"])
+            if check is not None:
+                output["verdict"] = "changes_requested"
+                if check != "findings_only":
+                    output["checks"][check] = False
+                if check != "source_pages":
+                    finding = {"id": spec["unit_id"] + "_UnchangedACK", "severity": "major",
+                               "location": "Intentionally unparseable freeform location",
+                               "detail": "Synthetic source-unchanged omission requiring fresh target authoring."}
+                    output["findings"] = [finding]
+                    expected_findings.append(finding)
+            self.finish(job, prepared, output)
+        workflow.assemble_units(job, "review")
+        round_number = workflow.load_job(job)["round"]
+        report = job / f"reviews/round-{round_number}.json"
+        self.assertEqual(core.load_json(report)["findings"], expected_findings)
+        result = workflow.submit_review(job, report)
+        self.assertEqual(result["state"], "exhausted" if round_number == workflow.load_job(job)["max_rounds"] else "changes_requested")
+        return plan, [spec["unit_id"] for spec in plan["units"] if spec["unit_id"] in failures]
+
+    def recovery_job(self, shared=False, overflow=False, failure_mode="local"):
+        def independent_source(draft, pages):
+            for item in draft["blocks"] + draft["notes"]:
+                item["source"] = [token for token in item["source"] if "protected" not in token]
+            draft["protected"] = []
+            if shared:
+                draft["protected"] = [{"id": "SharedName", "kind": "name", "value": "Literal Name"}]
+                for identifier in ("paragraph26", "paragraph32"):
+                    next(block for block in draft["blocks"] if block["id"] == identifier)["source"].append({"protected": "SharedName"})
+        job, first = self.pending_translation_job(page_count=36, spans=((6, 7), (18, 19)), draft_update=independent_source)
+        for spec in first["units"]:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            self.finish(job, prepared, output)
+        # Two real preassembly transitions leave nested origin chains under consumed R0 work.
+        for identifier in ("u0002", "u0001"):
+            reference = workflow.plan_units(job, "translation", 6, reopen_units=[identifier])
+        target = core.load_json(job / reference["plan"])
+        for identifier in ("u0001", "u0002"):
+            prepared, _, _, output = self.prepare(job, "translation", identifier)
+            self.finish(job, prepared, output)
+        with patch("render.build", side_effect=lambda current: self.recovery_build(current, overflow, failure_mode == "physical_overlap")):
+            workflow.assemble_units(job, "translation")
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("translated", 1))
+        def select_failures(plan):
+            ack = next(spec["unit_id"] for spec in plan["units"] if "paragraph26" in spec["owned_block_ids"])
+            if failure_mode == "metadata":
+                return {plan["metadata_owner"]: "coverage"}
+            if failure_mode == "global_check":
+                return {ack: "terminology"}
+            if failure_mode == "findings_only":
+                return {ack: "findings_only"}
+            if failure_mode == "pdf_overflow":
+                return {next(spec["unit_id"] for spec in plan["units"] if "_pdf002" in spec["unit_id"]): "typography"}
+            if failure_mode == "multiple_check_only":
+                crossing = next(spec["unit_id"] for spec in plan["units"] if "cross18" in spec["owned_block_ids"])
+                return {ack: "coverage", crossing: "source_pages"}
+            return {ack: "coverage"}
+
+        review, failed = self.recovery_review(job, failures=select_failures)
+        return job, target, review, failed
+
+    def recovery_request(self, job, identifier="cross6"):
+        expected = core.load_json(job / "book-source.json")
+        block = next(item for item in expected["blocks"] if item["id"] == identifier)
+        block.update(kind="list_item", label="6", list_type="ordered", list_level=1 if block.get("list_level") != 1 else 2)
+        directory = job / "work"
+        directory.mkdir(exist_ok=True)
+        expected_path = directory / "expected-source.json"
+        # Different object serialization is accepted only at native candidate comparison.
+        expected_path.write_text(json.dumps(expected, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        event = next(event for event in reversed(workflow.load_job(job)["history"]) if event["event"] == "review_submitted")
+        request = {"version": 1, "kind": "post-review-source-scope",
+                   "submitted_review": {"path": event["receipt"], "sha256": event["receipt_sha256"]},
+                   "expected_source": {"path": expected_path.relative_to(job).as_posix(), "sha256": workflow.digest_file(expected_path)},
+                   "source_changes": {"block_ids": [identifier], "allowed_fields": ["kind", "source", "label", "list_type", "list_level"]}}
+        request_path = directory / "scope.json"
+        core.save_json(request_path, request)
+        return request_path, request, expected
+
+    def recovery_source(self, job, request_path, expected):
+        reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=request_path)
+        revision = core.load_json(job / reference["plan"])
+        prepared, _, _, output = self.prepare(job, "source", "u0001")
+        # Independently authored synthetic native result, not proposal-to-result copying.
+        block = next(block for block in output["blocks"] if block["id"] == "cross6")
+        block.update(kind="list_item", label="6", list_type="ordered",
+                     list_level=1 if block.get("list_level") != 1 else 2)
+        self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        self.assertEqual(core.load_json(job / "book-source.json"), expected)
+        workflow.seal_job(job, reseal=True)
+        return reference, revision
+
+    def recovery_terms(self, job):
+        # Fresh settled metadata is distinct; byte-identical terms are not a reused receipt.
+        (job / "handoff.md").write_text(
+            "Synthetic fresh whole-source terminology decision: governed terms, protected-name bindings, "
+            "target language, register, treatment of untranslated names, title and preface policy remain compatible. "
+            "Structural source list changes require new target authoring, not reused review approval.\n", encoding="utf-8")
+        task = domain_fixtures.save_task_result(self.root / "coordinator-results", "terminology", PROVIDER, MODEL)
+        workflow.checkpoint_role(job, "terminology", task)
+
+    def recovery_terms_and_rebase(self, job, revision_reference):
+        self.recovery_terms(job)
+        reference = workflow.plan_units(job, "translation", 6, rebase_source=job / revision_reference["plan"],
+                                        accept_policy_compatibility=workflow.digest_file(job / "handoff.md"))
+        return core.load_json(job / reference["plan"])
+
+    def test_post_review_source_recovery_preserves_consumed_origins_feedback_and_original_cap(self):
+        job, old_target, review, failed = self.recovery_job()
+        original = workflow.load_job(job)
+        old_history = copy.deepcopy(original["history"])
+        old_files = {path.relative_to(job).as_posix(): path.read_bytes() for path in job.rglob("*") if path.is_file()}
+        old_target_pointer = core.load_json(job / "units/translation/active.json")
+        old_source_pointer = core.load_json(job / "units/source/active.json")
+        old_native = {spec["unit_id"]: core.load_json(job / spec["checkpoint"]) for spec in old_target["units"]}
+        self.assertEqual(old_target["base_round"], 0)
+        self.assertIn("carried_checkpoint", next(spec for spec in old_target["units"] if spec["unit_id"] == "u0003"))
+        request_path, request, expected = self.recovery_request(job)
+        revision_reference, revision = self.recovery_source(job, request_path, expected)
+        base_reference = revision["source_revision"]["base"]
+        base = core.load_json(job / base_reference["path"])
+        post = base["post_review"]
+        self.assertEqual((post["original_round"], post["original_max_rounds"]), (1, 3))
+        self.assertEqual(post["failed_review_units"], failed)
+        self.assertEqual(post["derivation_version"], 1)
+        self.assertEqual(base["target_plan"], old_target_pointer)
+        self.assertEqual(base["source_plan"], old_source_pointer)
+        for field, old_path in (("target_document", "book.json"), ("scope_request", "work/scope.json"),
+                                ("expected_source", request["expected_source"]["path"])):
+            reference = post[field]
+            self.assertEqual(workflow.digest_file(job / reference["path"]), reference["sha256"])
+            if old_path in old_files:
+                self.assertEqual((job / reference["path"]).read_bytes(), old_files[old_path])
+        build_bytes = {content for path, content in old_files.items() if path.startswith("build/")}
+        frozen_bytes = {(job / item["path"]).read_bytes() for item in post["build_files"].values()}
+        self.assertEqual(frozen_bytes, build_bytes)
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("source_ready", 1))
+        for spec in revision["units"][1:]:
+            self.assertEqual(spec["source_carry"]["checkpoint"]["path"], spec["checkpoint"])
+            self.assertEqual(core.load_json(job / spec["result"])["kind"], "source-unit-projection")
+        rebased = self.recovery_terms_and_rebase(job, revision_reference)
+        self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"]), ("changes_requested", 1))
+        self.assertEqual(rebased["readiness"]["bindings"]["post_review_base"], base_reference)
+        self.assertEqual([(spec["unit_id"], spec["owned_pages"]) for spec in rebased["units"]],
+                         [(spec["unit_id"], spec["owned_pages"]) for spec in old_target["units"]])
+        bridge = rebased["source_rebase"]
+        footprints = bridge["footprints"]
+        self.assertNotEqual(footprints["u0001"]["before"], footprints["u0001"]["after"])
+        self.assertNotEqual(footprints["u0002"]["before"], footprints["u0002"]["after"])
+        self.assertEqual(footprints["u0005"]["before"], footprints["u0005"]["after"])
+        self.assertIn("u0005", post["forced_pending"])
+        self.assertNotIn("u0005", bridge["carried"])
+        old_readonly = core.load_json(job / next(spec for spec in old_target["units"] if spec["unit_id"] == "u0002")["packet"])
+        fresh_readonly = core.load_json(job / next(spec for spec in rebased["units"] if spec["unit_id"] == "u0002")["packet"])
+        self.assertEqual(fresh_readonly["blocks"], old_readonly["blocks"])
+        self.assertEqual(fresh_readonly["notes"], old_readonly["notes"])
+        self.assertNotEqual(fresh_readonly["context_blocks"], old_readonly["context_blocks"])
+        self.assertEqual(footprints["u0005"]["decision"], "pending")
+        self.assertEqual(set(bridge["carried"]), {"u0003", "u0006"})
+        for identifier in bridge["carried"]:
+            previous = next(spec for spec in old_target["units"] if spec["unit_id"] == identifier)
+            current = next(spec for spec in rebased["units"] if spec["unit_id"] == identifier)
+            for key in ("packet", "packet_sha256", "result", "checkpoint", "assets_dir"):
+                self.assertEqual(current[key], previous[key], (identifier, key))
+            self.assertEqual(core.load_json(job / current["checkpoint"]), old_native[identifier])
+            self.assertEqual(footprints[identifier]["before"], footprints[identifier]["after"])
+        for spec in rebased["units"]:
+            if spec["unit_id"] in bridge["carried"]:
+                continue
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            if spec["unit_id"] == "u0005":
+                output["blocks"][0]["target"] = [{"page": spec["owned_pages"][0]}, {"text": "Fresh complete ACK correction."}]
+            self.finish(job, prepared, output)
+        with patch("render.build", side_effect=self.recovery_build):
+            result = workflow.assemble_units(job, "translation")
+        self.assertEqual((result["state"], result["round"], workflow.load_job(job)["max_rounds"]), ("translated", 2, 3))
+        workflow.translation_ready(job, workflow.load_job(job))
+        current = workflow.load_job(job)
+        self.assertEqual(current["history"][:len(old_history)], old_history)
+        authored = next(event for event in reversed(current["history"]) if event["event"] == "translation_content_authored")
+        self.assertEqual(core.load_json(job / authored["receipt"])["base_round"], 1)
+        mutable = {"job.json", "book-source.json", "source.sha256", "book.json", "handoff.md",
+                   "units/source/active.json", "units/translation/active.json"}
+        for name, content in old_files.items():
+            if name not in mutable and not name.startswith("build/"):
+                self.assertEqual((job / name).read_bytes(), content, name)
+        with self.assertRaises(ValueError):
+            workflow.submit_review(job, job / "reviews/round-1.json")
+        with self.assertRaises(ValueError):
+            workflow.accept_job(job)
+        self.recovery_review(job)
+        path, _, next_expected = self.recovery_request(job)
+        reference, _ = self.recovery_source(job, path, next_expected)
+        final = self.recovery_terms_and_rebase(job, reference)
+        for identifier in units.status(job, "translation")["pending"]:
+            prepared, _, _, output = self.prepare(job, "translation", identifier)
+            self.finish(job, prepared, output)
+        with patch("render.build", side_effect=self.recovery_build):
+            last = workflow.assemble_units(job, "translation")
+        self.assertEqual((last["state"], last["round"], workflow.load_job(job)["max_rounds"]), ("translated", 3, 3))
+        self.assertEqual(final["base_round"], 2)
+        self.recovery_review(job)
+        self.assertEqual(workflow.load_job(job)["state"], "exhausted")
+        path, _, _ = self.recovery_request(job)
+        before = self.recovery_tree(job)
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+        self.assertEqual(self.recovery_tree(job), before)
+
+
+    def test_post_review_source_rebase_rechecks_frozen_authority_readiness_policy_and_feedback(self):
+        job, target, review, _ = self.recovery_job()
+        path, _, expected = self.recovery_request(job)
+        revision_ref, revision = self.recovery_source(job, path, expected)
+        base_ref = revision["source_revision"]["base"]
+        base = core.load_json(job / base_ref["path"])
+        self.recovery_terms(job)
+        acceptance = workflow.digest_file(job / "handoff.md")
+
+        def refuse(**overrides):
+            options = {"rebase_source": job / revision_ref["plan"], "accept_policy_compatibility": acceptance, **overrides}
+            before = self.recovery_tree(job)
+            with self.assertRaises(ValueError):
+                workflow.plan_units(job, "translation", 6, **options)
+            self.assertEqual(self.recovery_tree(job), before)
+
+        for options in ({"accept_policy_compatibility": None}, {"accept_policy_compatibility": "0" * 64},
+                        {"rebase_source": job / base["source_plan"]["plan"]}, {"rebase_source": None},
+                        {"replan_pending": True}, {"reopen_units": ["u0001"]}, {"draft": job / "book.json"}, {"revise": True}):
+            with self.subTest(options=options):
+                refuse(**options)
+        names = {base_ref["path"], revision_ref["plan"], "book-source.json", "book.json", "source.sha256",
+                 "terms.json", "handoff.md", "note-evidence.png", "extraction.json"}
+        names.update(base[field]["path"] for field in ("job", "source", "terms", "handoff", "seal", "source_receipt", "terminology_receipt"))
+        names.update(ref["path"] for field, ref in base["post_review"].items() if isinstance(ref, dict) and set(ref) == {"path", "sha256"})
+        names.update(ref["path"] for ref in base["post_review"]["build_files"].values())
+        names.update(spec[field] for spec in (target["units"][2], review["units"][-1], revision["units"][0])
+                     for field in ("packet", "result", "checkpoint"))
+        term_event = next(event for event in reversed(workflow.load_job(job)["history"]) if event["event"] == "stage_terminology")
+        names.add(term_event["receipt"])
+        for name in sorted(names):
+            artifact = job / name
+            content = artifact.read_bytes()
+            try:
+                artifact.write_bytes(content + b"\n ")
+                with self.subTest(postfreeze_artifact=name):
+                    refuse()
+            finally:
+                artifact.write_bytes(content)
+        _, _, _, seal, bindings = workflow.role_readiness(job, "translation")
+        readiness = {"source_digest": seal, "bindings": bindings}
+        for field in ("source_digest", "source_seal_sha256", "terminology_receipt_sha256", "terms_sha256",
+                      "handoff_sha256", "post_review_base", "extra"):
+            invalid = copy.deepcopy(readiness)
+            if field == "source_digest":
+                invalid[field] = "0" * 64
+            elif field == "post_review_base":
+                invalid["bindings"][field] = {**base_ref, "sha256": "0" * 64}
+            else:
+                invalid["bindings"][field] = "0" * 64
+            before = self.recovery_tree(job)
+            with self.subTest(readiness=field), self.assertRaises(ValueError):
+                units.create_plan(job, "translation", pages_per_unit=6, readiness=invalid,
+                                  rebase_source=job / revision_ref["plan"], accept_policy_compatibility=acceptance)
+            self.assertEqual(self.recovery_tree(job), before)
+        reference = workflow.plan_units(job, "translation", 6, rebase_source=job / revision_ref["plan"],
+                                        accept_policy_compatibility=acceptance)
+        active = job / "units/translation/active.json"
+        pointer_bytes = active.read_bytes()
+        plan_path = job / reference["plan"]
+        plan_bytes = plan_path.read_bytes()
+        valid = core.load_json(plan_path)
+        for case in ("omitted_feedback", "false_footprint", "forced_carry", "changed_owner", "changed_native_origin"):
+            invalid = copy.deepcopy(valid)
+            bridge = invalid["source_rebase"]
+            if case == "omitted_feedback":
+                bridge["footprints"]["u0005"]["review_exclusions"] = []
+            elif case == "false_footprint":
+                bridge["footprints"]["u0002"]["after"] = bridge["footprints"]["u0002"]["before"]
+            elif case == "forced_carry":
+                previous = next(spec for spec in target["units"] if spec["unit_id"] == "u0005")
+                bridge["carried"]["u0005"] = {"path": previous["checkpoint"], "sha256": workflow.digest_file(job / previous["checkpoint"])}
+            elif case == "changed_owner":
+                invalid["metadata_owner"] = "u0005"
+            else:
+                next(spec for spec in invalid["units"] if spec["unit_id"] == "u0003")["carried_checkpoint"]["sha256"] = "0" * 64
+            try:
+                core.save_json(plan_path, invalid)
+                core.save_json(active, {"plan": reference["plan"], "plan_sha256": workflow.digest_file(plan_path)})
+                before = self.recovery_tree(job)
+                with self.subTest(recomputed=case, endpoint="readiness"), self.assertRaises(ValueError):
+                    units.unit_binding(job, "translation", "u0001")
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                plan_path.write_bytes(plan_bytes)
+                active.write_bytes(pointer_bytes)
+        self.assertEqual(units.status(job, "translation")["admitted"], ["u0003", "u0006"])
+
+
+    def test_post_review_source_scope_preflight_rejects_unauthorized_complete_proposals_without_writes(self):
+        job, _, _, _ = self.recovery_job()
+        path, good, expected = self.recovery_request(job)
+        expected_path = job / good["expected_source"]["path"]
+        original = core.load_json(job / "book-source.json")
+        cases = ["missing_expected", "incomplete_expected", "unknown_request_field", "unknown_scope_field",
+                 "wrong_kind", "wrong_version", "wrong_hash", "malformed_hash", "wrong_submitted", "missing_file",
+                 "empty_ids", "duplicate_ids", "unknown_ids", "outside_owner", "empty_fields", "duplicate_fields",
+                 "unsupported_field", "owner_field", "no_change", "extra_unchanged_id", "unlisted_change",
+                 "selected_owner_extra_edit", "metadata", "notes", "definitions", "page_inventory", "page_reassignment",
+                 "block_order", "block_insert", "block_delete", "block_id", "source_asset", "invalid_structure"]
+        for case in cases:
+            request, proposal = copy.deepcopy(good), copy.deepcopy(expected)
+            selected = next(block for block in proposal["blocks"] if block["id"] == "cross6")
+            if case == "missing_expected":
+                request.pop("expected_source")
+            elif case == "incomplete_expected":
+                proposal = {"blocks": proposal["blocks"]}
+            elif case == "unknown_request_field":
+                request["allow_reset"] = True
+            elif case == "unknown_scope_field":
+                request["source_changes"]["owner"] = "u0001"
+            elif case == "wrong_kind":
+                request["kind"] = "source-revision"
+            elif case == "wrong_version":
+                request["version"] = True
+            elif case in {"empty_ids", "duplicate_ids", "unknown_ids", "outside_owner", "extra_unchanged_id"}:
+                request["source_changes"]["block_ids"] = {
+                    "empty_ids": [], "duplicate_ids": ["cross6", "cross6"], "unknown_ids": ["unknown"],
+                    "outside_owner": ["paragraph26"], "extra_unchanged_id": ["cross6", "paragraph1"]}[case]
+            elif case in {"empty_fields", "duplicate_fields", "unsupported_field", "owner_field"}:
+                request["source_changes"]["allowed_fields"] = {
+                    "empty_fields": [], "duplicate_fields": ["kind", "kind"], "unsupported_field": ["target"],
+                    "owner_field": ["kind", "source_pages"]}[case]
+            elif case == "no_change":
+                proposal = copy.deepcopy(original)
+            elif case in {"unlisted_change", "selected_owner_extra_edit"}:
+                identifier = "paragraph26" if case == "unlisted_change" else "paragraph2"
+                next(block for block in proposal["blocks"] if block["id"] == identifier)["source"].append({"text": "Unauthorized extra prose."})
+            elif case == "metadata":
+                proposal["title"] = "Unauthorized global title"
+            elif case == "notes":
+                proposal["notes"][0]["source"].append({"text": "Unauthorized note edit."})
+            elif case == "definitions":
+                proposal["protected"].append({"id": "ExtraName", "kind": "name", "value": "New binding"})
+            elif case == "page_inventory":
+                proposal["source_pages"][0]["printed_label"] = "new"
+            elif case == "page_reassignment":
+                selected["source_pages"] = [proposal["source_pages"][0]["id"]]
+            elif case == "block_order":
+                proposal["blocks"][1:3] = reversed(proposal["blocks"][1:3])
+            elif case == "block_insert":
+                proposal["blocks"].insert(1, {**copy.deepcopy(proposal["blocks"][0]), "id": "InsertedBlock"})
+            elif case == "block_delete":
+                proposal["blocks"].pop()
+            elif case == "block_id":
+                selected["id"] = "ChangedIdentity"
+            elif case == "source_asset":
+                selected["source_evidence"] = [{"asset": "note-evidence.png", "source_page": selected["source_pages"][0],
+                                                  "description": "Unauthorized asset-reference set change."}]
+            elif case == "invalid_structure":
+                selected["list_level"] = 99
+            core.save_json(expected_path, proposal)
+            if "expected_source" in request:
+                request["expected_source"]["sha256"] = workflow.digest_file(expected_path)
+            if case in {"wrong_hash", "malformed_hash"}:
+                request["expected_source"]["sha256"] = "0" * 64 if case == "wrong_hash" else "not-sha256"
+            elif case == "wrong_submitted":
+                request["submitted_review"]["sha256"] = "0" * 64
+            elif case == "missing_file":
+                request["expected_source"]["path"] = "work/absent.json"
+            core.save_json(path, request)
+            before = self.recovery_tree(job)
+            with self.subTest(case=case, entry="controller"), self.assertRaises(ValueError):
+                workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+            self.assertEqual(self.recovery_tree(job), before, case)
+            _, _, _, seal, bindings = workflow.role_readiness(job, "source", revise=True)
+            with self.subTest(case=case, entry="domain"), self.assertRaises(ValueError):
+                units.create_plan(job, "source", pages_per_unit=6, revise=True, reopen_units=["u0001"],
+                                  readiness={"source_digest": seal, "bindings": bindings}, post_review_scope=path)
+            self.assertEqual(self.recovery_tree(job), before, case)
+        core.save_json(expected_path, expected)
+        good["expected_source"]["sha256"] = workflow.digest_file(expected_path)
+        core.save_json(path, good)
+        outside = self.root / "outside-expected.json"
+        core.save_json(outside, expected)
+        link = job / "work/escape.json"
+        link.symlink_to(outside)
+        for escaped in ("../outside-expected.json", str(outside), "work/escape.json"):
+            request = copy.deepcopy(good)
+            request["expected_source"]["path"] = escaped
+            core.save_json(path, request)
+            before = self.recovery_tree(job)
+            with self.subTest(expected_path=escaped), self.assertRaises(ValueError):
+                workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+            self.assertEqual(self.recovery_tree(job), before)
+        core.save_json(path, good)
+        outside_scope = self.root / "outside-scope.json"
+        core.save_json(outside_scope, good)
+        for request_path in (outside_scope, job / "work/scope-escape.json"):
+            if request_path.parent == job / "work":
+                request_path.symlink_to(outside_scope)
+            before = self.recovery_tree(job)
+            with self.subTest(request_path=request_path.name), self.assertRaises(ValueError):
+                workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=request_path)
+            self.assertEqual(self.recovery_tree(job), before)
+
+    def test_post_review_source_native_whole_owner_and_exact_candidate_are_mandatory(self):
+        job, _, _, _ = self.recovery_job()
+        path, _, expected = self.recovery_request(job)
+        reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+        revision = core.load_json(job / reference["plan"])
+        selected = next(spec for spec in revision["units"] if spec["unit_id"] == "u0001")
+        prepared, binding, packet, complete = self.prepare(job, "source", "u0001")
+        next(block for block in complete["blocks"] if block["id"] == "cross6").update(
+            kind="list_item", label="6", list_type="ordered", list_level=1)
+        canonical_before = {name: (job / name).read_bytes() for name in ("job.json", "book-source.json", "book.json", "source.sha256")}
+        for case in ("patch_only", "extra_owner_field", "inspection"):
+            output = copy.deepcopy(complete)
+            if case == "patch_only":
+                output["blocks"] = [block for block in output["blocks"] if block["id"] == "cross6"]
+            elif case == "extra_owner_field":
+                output["owner"] = "u0001"
+            else:
+                output["inspection"].pop()
+            core.save_json(job / binding["result"], output)
+            task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", PROVIDER, MODEL)
+            before = self.recovery_tree(job)
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                workflow.checkpoint_unit(job, "source", "u0001", task)
+            self.assertEqual(self.recovery_tree(job), before)
+            self.assertFalse((job / selected["checkpoint"]).exists())
+        self.finish(job, prepared, complete)
+        base = core.load_json(job / revision["source_revision"]["base"]["path"])
+        for ref in (base["post_review"]["expected_source"], base["post_review"]["scope_request"]):
+            frozen = job / ref["path"]
+            content = frozen.read_bytes()
+            try:
+                frozen.write_bytes(content + b" ")
+                before = self.recovery_tree(job)
+                with self.subTest(frozen=frozen.name), self.assertRaises(ValueError):
+                    workflow.assemble_units(job, "source")
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                frozen.write_bytes(content)
+        for name, content in canonical_before.items():
+            self.assertEqual((job / name).read_bytes(), content, name)
+        workflow.assemble_units(job, "source")
+        self.assertEqual(core.load_json(job / "book-source.json"), expected)
+
+    def test_post_review_source_native_complete_disagreement_never_publishes(self):
+        for case in ("extra_selected_owner_edit", "different_allowed_value", "metadata"):
+            with self.subTest(case=case):
+                job, _, _, _ = self.recovery_job()
+                path, _, _ = self.recovery_request(job)
+                workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+                prepared, _, _, output = self.prepare(job, "source", "u0001")
+                next(block for block in output["blocks"] if block["id"] == "cross6").update(
+                    kind="list_item", label="6", list_type="ordered", list_level=1)
+                if case == "extra_selected_owner_edit":
+                    output["blocks"][1]["source"].append({"text": "Unapproved edit elsewhere inside selected whole owner."})
+                elif case == "different_allowed_value":
+                    next(block for block in output["blocks"] if block["id"] == "cross6")["label"] = "unapproved"
+                else:
+                    output["metadata"]["title"] = "Unapproved complete-source title"
+                self.finish(job, prepared, output)
+                before = self.recovery_tree(job)
+                with self.assertRaisesRegex(ValueError, "expected_source"):
+                    workflow.assemble_units(job, "source")
+                self.assertEqual(self.recovery_tree(job), before)
+                with self.assertRaises(ValueError):
+                    workflow.seal_job(job, reseal=True)
+                self.assertEqual(self.recovery_tree(job), before)
+
+    def test_post_review_source_admission_rejects_changed_frozen_inputs_without_writes(self):
+        job, target, review, _ = self.recovery_job()
+        path, _, _ = self.recovery_request(job)
+        data = workflow.load_job(job)
+        receipt_events = [event for event in data["history"] if "receipt" in event]
+        source_plan = core.load_json(job / core.load_json(job / "units/source/active.json")["plan"])
+        names = {"book-source.json", "source.sha256", "book.json", "terms.json", "handoff.md", "extraction.json",
+                 "build/book.pdf", "build/verification.json", "note-evidence.png", data["source_file"]}
+        names.update(event["receipt"] for event in receipt_events)
+        names.update({"reviews/round-1.json", "reviews/round-1.receipt.json"})
+        for plan in (source_plan, target, review):
+            for spec in plan["units"]:
+                names.update(spec[field] for field in ("checkpoint", "packet", "result"))
+            # One member per role exercises hash-pinned origin closure without duplicate siblings.
+            if plan is not review:
+                for spec in plan["units"][1:]:
+                    names.difference_update(spec[field] for field in ("checkpoint", "packet", "result"))
+        names.add(next(iter(source_plan["pages"].values()))["image"])
+        for name in sorted(names):
+            artifact = job / name
+            content = artifact.read_bytes()
+            try:
+                artifact.write_bytes(content + b"\n ")
+                before = self.recovery_tree(job)
+                with self.subTest(artifact=name), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                artifact.write_bytes(content)
+        for field, value in (("round", 0), ("round", 2), ("max_rounds", 4), ("state", "translated"),
+                             ("source_language", "fr"), ("target_language", "fr"), ("title", "Changed original title"),
+                             ("layout", {**data["layout"], "outer_mm": data["layout"]["outer_mm"] + 1}),
+                             ("history", [{**data["history"][0], "event": "changed_prefix"}, *data["history"][1:]])):
+            content = (job / "job.json").read_bytes()
+            try:
+                core.save_json(job / "job.json", {**data, field: value})
+                before = self.recovery_tree(job)
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                (job / "job.json").write_bytes(content)
+        for role in workflow.ROLES:
+            content = (job / "job.json").read_bytes()
+            try:
+                core.save_json(job / "job.json", {**data, "models": {**data["models"], role: {"provider": "openai-codex", "model": "gpt-6-luna"}}})
+                before = self.recovery_tree(job)
+                with self.subTest(changed_model=role), self.assertRaises(ValueError):
+                    workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                (job / "job.json").write_bytes(content)
+
+
+    def test_post_review_source_feedback_closure_includes_context_crossings_notes_shared_and_global_scopes(self):
+        expected_forced = {"multiple_check_only": {"u0003", "u0004", "u0005"},
+                           "shared_definition": {"u0004", "u0005", "u0006"},
+                           "physical_overlap": {"u0003", "u0004", "u0005", "u0006"}}
+        for mode in (*expected_forced, "metadata", "global_check", "findings_only", "pdf_overflow"):
+            with self.subTest(mode=mode):
+                job, target, review, failed = self.recovery_job(shared=mode == "shared_definition",
+                    overflow=mode == "pdf_overflow", failure_mode=mode)
+                if mode == "multiple_check_only":
+                    check_only = next(spec for spec in review["units"] if "cross18" in spec["owned_block_ids"])
+                    output = core.load_json(job / check_only["result"])
+                    self.assertEqual(output["findings"], [])
+                    self.assertFalse(output["checks"]["source_pages"])
+                if mode == "pdf_overflow":
+                    self.assertTrue(any("_pdf002" in identifier for identifier in failed))
+                path, _, expected = self.recovery_request(job)
+                reference, revision = self.recovery_source(job, path, expected)
+                base = core.load_json(job / revision["source_revision"]["base"]["path"])
+                forced = base["post_review"]["forced_pending"]
+                self.assertEqual(base["post_review"]["failed_review_units"], failed)
+                self.assertEqual(set(forced), expected_forced.get(mode, {spec["unit_id"] for spec in target["units"]}))
+                self.assertEqual(set(identifier for reasons in forced.values() for identifier in reasons), set(failed))
+                rebased = self.recovery_terms_and_rebase(job, reference)
+                carried = set(rebased["source_rebase"]["carried"])
+                expected_carry = {"u0003", "u0006"} - set(forced)
+                self.assertEqual(carried, expected_carry)
+                for identifier in forced:
+                    self.assertEqual(rebased["source_rebase"]["footprints"][identifier]["decision"], "pending")
+                    self.assertEqual(rebased["source_rebase"]["footprints"][identifier]["review_exclusions"], forced[identifier])
+                if mode == "physical_overlap":
+                    # No prose-location parser can derive note18/paragraph32 ownership from ACK wording.
+                    self.assertEqual(set(forced["u0003"]), set(failed))
+                    self.assertEqual(set(forced["u0006"]), set(failed))
+
 
     def corrected_source_revision(self, packet, binding):
         output = unit_output(packet, binding)
