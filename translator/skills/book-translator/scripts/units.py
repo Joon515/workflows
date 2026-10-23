@@ -17,6 +17,7 @@ import shutil
 import uuid
 
 from jsonschema import Draft202012Validator
+from PIL import Image
 
 import core
 
@@ -811,56 +812,516 @@ def _strict_ref(job: Path, value: dict) -> dict:
             or not isinstance(value.get("sha256"), str) or len(value["sha256"]) != 64
             or any(char not in "0123456789abcdef" for char in value["sha256"])):
         raise ValueError("Post-review scope requires exact contained path/sha256 references")
+    name = value["path"]
+    path = _path(job, name)
+    if Path(name).as_posix() != name or path != job / name or any(
+            parent.is_symlink() for parent in [job / name, *(job / name).parents] if parent.is_relative_to(job)):
+        raise ValueError("Post-review reference aliases/symlinks are forbidden")
+    if not path.is_file() or path.stat().st_nlink != 1:
+        raise ValueError("Post-review reference must be a regular unaliased file")
     _bound_bytes(job, value)
     return value
 
 
-def _expected_source(job: Path, old: dict, expected: dict, changes: dict, plan: dict, reopened: list) -> None:
-    if not isinstance(changes, dict) or set(changes) != {"block_ids", "allowed_fields"}:
-        raise ValueError("Post-review source_changes must name block_ids and allowed_fields")
-    ids, fields = changes["block_ids"], changes["allowed_fields"]
-    for values in (ids, fields):
-        if (not isinstance(values, list) or not values or any(not isinstance(value, str) or not value for value in values)
-                or len(set(values)) != len(values)):
-            raise ValueError("Post-review source scope requires unique nonempty block IDs and fields")
-    if not set(fields) <= {"kind", "source", "label", "list_type", "list_level"}:
-        raise ValueError("Unsupported post-review structural source field authority")
+def _scope_json(path: Path) -> dict:
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate post-review scope object key")
+            result[key] = value
+        return result
+    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
+
+
+def _scope_shape(value: object, keys: set, location: str) -> None:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"Invalid closed post-review {location} shape")
+
+
+def _scope_ids(values: object, location: str, *, nonempty=False) -> list:
+    if (not isinstance(values, list) or (nonempty and not values)
+            or any(not isinstance(value, str) or not value for value in values)
+            or len(set(values)) != len(values)):
+        raise ValueError(f"Post-review {location} requires unique nonempty identifiers")
+    return values
+
+
+def _scope_witnesses(job: Path, values: object, *, required=False) -> None:
+    if not isinstance(values, list) or (required and not values):
+        raise ValueError("Post-review witnesses must be an explicit readonly reference array")
+    for value in values:
+        _strict_ref(job, value)
+    if len({value["path"] for value in values}) != len(values):
+        raise ValueError("Duplicate post-review witness reference")
+
+
+def _source_scope_request(job: Path, request: dict, *, historical=False) -> None:
+    _scope_shape(request, {"version", "kind", "submitted_review", "expected_source", "source_changes"}, "request")
+    version = request["version"]
+    if (type(version) is not int or version not in ({1, 2} if historical else {2})
+            or request["kind"] != "post-review-source-scope"):
+        raise ValueError("Invalid strict post-review source scope request version; live authority requires version 2")
+    for key in ("submitted_review", "expected_source"):
+        _strict_ref(job, request[key])
+    changes = request["source_changes"]
+    if version == 1:
+        # Provenance-only interpretation of an already admitted immutable base.
+        _scope_shape(changes, {"block_ids", "allowed_fields"}, "historical v1 changes")
+        _scope_ids(changes["block_ids"], "historical blocks", nonempty=True)
+        fields = _scope_ids(changes["allowed_fields"], "historical fields", nonempty=True)
+        if not set(fields) <= {"kind", "source", "label", "list_type", "list_level"}:
+            raise ValueError("Unsupported historical post-review structural field")
+        return
+    _scope_shape(changes, {"block_fields", "deleted_blocks", "block_orders", "page_fields", "added_protected",
+                           "removed_protected_ids", "added_notes", "crop_derivations"}, "source_changes")
+    for key, eligible in (("block_fields", {"kind", "source", "label", "list_type", "list_level", "asset", "width", "height"}),
+                          ("page_fields", {"printed_label", "label_verified", "evidence"})):
+        if not isinstance(changes[key], dict) or any(not isinstance(name, str) or not name for name in changes[key]):
+            raise ValueError("Post-review field authority must be a per-ID map")
+        for fields in changes[key].values():
+            if not set(_scope_ids(fields, key, nonempty=True)) <= eligible:
+                raise ValueError("Unsupported post-review field authority")
+    _scope_ids(changes["removed_protected_ids"], "removed protected IDs")
+    for key in ("deleted_blocks", "block_orders", "added_protected", "added_notes", "crop_derivations"):
+        if not isinstance(changes[key], list):
+            raise ValueError(f"Post-review {key} must be an array")
+    for row in changes["deleted_blocks"]:
+        if not isinstance(row, dict):
+            raise ValueError("Invalid post-review deletion record")
+        if row.get("kind") == "redundant-image":
+            _scope_shape(row, {"id", "kind", "retained_block_ids"}, "image deletion")
+            _scope_ids(row["retained_block_ids"], "retained image representation", nonempty=True)
+        elif row.get("kind") == "redundant-ordinary-fragment":
+            _scope_shape(row, {"id", "kind", "retained_at"}, "ordinary-fragment deletion")
+            if not isinstance(row["retained_at"], list) or not row["retained_at"]:
+                raise ValueError("Ordinary deletion requires exact retained destinations")
+            for destination in row["retained_at"]:
+                if not isinstance(destination, dict) or destination.get("field") not in {"label", "source"}:
+                    raise ValueError("Invalid ordinary-fragment destination")
+                keys = {"block_id", "field"} | ({"text_token_indexes"} if destination["field"] == "source" else set())
+                _scope_shape(destination, keys, "ordinary-fragment destination")
+                _scope_ids([destination["block_id"]], "destination block")
+                if destination["field"] == "source":
+                    indexes = destination["text_token_indexes"]
+                    if (not isinstance(indexes, list) or not indexes or any(type(index) is not int or index < 0 for index in indexes)
+                            or len(set(indexes)) != len(indexes)):
+                        raise ValueError("Ordinary destination needs exact unique text-token indexes")
+            if len({_canonical(destination) for destination in row["retained_at"]}) != len(row["retained_at"]):
+                raise ValueError("Duplicate ordinary-fragment destination")
+        else:
+            raise ValueError("Unsupported post-review deletion kind")
+        _scope_ids([row["id"]], "deleted block")
+    for row in changes["block_orders"]:
+        _scope_shape(row, {"unit_id", "block_ids"}, "block order")
+        _scope_ids([row["unit_id"]], "order owner")
+        _scope_ids(row["block_ids"], "surviving block permutation", nonempty=True)
+    for category in ("added_protected", "added_notes"):
+        for row in changes[category]:
+            keys = {"id", "unit_id", "witnesses"} | ({"callout_block_id"} if category == "added_notes" else set())
+            _scope_shape(row, keys, category)
+            _scope_ids([row["id"]], "addition ID")
+            _scope_ids([row["unit_id"]], "addition owner")
+            if category == "added_notes":
+                _scope_ids([row["callout_block_id"]], "note callout")
+            _scope_witnesses(job, row["witnesses"], required=category == "added_notes")
+    refs = [request["submitted_review"], request["expected_source"]]
+    for category in ("added_protected", "added_notes"):
+        refs.extend(ref for row in changes[category] for ref in row["witnesses"])
+    for row in changes["crop_derivations"]:
+        _scope_shape(row, {"unit_id", "origin", "use", "input", "rect_px", "output"}, "crop")
+        _scope_ids([row["unit_id"]], "crop owner")
+        origin, use = row["origin"], row["use"]
+        if not isinstance(origin, dict) or not isinstance(use, dict):
+            raise ValueError("Invalid crop origin/use")
+        if origin.get("kind") == "source-asset" and use.get("kind") == "image-block":
+            _scope_shape(origin, {"kind", "block_id"}, "crop origin")
+            _scope_shape(use, {"kind", "block_id"}, "crop use")
+            _scope_ids([origin["block_id"]], "crop block")
+            if use["block_id"] != origin["block_id"]:
+                raise ValueError("Crop must retain the same existing image block")
+        elif origin.get("kind") == "original-page" and use.get("kind") == "restoration-note":
+            _scope_shape(origin, {"kind", "page_id"}, "crop origin")
+            _scope_shape(use, {"kind", "note_id", "callout_block_id", "source_page"}, "crop use")
+            for name in (origin["page_id"], use["note_id"], use["callout_block_id"], use["source_page"]):
+                _scope_ids([name], "restoration crop association")
+            if origin["page_id"] != use["source_page"]:
+                raise ValueError("Restoration crop must use its exact original source page")
+        else:
+            raise ValueError("Unsupported crop origin/use pairing")
+        for key in ("input", "output"):
+            image = row[key]
+            _scope_shape(image, {"ref", "width_px", "height_px", "mode"}, "crop raster")
+            _strict_ref(job, image["ref"])
+            refs.append(image["ref"])
+            if (any(type(image[dimension]) is not int or image[dimension] <= 0 for dimension in ("width_px", "height_px"))
+                    or not isinstance(image["mode"], str) or not image["mode"]):
+                raise ValueError("Crop raster needs exact integer dimensions and decoded mode")
+        rect = row["rect_px"]
+        if not isinstance(rect, list) or len(rect) != 4 or any(type(value) is not int for value in rect):
+            raise ValueError("Crop rectangle must be four exact integers")
+    for key, field in (("deleted_blocks", "id"), ("block_orders", "unit_id"), ("added_protected", "id"), ("added_notes", "id")):
+        _scope_ids([row[field] for row in changes[key]], key)
+    uses = [_canonical(row["use"]) for row in changes["crop_derivations"]]
+    outputs = [row["output"]["ref"]["path"] for row in changes["crop_derivations"]]
+    if len(set(uses)) != len(uses) or len(set(outputs)) != len(outputs):
+        raise ValueError("Duplicate crop use/output declaration")
+    identities = {}
+    for ref in refs:
+        if ref["path"] in identities and identities[ref["path"]] != ref["sha256"]:
+            raise ValueError("Conflicting post-review reference hash identities")
+        identities[ref["path"]] = ref["sha256"]
+
+
+def _changed_fields(before: dict, after: dict) -> set:
+    return {key for key in before.keys() | after.keys()
+            if (key in before) != (key in after) or before.get(key) != after.get(key)}
+
+
+def _asset_associations(book: dict) -> Counter:
+    """Count exact uses, not just filenames; text-token resegmentation is irrelevant."""
+    uses = Counter()
+    for category in ("blocks", "notes"):
+        for item in book.get(category, []):
+            def add(kind, asset, geometry=None):
+                uses[(category, item["id"], kind, asset, _canonical(geometry))] += 1
+            if item.get("kind") == "image":
+                add("image-block", item["asset"], {key: item[key] for key in ("width", "height")})
+            for image in item.get("images", []):
+                add("group-image", image["asset"], image)
+            for field in ("source", "target"):
+                for token in item.get(field, []):
+                    if "image" in token:
+                        add(field + "-image", token["image"]["asset"], token["image"])
+            for evidence in item.get("source_evidence", []):
+                add("source-evidence", evidence["asset"], evidence)
+            if item.get("restoration"):
+                add("restoration-damage", item["restoration"]["damage_asset"])
+    return uses
+
+
+def _crop_pixels(job: Path, row: dict) -> None:
+    before, after = row["input"], row["output"]
+    _strict_ref(job, before["ref"])
+    _strict_ref(job, after["ref"])
+    if before["ref"]["path"] == after["ref"]["path"]:
+        raise ValueError("Prepared crop must be a distinct append-only candidate")
+    x0, y0, x1, y1 = row["rect_px"]
+    width, height = before["width_px"], before["height_px"]
+    if (not 0 <= x0 < x1 <= width or not 0 <= y0 < y1 <= height
+            or (x0, y0, x1, y1) == (0, 0, width, height)
+            or (after["width_px"], after["height_px"]) != (x1 - x0, y1 - y0)
+            or after["mode"] != before["mode"]):
+        raise ValueError("Prepared crop must be an exact proper in-bounds rectangle with unchanged mode")
+    try:
+        with Image.open(_path(job, before["ref"]["path"])) as source, Image.open(_path(job, after["ref"]["path"])) as candidate:
+            if (getattr(source, "n_frames", 1) != 1 or getattr(candidate, "n_frames", 1) != 1
+                    or candidate.format != "PNG" or source.size != (width, height)
+                    or candidate.size != (after["width_px"], after["height_px"])
+                    or source.mode != before["mode"] or candidate.mode != after["mode"]):
+                raise ValueError("Prepared crop decoded format/mode/dimensions changed")
+            rectangle = source.crop((x0, y0, x1, y1))
+            if (candidate.tobytes() != rectangle.tobytes() or candidate.getpalette() != rectangle.getpalette()
+                    or candidate.info.get("transparency") != source.info.get("transparency")):
+                raise ValueError("Prepared crop pixels differ from the exact source rectangle")
+    except (OSError, SyntaxError) as exc:
+        raise ValueError("Prepared crop must decode as an exact raster rectangle") from exc
+
+
+def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: dict, reopened: list,
+                     *, historical=False) -> None:
+    _source_scope_request(job, request, historical=historical)
+    changes = request["source_changes"]
     core._validate_structure(expected, job, None, False)
-    if ({key: value for key, value in old.items() if key != "blocks"}
-            != {key: value for key, value in expected.items() if key != "blocks"}
-            or [item["id"] for item in old["blocks"]] != [item["id"] for item in expected["blocks"]]):
-        raise ValueError("Expected source changed non-block data or ordered block identities")
-    owners = {name: spec["unit_id"] for spec in plan["units"] for name in spec["owned_block_ids"]}
-    if not set(ids) <= set(owners) or any(owners[name] not in reopened for name in ids):
-        raise ValueError("Expected source block scope lies outside selected existing source owners")
-    changed = set()
-    for before, after in zip(old["blocks"], expected["blocks"]):
-        delta = {key for key in before.keys() | after.keys() if (key in before) != (key in after) or before.get(key) != after.get(key)}
-        if delta:
-            changed.add(before["id"])
-            if before["id"] not in ids or not delta <= set(fields):
-                raise ValueError("Expected source exceeded explicit block/field authority")
-    if changed != set(ids):
-        raise ValueError("Expected source must contain exactly the declared nonempty source correction, not a no-op")
-    if core._asset_hashes(job, old) != core._asset_hashes(job, expected):
-        raise ValueError("Expected source changed source asset identity")
+    if request["version"] == 1:
+        ids, fields = changes["block_ids"], changes["allowed_fields"]
+        if ({key: value for key, value in old.items() if key != "blocks"}
+                != {key: value for key, value in expected.items() if key != "blocks"}
+                or [item["id"] for item in old["blocks"]] != [item["id"] for item in expected["blocks"]]):
+            raise ValueError("Historical expected source changed non-block data or ordered block identities")
+        owners = {name: spec["unit_id"] for spec in plan["units"] for name in spec["owned_block_ids"]}
+        if not set(ids) <= set(owners) or any(owners[name] not in reopened for name in ids):
+            raise ValueError("Historical expected source lies outside admitted source owners")
+        actual = {before["id"] for before, after in zip(old["blocks"], expected["blocks"]) if _changed_fields(before, after)}
+        if actual != set(ids) or any(not _changed_fields(before, after) <= set(fields)
+                                   for before, after in zip(old["blocks"], expected["blocks"])):
+            raise ValueError("Historical expected source exceeded its exact narrow authority")
+        if core._asset_hashes(job, old) != core._asset_hashes(job, expected):
+            raise ValueError("Historical expected source changed asset identity")
+        return
+    mutable = {"blocks", "source_pages", "protected", "notes"}
+    if ({key: value for key, value in old.items() if key not in mutable}
+            != {key: value for key, value in expected.items() if key not in mutable}):
+        raise ValueError("Expected source changed root metadata outside source authority")
+    declarations, canonical_specs, ownership = _logical_layout(old, plan)
+    block_owners, note_owners, _, _ = ownership
+    page_owners = {page: spec["unit_id"] for spec in plan["units"] for page in spec["owned_pages"]}
+    definition_owners = {name: spec["unit_id"] for spec in canonical_specs for name in spec["owned_protected_ids"]}
+    selected = set(reopened)
+    def owned(owner):
+        if owner not in selected:
+            raise ValueError("Expected source change lies outside selected existing source owners")
+    def fields(category, authority, owners, eligible):
+        before = {item["id"]: item for item in old[category]}
+        after = {item["id"]: item for item in expected[category]}
+        actual = {name: _changed_fields(before[name], after[name]) for name in before.keys() & after.keys()}
+        actual = {name: delta for name, delta in actual.items() if delta}
+        if set(actual) != set(authority):
+            raise ValueError(f"Expected source {category} must have exactly its declared changed IDs")
+        for name, delta in actual.items():
+            owned(owners[name])
+            if delta != set(authority[name]) or not delta <= eligible:
+                raise ValueError(f"Expected source {category} exceeded exact per-ID changed-field authority")
+    if [page["id"] for page in old["source_pages"]] != [page["id"] for page in expected["source_pages"]]:
+        raise ValueError("Expected source changed ordered original page inventory")
+    fields("source_pages", changes["page_fields"], page_owners, {"printed_label", "label_verified", "evidence"})
+    before, after = declarations["blocks"], {item["id"]: item for item in expected["blocks"]}
+    deleted = {row["id"]: row for row in changes["deleted_blocks"]}
+    if set(after) - set(before) or set(before) - set(after) != set(deleted):
+        raise ValueError("Expected source block membership differs from exact declared deletions")
+    fields("blocks", changes["block_fields"], block_owners, {"kind", "source", "label", "list_type", "list_level", "asset", "width", "height"})
+    for name, row in deleted.items():
+        block = before[name]
+        owned(block_owners[name])
+        if len(block["source_pages"]) != 1 or name == old["main_body_start"] or block.get("target") != []:
+            raise ValueError("Cannot delete a crossing/body-boundary/nonempty-target source block")
+        if row["kind"] == "redundant-image":
+            if block["kind"] != "image" or block["source"] != []:
+                raise ValueError("Redundant image deletion requires an ordinary standalone image without source tokens")
+            destinations = row["retained_block_ids"]
+        else:
+            if (block["kind"] not in {"paragraph", "list_item"} or not block["source"]
+                    or any(set(token) != {"text"} for token in block["source"])):
+                raise ValueError("Redundant ordinary deletion cannot remove typed semantics/page boundaries")
+            destinations = [destination["block_id"] for destination in row["retained_at"]]
+        for destination in destinations:
+            if (destination not in after or block_owners[destination] != block_owners[name]
+                    or after[destination]["source_pages"] != block["source_pages"]):
+                raise ValueError("Deletion representation must survive on exactly the same owner/page")
+        if row["kind"] == "redundant-ordinary-fragment":
+            for destination in row["retained_at"]:
+                retained = after[destination["block_id"]]
+                if retained["kind"] not in {"paragraph", "list_item", "heading"}:
+                    raise ValueError("Ordinary deletion needs a retained ordinary-text representation")
+                if destination["field"] == "label":
+                    if not isinstance(retained.get("label"), str) or not retained["label"]:
+                        raise ValueError("Ordinary deletion destination needs a real retained label")
+                elif any(index >= len(retained["source"]) or set(retained["source"][index]) != {"text"}
+                         or not retained["source"][index]["text"] for index in destination["text_token_indexes"]):
+                    raise ValueError("Ordinary deletion destination must name existing ordinary text tokens")
+    orders = {row["unit_id"]: row["block_ids"] for row in changes["block_orders"]}
+    sequence = []
+    for spec in canonical_specs:
+        unit = spec["unit_id"]
+        surviving = [name for name in spec["owned_block_ids"] if name not in deleted]
+        order = orders.get(unit, surviving)
+        if unit in orders:
+            owned(unit)
+            if set(order) != set(surviving) or order == surviving:
+                raise ValueError("Block order must be a real complete surviving same-owner permutation")
+        sequence.extend(order)
+    if set(orders) - {spec["unit_id"] for spec in plan["units"]} or sequence != [item["id"] for item in expected["blocks"]]:
+        raise ValueError("Expected whole block order differs from declared natural-owner permutations")
+    additions = {row["id"]: row for row in changes["added_protected"]}
+    removals = set(changes["removed_protected_ids"])
+    new_defs = {item["id"]: item for item in expected["protected"]}
+    if (set(new_defs) - set(declarations["protected"]) != set(additions)
+            or set(declarations["protected"]) - set(new_defs) != removals):
+        raise ValueError("Expected protected membership differs from declared additions/removals")
+    retained = [item for item in old["protected"] if item["id"] not in removals]
+    if expected["protected"][:len(retained)] != retained:
+        raise ValueError("Retained protected definitions/values/order are immutable")
+    for name in removals:
+        owned(definition_owners[name])
+        if declarations["protected"][name]["kind"] not in {"math", "variable"}:
+            raise ValueError("Only globally unused old math/variable definitions may be removed")
+        for category in ("blocks", "notes"):
+            for item in old[category]:
+                references = _references(item, "protected") | {token["protected"] for token in item.get("target", []) if "protected" in token}
+                if name in references:
+                    owned(block_owners[item["id"]] if category == "blocks" else note_owners[item["id"]])
+                    if category == "notes" or (item["id"] not in deleted and "source" not in changes["block_fields"].get(item["id"], [])):
+                        raise ValueError("Every removed protected use needs explicit selected content authority")
+        if any(name in _references(item, "protected") or any(token.get("protected") == name for token in item.get("target", []))
+               for item in expected["blocks"] + expected["notes"]):
+            raise ValueError("Removed protected definition still has a global source/target user")
+    new_note_rows = {row["id"]: row for row in changes["added_notes"]}
+    new_notes = {item["id"]: item for item in expected["notes"]}
+    if (set(new_notes) != set(declarations["notes"]) | set(new_note_rows)
+            or [item for item in expected["notes"] if item["id"] in declarations["notes"]] != old["notes"]):
+        raise ValueError("Old notes/order are immutable; only declared new restoration notes are eligible")
+    for name, row in {**additions, **new_note_rows}.items():
+        owned(row["unit_id"])
+        if not name.startswith(row["unit_id"] + "_"):
+            raise ValueError("New source IDs require their selected natural owner's namespace")
+    for name, row in additions.items():
+        if new_defs[name]["kind"] not in {"math", "variable"}:
+            raise ValueError("Only genuinely used math/variable protected additions are allowed")
+        consumers = [block_owners[item["id"]] for item in expected["blocks"] if name in _references(item, "protected")]
+        consumers += [note_owners[item["id"]] if item["id"] in note_owners else new_note_rows[item["id"]]["unit_id"]
+                      for item in expected["notes"] if name in _references(item, "protected")]
+        owner_rank = {spec["unit_id"]: index for index, spec in enumerate(plan["units"])}
+        if (not consumers or any(owner not in selected for owner in consumers)
+                or min(consumers, key=owner_rank.__getitem__) != row["unit_id"]):
+            raise ValueError("New definitions must be used by authorized source content with their natural declared owner")
+    # Preserve normal merge order, including old note objects in their real owner.
+    owner_rank = {spec["unit_id"]: index for index, spec in enumerate(plan["units"])}
+    added_order = [item["id"] for item in expected["protected"] if item["id"] in additions]
+    if added_order != sorted(added_order, key=lambda name: owner_rank[additions[name]["unit_id"]]):
+        raise ValueError("New definitions must follow deterministic normal owner merge order")
+    note_order = [owner_rank[note_owners[item["id"]] if item["id"] in note_owners else new_note_rows[item["id"]]["unit_id"]]
+                  for item in expected["notes"]]
+    if note_order != sorted(note_order):
+        raise ValueError("Notes must retain normal natural-owner merge order")
+    for name, row in new_note_rows.items():
+        note = new_notes[name]
+        callout = row["callout_block_id"]
+        if (callout not in after or block_owners[callout] != row["unit_id"]
+                or "source" not in changes["block_fields"].get(callout, [])
+                or sum(token.get("note") == name for token in after[callout]["source"]) != 1
+                or note.get("content_type") != "prose" or note.get("target") != []
+                or not isinstance(note.get("restoration"), dict) or not note["restoration"]):
+            raise ValueError("New notes require a single authorized natural-owner callout and valid prose restoration")
+    old_assets = core._asset_hashes(job, old)
+    desired = _asset_associations(old)
+    for name in deleted:
+        desired.subtract(_asset_associations({"blocks": [before[name]]}))
+    image_crops = set()
+    note_crops = set()
+    page_records = plan["pages"]
+    for row in changes["crop_derivations"]:
+        owned(row["unit_id"])
+        _crop_pixels(job, row)
+        output_name = row["output"]["ref"]["path"]
+        if (output_name in old_assets or output_name in {page["image"] for page in page_records.values()}
+                or Path(output_name).parts[0] not in {"work", "evidence"}):
+            raise ValueError("Prepared output must be a distinct noncanonical work/evidence candidate")
+        if row["origin"]["kind"] == "source-asset":
+            name = row["origin"]["block_id"]
+            if (name not in before or name not in after or block_owners[name] != row["unit_id"]
+                    or before[name]["kind"] != "image" or after[name]["kind"] != "image"
+                    or row["input"]["ref"] != {"path": before[name]["asset"], "sha256": old_assets[before[name]["asset"]]}
+                    or (before[name]["width"], before[name]["height"]) != (row["input"]["width_px"], row["input"]["height_px"])
+                    or after[name]["asset"] != output_name
+                    or (after[name]["width"], after[name]["height"]) != (row["output"]["width_px"], row["output"]["height_px"])):
+                raise ValueError("Prepared crop differs from its exact old image/owner/geometry association")
+            image_crops.add(name)
+            desired.subtract({use: count for use, count in _asset_associations({"blocks": [before[name]]}).items()
+                              if use[2] == "image-block"})
+            desired.update({use: count for use, count in _asset_associations({"blocks": [after[name]]}).items()
+                            if use[2] == "image-block"})
+        else:
+            page_id, use = row["origin"]["page_id"], row["use"]
+            name = use["note_id"]
+            declaration = new_note_rows.get(name)
+            if (page_owners.get(page_id) != row["unit_id"] or declaration is None
+                    or declaration["unit_id"] != row["unit_id"] or declaration["callout_block_id"] != use["callout_block_id"]
+                    or row["input"]["ref"] != {"path": page_records[page_id]["image"], "sha256": page_records[page_id]["image_sha256"]}
+                    or new_notes[name]["restoration"]["source_page"] != page_id
+                    or new_notes[name]["restoration"]["damage_asset"] != output_name):
+                raise ValueError("Prepared damage crop differs from its exact original-page/restoration association")
+            note_crops.add(name)
+            if _asset_names({"notes": [new_notes[name]]}) != {output_name}:
+                raise ValueError("New restoration imagery must be only its declared supplied-source damage crop")
+            images = [token["image"] for token in new_notes[name]["source"] if "image" in token]
+            if len(images) != 1:
+                raise ValueError("New restoration note requires exactly its one declared damage image")
+            desired.update(_asset_associations({"notes": [new_notes[name]]}))
+    if note_crops != set(new_note_rows):
+        raise ValueError("Every new restoration note requires its exact declared original-page crop")
+    for name, fields_list in changes["block_fields"].items():
+        if set(fields_list) & {"asset", "width", "height"} and name not in image_crops:
+            raise ValueError("Image asset/geometry authority requires its exact declared prepared crop")
+    if +desired != _asset_associations(expected):
+        raise ValueError("Expected source changed an undeclared asset association")
+    expected_assets = core._asset_hashes(job, expected)
+    outputs = {row["output"]["ref"]["path"]: row["output"]["ref"]["sha256"] for row in changes["crop_derivations"]}
+    if expected_assets != {name: outputs[name] if name in outputs else old_assets[name] for name in _asset_names(expected)}:
+        raise ValueError("Expected source asset identities exceed exact prepared outputs")
+    if expected == old:
+        raise ValueError("Expected source must contain a real declared correction, not a no-op")
 
 
 def _scope_request(job: Path, path) -> tuple[dict, dict]:
     path = Path(path)
     if path.is_absolute():
-        path = path.resolve(strict=True)
         if not path.is_relative_to(job):
             raise ValueError("Post-review scope request must be contained by this job")
+        name = path.relative_to(job).as_posix()
     else:
-        path = _path(job, str(path))
-    request = core.load_json(path)
-    if (not isinstance(request, dict) or set(request) != {"version", "kind", "submitted_review", "expected_source", "source_changes"}
-            or type(request.get("version")) is not int or request["version"] != 1 or request.get("kind") != "post-review-source-scope"):
-        raise ValueError("Invalid strict post-review source scope request")
-    for key in ("submitted_review", "expected_source"):
-        _strict_ref(job, request[key])
-    return _ref(job, path), request
+        name = path.as_posix()
+    reference = _ref(job, job / name)
+    _strict_ref(job, reference)
+    request = _scope_json(job / name)
+    _source_scope_request(job, request)
+    return reference, request
+
+def _frozen_scope_request(job: Path, post: dict) -> dict:
+    request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
+    if isinstance(request, dict) and request.get("version") == 2:
+        request = _scope_json(_path(job, post["scope_request"]["path"]))
+    if (not isinstance(request, dict) or request.get("submitted_review") != post["submitted_review"]
+            or request.get("expected_source", {}).get("sha256") != post["expected_source"]["sha256"]):
+        raise ValueError("Frozen post-review scope request changed")
+    # The original operator document is not a live dependency after snapshotting.
+    request = {**request, "expected_source": post["expected_source"]}
+    _source_scope_request(job, request, historical=True)
+    return request
+
+
+def _prepared_references(changes: dict) -> list:
+    refs = [ref for key in ("added_protected", "added_notes") for row in changes[key] for ref in row["witnesses"]]
+    refs.extend(row[key]["ref"] for row in changes["crop_derivations"] for key in ("input", "output"))
+    return refs
+
+
+def _prepared_source_scope(job: Path, post: dict, unit_id: str) -> dict | None:
+    request = _frozen_scope_request(job, post)
+    if request["version"] != 2:
+        return None
+    changes = request["source_changes"]
+    witnesses = {}
+    for key in ("added_protected", "added_notes"):
+        for row in changes[key]:
+            if row["unit_id"] == unit_id:
+                for ref in row["witnesses"]:
+                    witnesses[ref["path"]] = ref
+    return {"version": 2, "scope_request": post["scope_request"], "expected_source": post["expected_source"],
+            "crop_derivations": [row for row in changes["crop_derivations"] if row["unit_id"] == unit_id],
+            "witnesses": list(witnesses.values())}
+
+
+def _prepared_source_inputs(job: Path, packet: dict) -> dict | None:
+    prepared = packet.get("prepared_source_scope")
+    if prepared is None:
+        return None
+    _scope_shape(prepared, {"version", "scope_request", "expected_source", "crop_derivations", "witnesses"}, "prepared source packet")
+    if packet["role"] != "source" or type(prepared["version"]) is not int or prepared["version"] != 2:
+        raise ValueError("Prepared source authority is only version 2 source context")
+    for key in ("scope_request", "expected_source"):
+        _strict_ref(job, prepared[key])
+    raw = _scope_json(_path(job, prepared["scope_request"]["path"]))
+    if raw.get("version") != 2:
+        raise ValueError("Prepared source context cannot grant historical v1 authority")
+    post = {**prepared, "submitted_review": raw.get("submitted_review")}
+    if prepared != _prepared_source_scope(job, post, packet["unit_id"]):
+        raise ValueError("Prepared source packet differs from its frozen owner authority")
+    expected = _checked(job, prepared["expected_source"]["path"], prepared["expected_source"]["sha256"])
+    blocks = {item["id"]: item for item in packet["blocks"]}
+    pages = {item["page_id"]: item for item in packet["pages"]}
+    for row in prepared["crop_derivations"]:
+        _crop_pixels(job, row)
+        if row["origin"]["kind"] == "source-asset":
+            block = blocks.get(row["origin"]["block_id"])
+            if (block is None or block["kind"] != "image"
+                    or row["input"]["ref"] != {"path": block["asset"], "sha256": packet["source_assets"][block["asset"]]}):
+                raise ValueError("Prepared image input differs from the old canonical owned block")
+        else:
+            name = row["origin"]["page_id"]
+            if (name not in packet["owned_pages"] or row["input"]["ref"] != {
+                    "path": pages[name]["image"], "sha256": pages[name]["image_sha256"]}):
+                raise ValueError("Prepared restoration input differs from the owned original page")
+    return expected
 
 
 def _admit_post_review(job: Path, data: dict, scope, source: dict, plan: dict, reopened: list) -> dict:
@@ -868,7 +1329,7 @@ def _admit_post_review(job: Path, data: dict, scope, source: dict, plan: dict, r
 
     request_ref, request = _scope_request(job, scope)
     expected = _checked(job, request["expected_source"]["path"], request["expected_source"]["sha256"])
-    _expected_source(job, source, expected, request["source_changes"], plan, reopened)
+    _expected_source(job, source, expected, request, plan, reopened)
     admitted = translator.admit_post_review(job, data, request["submitted_review"])
     if (job / "build").is_symlink() or not (job / "build").is_dir():
         raise ValueError("Post-review build root must be a contained regular directory")
@@ -995,11 +1456,10 @@ def _post_review_base(job: Path, base: dict, source: dict) -> None:
         raise ValueError("Post-review base lost original changes_requested round/cap")
     for key in ("scope_request", "expected_source", "target_document", "authoring_receipt", "finalization_receipt", "submitted_review", "report", "reviewer_receipt"):
         _strict_ref(job, post[key])
-    request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
-    if (set(request) != {"version", "kind", "submitted_review", "expected_source", "source_changes"}
-            or request.get("version") != 1 or request.get("kind") != "post-review-source-scope"
-            or request["submitted_review"] != post["submitted_review"] or request["expected_source"]["sha256"] != post["expected_source"]["sha256"]):
-        raise ValueError("Frozen post-review scope request changed")
+    request = _frozen_scope_request(job, post)
+    original = _checked(job, base["source_plan"]["plan"], base["source_plan"]["plan_sha256"])
+    expected = _checked(job, post["expected_source"]["path"], post["expected_source"]["sha256"])
+    _expected_source(job, source, expected, request, original, [spec["unit_id"] for spec in original["units"]], historical=True)
     for reference in post["build_files"].values():
         _strict_ref(job, reference)
     submitted = _checked(job, post["submitted_review"]["path"], post["submitted_review"]["sha256"])
@@ -1292,6 +1752,8 @@ def _source_revision_context(job: Path, pages_per_unit: int, reopen_units: list[
     if post is not None:
         roots.extend([{key: post[key]} for key in ("authoring_receipt", "finalization_receipt", "submitted_review", "report", "reviewer_receipt")])
         roots.append(post["review_plan"])
+        request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
+        roots.extend(_prepared_references(request["source_changes"]))
         roots.extend({"terminology_receipt": {"path": event["receipt"], "sha256": event["receipt_sha256"]}}
                      for event in data["history"] if event.get("event") == "stage_terminology")
     artifacts = _admitted_artifacts(job, [{"source_receipt": source_reference, "terminology_receipt": term_reference}, *roots])
@@ -1371,9 +1833,11 @@ def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
                     live[_relative(job, path)] = _hash(path)
             if live != {name: ref["sha256"] for name, ref in post["build_files"].items()}:
                 raise ValueError("Admitted build changed during post-review source authoring")
-        request = _checked(job, post["scope_request"]["path"], post["scope_request"]["sha256"])
+        request = _frozen_scope_request(job, post)
+        if request["version"] == 1 and _hash(job / "job.json") == plan["job_sha256"]:
+            raise ValueError("Historical version-1 source authority is read-only; no new live execution is admitted")
         expected = _checked(job, post["expected_source"]["path"], post["expected_source"]["sha256"])
-        _expected_source(job, source, expected, request["source_changes"], original, reopened)
+        _expected_source(job, source, expected, request, original, reopened, historical=True)
     if (plan["role"] != "source" or plan["revision"] is not True or plan["base_round"] != (post["original_round"] if post is not None else 0)
             or plan["base_state"] != ("changes_requested" if post is not None else "terminology_ready") or plan["job_sha256"] != base["job"]["sha256"]
             or plan["source_digest"] != base["source_digest"] or plan["selected_model"] != old_job["models"]["source"]
@@ -1390,6 +1854,10 @@ def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
     for spec in plan["units"]:
         if (spec["unit_id"] in reopened) == (spec.get("source_carry") is not None) or spec.get("carried_checkpoint") is not None:
             raise ValueError("Source revision may freshly execute only its explicit selected units")
+        packet = _checked(job, spec["packet"], spec["packet_sha256"])
+        prepared = _prepared_source_scope(job, post, spec["unit_id"]) if post is not None and spec["unit_id"] in reopened else None
+        if packet.get("prepared_source_scope") != prepared:
+            raise ValueError("Source packet prepared scope differs from frozen selected owner authority")
     return base, source
 
 
@@ -1943,6 +2411,10 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
         if spec["unit_id"] in carried:
             continue
         packet = packet_for(spec, identifier, page_records, ownership)
+        if source_context is not None and base.get("post_review") is not None and spec["unit_id"] in source_context["reopened"]:
+            prepared = _prepared_source_scope(job, base["post_review"], spec["unit_id"])
+            if prepared is not None:
+                packet["prepared_source_scope"] = prepared
         _packet_scope(packet)
         packets.append((spec, packet))
     for spec, packet in packets:
@@ -2170,10 +2642,26 @@ def _validate_result(job: Path, packet: dict, output: dict, binding: dict) -> di
                     raise ValueError("New source IDs must use their unit_id_ namespace")
         assets = {}
         allowed_assets = _asset_names({"blocks": packet["blocks"], "notes": packet["notes"]})
+        prepared_expected = _prepared_source_inputs(job, packet)
+        prepared_assets = {}
+        if prepared_expected is not None:
+            associations = _asset_associations(output)
+            expected_associations = _asset_associations(prepared_expected)
+            for row in packet["prepared_source_scope"]["crop_derivations"]:
+                ref = row["output"]["ref"]
+                name = ref["path"]
+                actual = Counter({use: count for use, count in associations.items() if use[3] == name})
+                declared = Counter({use: count for use, count in expected_associations.items() if use[3] == name})
+                if actual and actual != declared:
+                    raise ValueError("Prepared output may be used only at its exact declared block/note association and geometry")
+                prepared_assets[name] = ref["sha256"]
         for name in _asset_names(output):
-            if name not in allowed_assets and not _path(job, name).is_relative_to(_path(job, binding["assets_dir"])):
-                raise ValueError("New source assets must be in the assigned unit assets directory")
+            if (name not in allowed_assets and name not in prepared_assets
+                    and not _path(job, name).is_relative_to(_path(job, binding["assets_dir"]))):
+                raise ValueError("New source assets must be in the assigned unit assets directory or their exact prepared association")
             assets[name] = _hash(_path(job, name))
+            if name in prepared_assets and assets[name] != prepared_assets[name]:
+                raise ValueError("Prepared output identity changed")
         return assets
     terms = core.load_json(job / "terms.json")
     terminology = {item["id"]: item for item in terms["terms"]}
@@ -2219,6 +2707,7 @@ def _packet_inputs(job: Path, packet: dict) -> None:
     for name, digest in packet.get("source_assets", {}).items():
         if _hash(_path(job, name)) != digest:
             raise ValueError("Immutable draft/source asset changed")
+    _prepared_source_inputs(job, packet)
 
 
 

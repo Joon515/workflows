@@ -5,7 +5,7 @@ description: Translate PDF, EPUB, MOBI or DjVu books, including scans, into revi
 
 # Book translation workflow
 
-Read [format.md](references/format.md) before changing job artifacts and [operation.md](references/operation.md) before starting a job. Resolve this skill's actual filesystem directory; commands use <skill> for that directory, not the target project root. [omp-contract.md](references/omp-contract.md) defines published --plugin-dir startup and explicit project-native agent discovery for an already-running parent. The latter requires reading this skill manually; agent files alone do not register a skill.
+Read [format.md](references/format.md) before changing job artifacts and [operation.md](references/operation.md) before starting a job. Commands use <skill> for this skill directory, not the target project root. [omp-contract.md](references/omp-contract.md) defines published --plugin-dir startup and complete project-native activation: four agent files in .omp/agents plus the entire skill in .omp/skills/book-translator, either ordinary copies or relative agent-file and whole-skill-directory symlinks. Both active layouts register the skill and four agents in a new parent; retaining a nested package alone registers neither. Use the materialized skill path for native project activation; do not infer already-running-parent skill reload from fresh-parent discovery.
 
 ## Outcome and authority
 

@@ -1126,11 +1126,22 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="post-review-controller-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        from PIL import Image, ImageDraw
+        self.math_png = self.root / "synthetic-equation.png"
+        raster = Image.new("RGB", (200, 60), "white")
+        drawing = ImageDraw.Draw(raster)
+        drawing.text((5, 22), "stray", fill="black")
+        drawing.text((100, 22), "x = 1", fill="black")
+        raster.save(self.math_png)
         original = self.root / "source.pdf"
         with pymupdf.open() as document:
-            for number in (1, 2):
+            for number in (1, 2, 3):
                 page = document.new_page()
-                page.insert_text((60, 60), f"Original structural correction fixture paragraph {number}.")
+                text = ("Original structural correction fixture paragraph 1: deve[gap]pment" if number == 1
+                        else f"Original structural correction fixture paragraph {number}.")
+                page.insert_text((60, 60), text)
+                if number == 1:
+                    page.insert_image(pymupdf.Rect(60, 90, 260, 150), filename=str(self.math_png))
             document.save(original)
         self.job = self.root / "job"
         workflow.init_job(original, self.job, "Post-review controller fixture", "en", "en")
@@ -1145,8 +1156,11 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.complete_units("source")
         workflow.assemble_units(self.job, "source")
         workflow.seal_job(self.job)
-        core.save_json(self.job / "terms.json", {"version": 1, "terms": []})
-        (self.job / "handoff.md").write_text("Synthetic native terminology fixture: no governed terms.\n", encoding="utf-8")
+        core.save_json(self.job / "terms.json", {"version": 1, "terms": [
+            {"id": "Structure", "number": 1, "source": "structural", "target": "structural",
+             "authority": "Synthetic terminology decision", "authority_locator": "Fixture source paragraphs",
+             "rationale": "Controller regression only, not external terminological authority.", "protected_ids": []}]})
+        (self.job / "handoff.md").write_text("Synthetic native terminology fixture: structural is governed consistently.\n", encoding="utf-8")
         self.initial_term_task = self.task("terminology")
         workflow.checkpoint_role(self.job, "terminology", self.initial_term_task)
 
@@ -1169,22 +1183,27 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
             return json.loads(capture.getvalue())
         self.assertNotEqual(code, 0, capture.getvalue())
 
+    def artifact_tree(self):
+        return self.files(), sorted(path.relative_to(self.job).as_posix()
+                                    for path in self.job.rglob("*") if path.is_dir())
+
     def refuse(self, callback):
-        before = self.files()
+        before = self.artifact_tree()
         with self.assertRaises((ValueError, OSError, RuntimeError)):
             callback()
-        self.assertEqual(self.files(), before)
+        self.assertEqual(self.artifact_tree(), before)
 
     def refuse_cli(self, *arguments):
-        before = self.files()
+        before = self.artifact_tree()
         self.cli(*arguments, success=False)
-        self.assertEqual(self.files(), before)
+        self.assertEqual(self.artifact_tree(), before)
 
     def plan(self, role, **options):
         reference = workflow.plan_units(self.job, role, 1, **options)
         return core.load_json(self.job / reference["plan"])
 
-    def complete_units(self, role, *, expected=None, failed_review=False):
+    def complete_units(self, role, *, source_revision=None, failed_review=False, checkpoint=True):
+        bindings = []
         for identifier in self.units.status(self.job, role)["pending"]:
             binding = self.units.unit_binding(self.job, role, identifier)
             packet = core.load_json(self.job / binding["packet"])
@@ -1205,9 +1224,46 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
                                   for page in packet["pages"] if page["page_id"] in packet["owned_pages"]],
                     blocks=copy.deepcopy(packet["blocks"]), notes=copy.deepcopy(packet["notes"]),
                     protected=copy.deepcopy(packet["protected"]))
-                if expected is not None:
-                    replacements = {block["id"]: block for block in expected["blocks"]}
-                    output["blocks"] = [copy.deepcopy(replacements[block["id"]]) for block in output["blocks"]]
+                # Author full owned fixture results from old packets, not expected_source.
+                if source_revision is None and identifier == "u0001":
+                    asset = self.job / binding["assets_dir"] / "equation.png"
+                    asset.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(self.math_png, asset)
+                    output["blocks"] = [block for block in output["blocks"] if block["kind"] != "image"]
+                    output["blocks"].append({
+                        "id": "u0001_equation", "kind": "image", "source_pages": packet["owned_pages"],
+                        "source": [], "target": [], "asset": asset.relative_to(self.job).as_posix(),
+                        "width": 200, "height": 60, "source_em": 12,
+                        "scale_evidence": "Synthetic original fixture: 200 pixels span 200 source points at 12pt em."})
+                elif source_revision == "list":
+                    output["blocks"][0].update(kind="list_item", label="1.", list_type="ordered", list_level=0)
+                elif source_revision == "page":
+                    output["source_pages"][0].update(printed_label="iv", label_verified=True,
+                                                      evidence="Synthetic Roman folio independently inspected.")
+                elif source_revision in {"mixed", "mixed-confirmed"}:
+                    confirmed = source_revision == "mixed-confirmed"
+                    page = packet["owned_pages"][0]
+                    output["source_pages"][0].update(printed_label="iv", label_verified=True,
+                                                      evidence="Synthetic Roman folio independently inspected.")
+                    output["blocks"][0]["source"] = [
+                        {"page": page}, {"text": "Original structural correction fixture paragraph 1: development"},
+                        {"note": "u0001_repair"}, {"text": "; example "}, {"protected": "u0001_math"}]
+                    graphic = next(block for block in output["blocks"] if block["id"] == "u0001_equation")
+                    graphic.update(asset="work/prepared-equation.png", width=80)
+                    output["protected"].append({"id": "u0001_math", "kind": "math", "value": "x = 1"})
+                    output["notes"].append({
+                        "id": "u0001_repair", "content_type": "prose", "target": [],
+                        "source": [{"text": "Synthetic fixture-author confirmation of intended word: development. Original fragment: "
+                                   if confirmed else "Synthetic contextual conjecture, not recovered ink: development. Original fragment: "},
+                                   {"text": "deve[gap]pment"}, {"text": ". Original damage: "},
+                                   {"image": {"asset": "work/prepared-damage.png", "width_em": 9.25, "height_em": .5, "raise_em": 0}}],
+                        "restoration": {"source_page": page, "original_fragment": "deve[gap]pment", "replacement": "development",
+                                        "status": "confirmed" if confirmed else "conjectural",
+                                        "evidence": "Synthetic fixture author confirms intended development; no external manuscript or scientific claim."
+                                        if confirmed else "Synthetic authored gap and contextual witness; no recovered-ink or scientific claim.",
+                                        "damage_asset": "work/prepared-damage.png"},
+                        "source_evidence": [{"asset": "work/prepared-damage.png", "source_page": page,
+                                             "description": "Synthetic original page text rectangle [60,45,430,65]."}]})
                 if packet["metadata_owner"]:
                     output["metadata"] = {key: value for key, value in packet["metadata"].items() if value is not None}
                     if packet["metadata"]["main_body_start"] is None:
@@ -1216,6 +1272,15 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
                 for category in ("blocks", "notes"):
                     output[category] = [{"id": item["id"], "target": copy.deepcopy(item["source"])}
                                         for item in packet[category]]
+                    for item in output[category]:
+                        governed = []
+                        for token in item["target"]:
+                            if "structural" in token.get("text", ""):
+                                before, after = token["text"].split("structural", 1)
+                                governed.extend([{"text": before}, {"term": "Structure"}, {"text": after}])
+                            else:
+                                governed.append(token)
+                        item["target"] = governed
                 if packet["metadata_owner"]:
                     output["metadata"] = {"title": "Synthetic current target", "human_preface": None,
                                           "agent_preface": [{"text": "Synthetic controller data; no model quality claim."}]}
@@ -1231,7 +1296,10 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
                     output["findings"] = [{"id": identifier + "_fix", "severity": "minor",
                                            "location": "Synthetic source scope", "detail": "Correct structural source data."}]
             core.save_json(self.job / binding["result"], output)
-            workflow.checkpoint_unit(self.job, role, identifier, self.task(role))
+            bindings.append(binding)
+            if checkpoint:
+                workflow.checkpoint_unit(self.job, role, identifier, self.task(role))
+        return bindings
 
     def synthetic_build(self, job):
         """Native-controller state proof only; never a glyph or renderer assertion."""
@@ -1258,14 +1326,15 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         (build / "nested/layout.dat").write_bytes(b"Synthetic nested layout evidence")
         return pdf
 
-    def reviewed_job(self):
+    def reviewed_job(self, *, failed_review=True, submit=True):
         self.original_target_plan = self.plan("translation")
         self.complete_units("translation")
         workflow.assemble_units(self.job, "translation")
-        self.plan("review")
-        self.complete_units("review", failed_review=True)
+        self.original_review_plan = self.plan("review")
+        self.complete_units("review", failed_review=failed_review)
         workflow.assemble_units(self.job, "review")
-        workflow.submit_review(self.job, self.job / "reviews/round-1.json")
+        if submit:
+            workflow.submit_review(self.job, self.job / "reviews/round-1.json")
         self.original_job = workflow.load_job(self.job)
         self.original_files = self.files()
         self.expected = core.load_json(self.job / "book-source.json")
@@ -1274,12 +1343,15 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.scope = self.job / "work/recovery-scope.json"
         proposal = self.job / "work/expected-source.json"
         core.save_json(proposal, self.expected)
-        self.request = {"version": 1, "kind": "post-review-source-scope",
-                        "submitted_review": {"path": "reviews/round-1.receipt.json",
-                                             "sha256": workflow.digest_file(self.job / "reviews/round-1.receipt.json")},
+        submitted = "reviews/round-1.receipt.json" if submit else "reviews/round-1.json"
+        self.request = {"version": 2, "kind": "post-review-source-scope",
+                        "submitted_review": {"path": submitted, "sha256": workflow.digest_file(self.job / submitted)},
                         "expected_source": {"path": "work/expected-source.json", "sha256": workflow.digest_file(proposal)},
-                        "source_changes": {"block_ids": [block["id"]],
-                                           "allowed_fields": ["kind", "label", "list_type", "list_level"]}}
+                        "source_changes": {"block_fields": {block["id"]: ["kind", "label", "list_type", "list_level"]},
+                                           "deleted_blocks": [], "block_orders": [], "page_fields": {},
+                                           "added_protected": [], "removed_protected_ids": [],
+                                           "added_notes": [], "crop_derivations": []}}
+        self.source_revision = "list"
         core.save_json(self.scope, self.request)
 
     def admission_arguments(self):
@@ -1292,7 +1364,7 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.revision = core.load_json(self.revision_path)
         self.base_reference = self.revision["source_revision"]["base"]
         self.base = core.load_json(self.job / self.base_reference["path"])
-        self.complete_units("source", expected=self.expected)
+        self.complete_units("source", source_revision=self.source_revision)
         self.cli("assemble-units", self.job, "source")
         self.assertEqual(core.load_json(self.job / "book-source.json"), self.expected)
         self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("changes_requested", 1))
@@ -1312,6 +1384,291 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
     def rebase(self):
         return self.plan("translation", rebase_source=self.revision_path,
                          accept_policy_compatibility=workflow.digest_file(self.job / "handoff.md"))
+
+    def refuse_admission(self, *, reopen_units=None):
+        selected = ["u0001"] if reopen_units is None else reopen_units
+        self.refuse_cli("plan-units", self.job, "source", "--pages-per-unit", "1", "--revise",
+                        "--reopen", *selected, "--post-review-scope", self.scope)
+        self.refuse(lambda: self.units.create_plan(
+            self.job, "source", pages_per_unit=1, revise=True, reopen_units=selected, post_review_scope=self.scope))
+
+    def save_proposal(self):
+        proposal = self.job / self.request["expected_source"]["path"]
+        core.save_json(proposal, self.expected)
+        self.request["expected_source"]["sha256"] = workflow.digest_file(proposal)
+        core.save_json(self.scope, self.request)
+
+    def page_only_proposal(self):
+        self.expected = core.load_json(self.job / "book-source.json")
+        page = self.expected["source_pages"][0]
+        page.update(printed_label="iv", label_verified=True,
+                    evidence="Synthetic Roman folio independently inspected.")
+        changes = self.request["source_changes"]
+        changes["block_fields"] = {}
+        changes["page_fields"] = {page["id"]: ["printed_label", "label_verified", "evidence"]}
+        self.source_revision = "page"
+        self.save_proposal()
+
+    def prepare_crop(self, input_name, rect, output_name, origin, use):
+        from PIL import Image
+        output = self.job / output_name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(self.job / input_name) as image:
+            width, height, mode = image.width, image.height, image.mode
+            image.crop(rect).save(output, format="PNG")
+        return {"unit_id": "u0001", "origin": origin, "use": use,
+                "input": {"ref": {"path": input_name, "sha256": workflow.digest_file(self.job / input_name)},
+                          "width_px": width, "height_px": height, "mode": mode},
+                "rect_px": list(rect),
+                "output": {"ref": {"path": output_name, "sha256": workflow.digest_file(output)},
+                           "width_px": rect[2] - rect[0], "height_px": rect[3] - rect[1], "mode": mode}}
+
+    def mixed_proposal(self):
+        self.page_only_proposal()
+        first = self.expected["blocks"][0]
+        page = first["source_pages"][0]
+        art = next(block for block in self.expected["blocks"] if block["id"] == "u0001_equation")
+        self.math_candidate = "work/prepared-equation.png"
+        math = self.prepare_crop(art["asset"], (80, 0, 160, 60), self.math_candidate,
+                                 {"kind": "source-asset", "block_id": art["id"]},
+                                 {"kind": "image-block", "block_id": art["id"]})
+        pointer = core.load_json(self.job / "units/source/active.json")
+        plan = core.load_json(self.job / pointer["plan"])
+        packet = core.load_json(self.job / plan["units"][0]["packet"])
+        original = next(item for item in packet["pages"] if item["page_id"] == page)
+        self.damage_candidate = "work/prepared-damage.png"
+        damage = self.prepare_crop(original["image"], (60, 45, 430, 65), self.damage_candidate,
+                                   {"kind": "original-page", "page_id": page},
+                                   {"kind": "restoration-note", "note_id": "u0001_repair",
+                                    "callout_block_id": first["id"], "source_page": page})
+        art.update(asset=self.math_candidate, width=80)
+        first["source"] = [{"page": page}, {"text": "Original structural correction fixture paragraph 1: development"},
+                           {"note": "u0001_repair"}, {"text": "; example "}, {"protected": "u0001_math"}]
+        self.expected["protected"].append({"id": "u0001_math", "kind": "math", "value": "x = 1"})
+        self.expected["notes"].append({
+            "id": "u0001_repair", "content_type": "prose", "target": [],
+            "source": [{"text": "Synthetic contextual conjecture, not recovered ink: development. Original fragment: "},
+                       {"text": "deve[gap]pment"}, {"text": ". Original damage: "},
+                       {"image": {"asset": self.damage_candidate, "width_em": 9.25, "height_em": .5, "raise_em": 0}}],
+            "restoration": {"source_page": page, "original_fragment": "deve[gap]pment", "replacement": "development",
+                            "status": "conjectural", "evidence": "Synthetic authored gap and contextual witness; no recovered-ink or scientific claim.",
+                            "damage_asset": self.damage_candidate},
+            "source_evidence": [{"asset": self.damage_candidate, "source_page": page,
+                                 "description": "Synthetic original page text rectangle [60,45,430,65]."}]})
+        witness = self.job / "work/restoration-witness.txt"
+        witness.write_text("Synthetic contextual witness: development; the literal [gap] is deliberate, not recovered ink.\n", encoding="utf-8")
+        changes = self.request["source_changes"]
+        changes["block_fields"] = {first["id"]: ["source"], art["id"]: ["asset", "width"]}
+        changes["added_protected"] = [{"id": "u0001_math", "unit_id": "u0001", "witnesses": []}]
+        changes["added_notes"] = [{"id": "u0001_repair", "unit_id": "u0001", "callout_block_id": first["id"],
+                                   "witnesses": [{"path": witness.relative_to(self.job).as_posix(),
+                                                  "sha256": workflow.digest_file(witness)}]}]
+        changes["crop_derivations"] = [math, damage]
+        self.source_revision = "mixed"
+        self.save_proposal()
+
+    @unittest.skipUnless(shutil.which("xelatex"), "real XeLaTeX required for page-only recovery lifecycle")
+    def test_page_only_scope_has_no_dummy_block_edit_and_preserves_failed_unchanged_targets(self):
+        self.build_patch.stop()
+        self.reviewed_job()
+        self.page_only_proposal()
+        self.admit_and_reseal()
+        self.fresh_terminology()
+        self.refuse(lambda: self.plan("translation", rebase_source=self.revision_path,
+                                      accept_policy_compatibility="0" * 64))
+        plan = self.rebase()
+        # Owner 3 has unchanged owned AND readonly context; its failed review still excludes carry.
+        bridge = plan["source_rebase"]
+        self.assertEqual(bridge["carried"], {})
+        unchanged = bridge["footprints"]["u0003"]
+        self.assertEqual(unchanged["before"], unchanged["after"])
+        self.assertEqual(unchanged["decision"], "pending")
+        self.assertIn("u0003", unchanged["review_exclusions"])
+        self.assertEqual(self.units.status(self.job, "translation")["pending"],
+                         [spec["unit_id"] for spec in self.original_target_plan["units"]])
+        self.complete_units("translation")
+        result = workflow.assemble_units(self.job, "translation")
+        self.assertEqual((result["state"], result["round"], workflow.load_job(self.job)["max_rounds"]), ("translated", 2, 3))
+        verification = core.load_json(self.job / "build/verification.json")
+        self.assertTrue(verification["passed"])
+        self.assertTrue(all(verification["checks"][name] for name in workflow.BUILD_CHECKS))
+        self.refuse_cli("review", self.job, self.job / "reviews/round-1.json")
+        self.refuse_cli("accept", self.job)
+
+    def test_submitted_authority_and_native_members_are_required_before_any_planning_write(self):
+        self.reviewed_job()
+        review_pointer = core.load_json(self.job / "units/review/active.json")
+        review = core.load_json(self.job / review_pointer["plan"])
+        target_pointer = core.load_json(self.job / "units/translation/active.json")
+        target = core.load_json(self.job / target_pointer["plan"])
+        cases = []
+        data = workflow.load_job(self.job)
+        unsubmitted = copy.deepcopy(data)
+        unsubmitted["history"] = [event for event in data["history"] if event["event"] != "review_submitted"]
+        cases.append(("unsubmitted", "job.json", unsubmitted))
+        unconsumed = copy.deepcopy(data)
+        unconsumed["history"] = [event for event in data["history"] if event["event"] != "translation_content_authored"]
+        cases.append(("missing-complete-target-authoring-consumption", "job.json", unconsumed))
+        for name, changes in (("pass", {"state": "approved"}), ("cap", {"max_rounds": 1}),
+                              ("stale-round", {"round": 2})):
+            cases.append((name, "job.json", {**data, **changes}))
+        for role in workflow.ROLES:
+            changed = copy.deepcopy(data)
+            changed["models"][role]["model"] = "changed-exact-selected-model"
+            cases.append(("model-" + role, "job.json", changed))
+        cases.extend([
+            ("partial-review", review["units"][-1]["checkpoint"], None),
+            ("missing-review-origin", review["units"][0]["result"], None),
+            ("partial-target", target["units"][-1]["checkpoint"], None),
+            ("unconsumed-target", "units/translation/active.json", {"plan": "absent.json", "plan_sha256": "0" * 64}),
+            ("changed-build-digest", "book.json", {**core.load_json(self.job / "book.json"), "title": "Changed current target"}),
+            ("changed-PDF", "build/book.pdf", b"%PDF changed bytes"),
+            ("changed-verifier", "build/verification.json", {"passed": True}),
+            ("stale-submission", "reviews/round-1.receipt.json", {"round": 1}),
+        ])
+        for label, name, replacement in cases:
+            with self.subTest(case=label):
+                path = self.job / name
+                before = path.read_bytes()
+                try:
+                    if replacement is None:
+                        path.unlink()
+                    elif isinstance(replacement, bytes):
+                        path.write_bytes(replacement)
+                    else:
+                        core.save_json(path, replacement)
+                    self.refuse_admission()
+                finally:
+                    path.write_bytes(before)
+
+    def test_exact_v2_page_note_definition_crop_and_natural_owner_authority_is_closed(self):
+        self.reviewed_job()
+        self.mixed_proposal()
+        original_request = copy.deepcopy(self.request)
+        for category in ("page_fields", "added_notes", "added_protected", "crop_derivations"):
+            with self.subTest(undeclared=category):
+                changed = copy.deepcopy(original_request)
+                changed["source_changes"][category] = {} if category == "page_fields" else []
+                core.save_json(self.scope, changed)
+                self.refuse_admission()
+        for version in (1, True, 3):
+            with self.subTest(version=version):
+                core.save_json(self.scope, {**original_request, "version": version})
+                self.refuse_admission()
+        for category in ("added_notes", "added_protected", "crop_derivations"):
+            with self.subTest(foreign_owner=category):
+                changed = copy.deepcopy(original_request)
+                changed["source_changes"][category][0]["unit_id"] = "u0002"
+                core.save_json(self.scope, changed)
+                self.refuse_admission()
+        core.save_json(self.scope, original_request)
+        self.refuse_admission(reopen_units=["u0002"])
+        extra = copy.deepcopy(original_request)
+        first = next(iter(extra["source_changes"]["block_fields"]))
+        extra["source_changes"]["block_fields"][first].append("kind")
+        core.save_json(self.scope, extra)
+        self.refuse_admission()
+        missing = copy.deepcopy(original_request)
+        del missing["source_changes"]["removed_protected_ids"]
+        core.save_json(self.scope, missing)
+        self.refuse_admission()
+        self.scope.write_text('{"version": 2, ' + json.dumps(original_request)[1:], encoding="utf-8")
+        self.refuse_admission()
+        before_expected = copy.deepcopy(self.expected)
+        self.expected["source_pages"][1]["evidence"] = "Undeclared edit in another explicitly selected full owner."
+        self.save_proposal()
+        self.refuse_admission(reopen_units=["u0001", "u0002"])
+        self.expected = before_expected
+        self.request = original_request
+        self.save_proposal()
+
+    def test_full_native_pass_is_not_source_authority(self):
+        self.reviewed_job(failed_review=False)
+        self.assertEqual(workflow.load_job(self.job)["state"], "approved")
+        self.refuse_admission()
+
+    def test_unsubmitted_complete_native_failure_is_not_source_authority(self):
+        self.reviewed_job(submit=False)
+        self.assertEqual(workflow.load_job(self.job)["state"], "translated")
+        self.refuse_admission()
+
+    def test_independent_full_source_disagreement_cannot_publish_the_proposal(self):
+        self.reviewed_job()
+        self.page_only_proposal()
+        self.cli(*self.admission_arguments())
+        self.complete_units("source", source_revision="list")
+        self.refuse_cli("assemble-units", self.job, "source")
+        self.assertEqual((self.job / "book-source.json").read_bytes(), self.original_files["book-source.json"])
+        self.assertEqual((self.job / "source.sha256").read_bytes(), self.original_files["source.sha256"])
+
+    def test_confirmed_restoration_retains_ordinary_core_status_at_controller_boundary(self):
+        # A synthetic fixture-author witness is not a scientific/manuscript-truth oracle.
+        self.reviewed_job()
+        self.mixed_proposal()
+        note = self.expected["notes"][0]
+        note["source"][0]["text"] = "Synthetic fixture-author confirmation of intended word: development. Original fragment: "
+        note["restoration"].update(
+            status="confirmed", evidence="Synthetic fixture author confirms intended development; no external manuscript or scientific claim.")
+        witness = self.job / "work/restoration-witness.txt"
+        witness.write_text("Synthetic fixture author confirms the intended word development; [gap] was deliberately authored.\n", encoding="utf-8")
+        self.request["source_changes"]["added_notes"][0]["witnesses"][0]["sha256"] = workflow.digest_file(witness)
+        self.source_revision = "mixed-confirmed"
+        self.save_proposal()
+        self.admit_and_reseal()
+        core.validate_book(self.job, translated=False)
+        self.refuse_cli("review", self.job, self.job / "reviews/round-1.json")
+
+    def test_selected_source_checkpoint_requires_full_inspection_and_pinned_prepared_inputs(self):
+        self.reviewed_job()
+        self.mixed_proposal()
+        self.cli(*self.admission_arguments())
+        bindings = self.complete_units("source", source_revision="mixed", checkpoint=False)
+        self.assertEqual(len(bindings), 1)
+        binding = bindings[0]
+        result_path = self.job / binding["result"]
+        authored = result_path.read_bytes()
+        try:
+            incomplete = json.loads(authored)
+            incomplete["inspection"] = []
+            core.save_json(result_path, incomplete)
+            self.refuse(lambda: workflow.checkpoint_unit(self.job, "source", "u0001", self.task("source")))
+        finally:
+            result_path.write_bytes(authored)
+        witness = self.job / "work/restoration-witness.txt"
+        original = witness.read_bytes()
+        try:
+            witness.write_bytes(original + b"Changed after admission")
+            self.refuse(lambda: workflow.checkpoint_unit(self.job, "source", "u0001", self.task("source")))
+        finally:
+            witness.write_bytes(original)
+        workflow.checkpoint_unit(self.job, "source", "u0001", self.task("source"))
+        self.cli("assemble-units", self.job, "source")
+        self.assertEqual(core.load_json(self.job / "book-source.json"), self.expected)
+
+    @unittest.skipUnless(shutil.which("xelatex"), "real XeLaTeX required for v2 mixed recovery smoke")
+    def test_real_xelatex_mixed_scope_recovery_preserves_all_eleven_normal_gates(self):
+        self.build_patch.stop()
+        self.reviewed_job()
+        initial = core.load_json(self.job / "build/verification.json")
+        self.assertTrue(initial["passed"])
+        self.assertTrue(all(initial["checks"][name] for name in workflow.BUILD_CHECKS))
+        self.mixed_proposal()
+        prepared = {record["output"]["ref"]["path"]: record["output"]["ref"]["sha256"]
+                    for record in self.request["source_changes"]["crop_derivations"]}
+        self.exercise_recovery()
+        verification = core.load_json(self.job / "build/verification.json")
+        self.assertTrue(verification["passed"])
+        self.assertTrue(all(verification["checks"][name] for name in workflow.BUILD_CHECKS))
+        self.assertIn("XeTeX", (self.job / "build/compiler.log").read_text())
+        marks = verification["source_marks"]
+        self.assertTrue(any(mark["printed_label"] == "iv" and mark["display"] == "iv" for mark in marks))
+        self.assertTrue(any(row["id"] == "u0001_repair" for row in verification["notes"]))
+        for name, digest in prepared.items():
+            self.assertEqual(workflow.digest_file(self.job / name), digest)
+        print(json.dumps({"kind": "synthetic-v2-real-xelatex-recovery", "checks": verification["checks"],
+                          "initial_pdf_sha256": initial["pdf_sha256"], "final_pdf_sha256": verification["pdf_sha256"],
+                          "prepared_outputs": prepared, "round": workflow.load_job(self.job)["round"],
+                          "limits": "Synthetic native/task data; structural/rendering evidence only, no inference or scientific/manuscript-truth claim."}, sort_keys=True, indent=2))
 
     def test_cli_scope_exclusivity_and_controller_admission_refuse_before_writes(self):
         self.reviewed_job()
@@ -1349,6 +1706,9 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
 
     def test_recovery_preserves_round_bindings_history_and_frozen_build_until_next_review(self):
         self.reviewed_job()
+        self.exercise_recovery()
+
+    def exercise_recovery(self):
         self.admit_and_reseal()
         tag = self.base["post_review"]
         self.assertEqual((tag["original_round"], tag["original_max_rounds"]), (1, 3))
@@ -1367,7 +1727,17 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.assertNotEqual(term["source_digest"], self.original_files["source.sha256"].decode("ascii").strip())
         self.assertEqual(term["bindings"]["post_review_base"], self.base_reference)
         self.assertEqual((self.job / "terms.json").read_bytes(), self.original_files["terms.json"])
-        self.rebase()
+        self.refuse(lambda: self.plan("translation", rebase_source=self.revision_path,
+                                      accept_policy_compatibility="0" * 64))
+        plan = self.rebase()
+        self.assertEqual(plan["source_rebase"]["carried"], {})
+        self.assertEqual(self.base["post_review"]["failed_review_units"],
+                         [spec["unit_id"] for spec in self.original_review_plan["units"]])
+        self.assertTrue(self.base["post_review"]["forced_pending"]["u0003"])
+        unchanged = plan["source_rebase"]["footprints"]["u0003"]
+        self.assertEqual(unchanged["before"], unchanged["after"])
+        self.assertEqual(unchanged["decision"], "pending")
+        self.assertIn("u0003", unchanged["review_exclusions"])
         self.complete_units("translation")
         with patch("render.build", side_effect=ValueError("synthetic recovery build failure")):
             self.refuse_pending_assembly()
@@ -1444,6 +1814,15 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.refuse(self.rebase)
         self.refuse_cli("checkpoint-role", self.job, "terminology", "--task-result", self.initial_term_task)
         self.assertEqual(old_receipt.read_bytes(), old_bytes)
+        terms_path = self.job / "terms.json"
+        old_terms = terms_path.read_bytes()
+        try:
+            changed = core.load_json(terms_path)
+            changed["terms"][0]["rationale"] += " Changed whole-table policy."
+            core.save_json(terms_path, changed)
+            self.refuse_cli("checkpoint-role", self.job, "terminology", "--task-result", self.task("terminology"))
+        finally:
+            terms_path.write_bytes(old_terms)
         self.fresh_terminology()
         new_receipt = self.job / self.new_term_event["receipt"]
         fresh_bytes = new_receipt.read_bytes()
@@ -1490,7 +1869,7 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         self.reviewed_job()
         reference = self.cli(*self.admission_arguments())
         revision = core.load_json(self.job / reference["plan"])
-        self.complete_units("source", expected=self.expected)
+        self.complete_units("source", source_revision=self.source_revision)
         workflow.assemble_units(self.job, "source")
         path = self.job / revision["source_revision"]["base"]["path"]
         old = path.read_bytes()
@@ -1513,7 +1892,7 @@ class PostReviewSourceRecoveryControllerTests(unittest.TestCase):
         revision = self.job / reference["plan"]
         base_ref = core.load_json(revision)["source_revision"]["base"]
         self.assertNotIn("post_review", core.load_json(self.job / base_ref["path"]))
-        self.complete_units("source", expected=expected)
+        self.complete_units("source", source_revision="list")
         workflow.assemble_units(self.job, "source")
         workflow.seal_job(self.job, reseal=True)
         self.assertEqual((workflow.load_job(self.job)["state"], workflow.load_job(self.job)["round"]), ("source_ready", 0))

@@ -204,8 +204,10 @@ class UnitContractTests(unittest.TestCase):
         self.admit_terminology(job)
         return job, self.plan(job, "translation")
 
-    def pending_translation_job(self, page_count=18, spans=None, terms=None, draft_update=None, source_update=None):
+    def pending_translation_job(self, page_count=18, spans=None, terms=None, draft_update=None, source_update=None, asset_setup=None):
         job = self.new_job(page_count=page_count)
+        if asset_setup is not None:
+            asset_setup(job)
         pages = [page["id"] for page in core.extraction_inventory(job)["pages"]]
         spans = dict(spans if spans is not None else ((3, 4), (6, 7), (9, 10), (12, 13), (15, 16)))
         Image.new("RGB", (8, 8), "red").save(job / "note-evidence.png")
@@ -401,23 +403,31 @@ class UnitContractTests(unittest.TestCase):
         review, failed = self.recovery_review(job, failures=select_failures)
         return job, target, review, failed
 
-    def recovery_request(self, job, identifier="cross6"):
-        expected = core.load_json(job / "book-source.json")
-        block = next(item for item in expected["blocks"] if item["id"] == identifier)
-        block.update(kind="list_item", label="6", list_type="ordered", list_level=1 if block.get("list_level") != 1 else 2)
+    def source_changes(self, **changes):
+        return {"block_fields": {}, "deleted_blocks": [], "block_orders": [], "page_fields": {},
+                "added_protected": [], "removed_protected_ids": [], "added_notes": [],
+                "crop_derivations": [], **changes}
+
+    def write_source_scope(self, job, expected, changes):
         directory = job / "work"
         directory.mkdir(exist_ok=True)
         expected_path = directory / "expected-source.json"
-        # Different object serialization is accepted only at native candidate comparison.
-        expected_path.write_text(json.dumps(expected, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        core.save_json(expected_path, expected)
         event = next(event for event in reversed(workflow.load_job(job)["history"]) if event["event"] == "review_submitted")
-        request = {"version": 1, "kind": "post-review-source-scope",
+        request = {"version": 2, "kind": "post-review-source-scope",
                    "submitted_review": {"path": event["receipt"], "sha256": event["receipt_sha256"]},
                    "expected_source": {"path": expected_path.relative_to(job).as_posix(), "sha256": workflow.digest_file(expected_path)},
-                   "source_changes": {"block_ids": [identifier], "allowed_fields": ["kind", "source", "label", "list_type", "list_level"]}}
+                   "source_changes": changes}
         request_path = directory / "scope.json"
         core.save_json(request_path, request)
         return request_path, request, expected
+
+    def recovery_request(self, job, identifier="cross6"):
+        expected = core.load_json(job / "book-source.json")
+        block = next(item for item in expected["blocks"] if item["id"] == identifier)
+        fields = ["list_level"] if block["kind"] == "list_item" else ["kind", "label", "list_type", "list_level"]
+        block.update(kind="list_item", label="6", list_type="ordered", list_level=1 if block.get("list_level") != 1 else 2)
+        return self.write_source_scope(job, expected, self.source_changes(block_fields={identifier: fields}))
 
     def recovery_source(self, job, request_path, expected):
         reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=request_path)
@@ -447,6 +457,523 @@ class UnitContractTests(unittest.TestCase):
         reference = workflow.plan_units(job, "translation", 6, rebase_source=job / revision_reference["plan"],
                                         accept_policy_compatibility=workflow.digest_file(job / "handoff.md"))
         return core.load_json(job / reference["plan"])
+
+    def source_scope_job(self):
+        """Small real admitted workflow; synthetic prose is not source-fidelity evidence."""
+        def assets(job):
+            for name, shift in (("old-a.png", 0), ("old-b.png", 71), ("redundant.png", 143)):
+                image = Image.new("RGB", (12, 8))
+                image.putdata([((x * 17 + shift) % 256, y * 29, (x + y) * 11)
+                               for y in range(8) for x in range(12)])
+                image.save(job / name)
+
+        def manuscript(draft, pages):
+            draft["protected"] = [
+                {"id": "ObsoleteTail", "kind": "math", "value": "d_{ij}+c_i"},
+                {"id": "SharedFormula", "kind": "math", "value": "z_i"},
+                {"id": "OldList", "kind": "math", "value": r"B_1,\ldots,B_m"}]
+            for block in draft["blocks"]:
+                block["source"] = [token for token in block["source"] if "protected" not in token]
+                if block["id"] == "paragraph4":
+                    block["source"] = [{"page": pages[3]}, {"text": self.tail_prose()}, {"protected": "ObsoleteTail"}]
+                if block["id"] in {"paragraph5", "paragraph10"}:
+                    block["source"].append({"protected": "SharedFormula"})
+                if block["id"] == "paragraph6":
+                    block["source"] = [{"page": pages[5]}, {"text": "The damaged word is deve[gap]pment."}]
+                if block["id"] == "paragraph9":
+                    block["source"].append({"protected": "OldList"})
+            extras = {
+                pages[1]: [
+                    {"id": "label_fragment", "kind": "paragraph", "source": [{"text": "1."}]},
+                    {"id": "duplicate_image", "kind": "image", "asset": "redundant.png", "width": 12, "height": 8,
+                     "source_em": 4, "scale_evidence": "Synthetic unchanged source-pixel calibration.", "source": []},
+                    {"id": "shared_image", "kind": "image", "asset": "old-a.png", "width": 12, "height": 8,
+                     "source_em": 4, "scale_evidence": "Synthetic unchanged source-pixel calibration.", "source": []},
+                    {"id": "question2", "kind": "list_item", "label": "2.", "list_type": "ordered", "list_level": 1,
+                     "source": [{"text": "Complete second exercise: retain its hypothesis, construction, and conclusion."}]},
+                    {"id": "question1", "kind": "list_item", "label": "?", "list_type": "ordered", "list_level": 1,
+                     "source": [{"text": "Complete first exercise: retain the complete setup, every constraint, and the final question."}]}],
+                pages[2]: [{"id": "crop_a", "kind": "image", "asset": "old-a.png", "width": 12, "height": 8,
+                            "source_em": 4, "scale_evidence": "Synthetic unchanged source-pixel calibration.", "source": []}],
+                pages[3]: [
+                    {"id": "inline_intro", "kind": "paragraph", "source": [
+                        {"text": "Complete valid explanatory prose before the unchanged genuine equation image. "},
+                        {"protected": "ObsoleteTail"}]},
+                    {"id": "genuine_display", "kind": "image", "asset": "old-a.png", "width": 12, "height": 8,
+                     "source_em": 4, "scale_evidence": "Synthetic unchanged source-pixel calibration.", "source": []}],
+                pages[7]: [{"id": "crop_b", "kind": "image", "asset": "old-b.png", "width": 12, "height": 8,
+                            "source_em": 4, "scale_evidence": "Synthetic unchanged source-pixel calibration.", "source": []}],
+                pages[8]: [{"id": "secondary_list", "kind": "paragraph", "source": [
+                    {"text": "A second actual occurrence of the same printed list: "}, {"protected": "OldList"}]}]}
+            blocks = []
+            for block in draft["blocks"]:
+                blocks.append(block)
+                for extra in extras.get(block["source_pages"][0], []):
+                    blocks.append({**extra, "source_pages": block["source_pages"], "target": []})
+            draft["blocks"] = blocks
+
+        job, target = self.pending_translation_job(page_count=12, spans=(), draft_update=manuscript, asset_setup=assets)
+        for spec in target["units"]:
+            prepared, _, _, output = self.prepare(job, "translation", spec["unit_id"])
+            self.finish(job, prepared, output)
+        with patch("render.build", side_effect=self.recovery_build):
+            workflow.assemble_units(job, "translation")
+        self.recovery_review(job, lambda plan: {plan["units"][-1]["unit_id"]: "coverage"})
+        return job
+
+    def tail_prose(self):
+        return ("The complete valid introduction explains the distance model, its assumptions, "
+                "the independent costs, and why the following genuine display is needed. ")
+
+    def restoration_fixture(self, page, asset, status="conjectural"):
+        return {"id": "u0001_reconstruction", "content_type": "prose", "target": [],
+                "source": [{"text": "Editorial synthetic reconstruction: development; no recovered-ink claim. Original fragment: "},
+                           {"text": "deve[gap]pment"}, {"text": " Original damage: "},
+                           {"image": {"asset": asset, "width_em": 14.5, "height_em": 1, "raise_em": 0}}],
+                "restoration": {"source_page": page, "original_fragment": "deve[gap]pment",
+                                "replacement": "development", "status": status,
+                                "evidence": "Synthetic contextual editorial fixture, not historical or scientific corroboration; see work/context.txt.",
+                                "damage_asset": asset},
+                "source_evidence": [{"asset": asset, "source_page": page,
+                                     "description": "Supplied synthetic original-page rectangle, [50,45,340,65]."}]}
+
+    def prepared_crop(self, job, unit, origin, use, input_path, output_path, rect):
+        with Image.open(job / input_path) as image:
+            width, height, mode = image.width, image.height, image.mode
+            image.crop(rect).save(job / output_path, format="PNG")
+        return {"unit_id": unit, "origin": origin, "use": use,
+                "input": {"ref": {"path": input_path, "sha256": workflow.digest_file(job / input_path)},
+                          "width_px": width, "height_px": height, "mode": mode},
+                "rect_px": list(rect),
+                "output": {"ref": {"path": output_path, "sha256": workflow.digest_file(job / output_path)},
+                           "width_px": rect[2] - rect[0], "height_px": rect[3] - rect[1], "mode": mode}}
+
+    def mixed_source_scope(self, job, status="conjectural"):
+        expected = core.load_json(job / "book-source.json")
+        pages = expected["source_pages"]
+        (job / "work").mkdir(exist_ok=True)
+        witness = job / "work/context.txt"
+        witness.write_text("Synthetic contextual reading: development. This fixture does not certify recovered ink.\n", encoding="utf-8")
+        witness_ref = {"path": "work/context.txt", "sha256": workflow.digest_file(witness)}
+        source_plan = core.load_json(job / core.load_json(job / "units/source/active.json")["plan"])
+        crops = [self.prepared_crop(job, unit, {"kind": "source-asset", "block_id": block},
+                                   {"kind": "image-block", "block_id": block}, old, new, (2, 1, 10, 7))
+                 for unit, block, old, new in (("u0001", "crop_a", "old-a.png", "work/crop-a.png"),
+                                                ("u0002", "crop_b", "old-b.png", "work/crop-b.png"))]
+        page = pages[5]["id"]
+        crops.append(self.prepared_crop(job, "u0001", {"kind": "original-page", "page_id": page},
+            {"kind": "restoration-note", "note_id": "u0001_reconstruction", "callout_block_id": "paragraph6", "source_page": page},
+            source_plan["pages"][page]["image"], "work/damage.png", (50, 45, 340, 65)))
+        pages[1].update(printed_label="iv", label_verified=True, evidence="Synthetic direct annotation; not arithmetic.")
+        expected["blocks"] = [block for block in expected["blocks"] if block["id"] not in {"label_fragment", "duplicate_image"}]
+        blocks = {block["id"]: block for block in expected["blocks"]}
+        blocks["question1"]["label"] = "1."
+        first, second = expected["blocks"].index(blocks["question1"]), expected["blocks"].index(blocks["question2"])
+        expected["blocks"][first], expected["blocks"][second] = expected["blocks"][second], expected["blocks"][first]
+        blocks["paragraph4"]["source"] = [{"page": pages[3]["id"]}, {"text": self.tail_prose()}]
+        blocks["inline_intro"]["source"] = [{"text": "Complete valid explanatory prose before the unchanged genuine equation image. "}]
+        blocks["paragraph6"]["source"] = [{"page": page}, {"text": "The contextual reading is development"}, {"note": "u0001_reconstruction"}]
+        for identifier in ("paragraph9", "secondary_list"):
+            for token in blocks[identifier]["source"]:
+                if token.get("protected") == "OldList":
+                    token["protected"] = "u0002_PrintedList"
+        for identifier, path in (("crop_a", "work/crop-a.png"), ("crop_b", "work/crop-b.png")):
+            blocks[identifier].update(asset=path, width=8, height=6)
+        expected["protected"] = [item for item in expected["protected"] if item["id"] not in {"ObsoleteTail", "OldList"}]
+        expected["protected"].append({"id": "u0002_PrintedList", "kind": "math", "value": r"B_1,\ldots,M_m"})
+        expected["notes"].append(self.restoration_fixture(page, "work/damage.png", status=status))
+        changes = self.source_changes(
+            block_fields={"question1": ["label"], "paragraph4": ["source"], "inline_intro": ["source"], "paragraph6": ["source"],
+                          "paragraph9": ["source"], "secondary_list": ["source"],
+                          "crop_a": ["asset", "width", "height"], "crop_b": ["asset", "width", "height"]},
+            deleted_blocks=[{"id": "label_fragment", "kind": "redundant-ordinary-fragment",
+                             "retained_at": [{"block_id": "question1", "field": "label"}]},
+                            {"id": "duplicate_image", "kind": "redundant-image", "retained_block_ids": ["question1"]}],
+            block_orders=[{"unit_id": "u0001", "block_ids": [block["id"] for block in expected["blocks"]
+                           if block["source_pages"][0] in source_plan["units"][0]["owned_pages"]]}],
+            page_fields={pages[1]["id"]: ["printed_label", "label_verified", "evidence"]},
+            added_protected=[{"id": "u0002_PrintedList", "unit_id": "u0002", "witnesses": [witness_ref]}],
+            removed_protected_ids=["ObsoleteTail", "OldList"],
+            added_notes=[{"id": "u0001_reconstruction", "unit_id": "u0001", "callout_block_id": "paragraph6", "witnesses": [witness_ref]}],
+            crop_derivations=crops)
+        return self.write_source_scope(job, expected, changes)
+
+    def mixed_native_source(self, job, unit, status="conjectural"):
+        """Author from old packet plus explicit fixture decisions, never expected_source."""
+        prepared, binding, packet, output = self.prepare(job, "source", unit)
+        blocks = {block["id"]: block for block in output["blocks"]}
+        if unit == "u0001":
+            output["source_pages"][1].update(printed_label="iv", label_verified=True, evidence="Synthetic direct annotation; not arithmetic.")
+            output["blocks"] = [block for block in output["blocks"] if block["id"] not in {"duplicate_image", "label_fragment"}]
+            blocks["question1"]["label"] = "1."
+            output["blocks"].remove(blocks["question1"])
+            output["blocks"].insert(output["blocks"].index(blocks["question2"]), blocks["question1"])
+            blocks["paragraph4"]["source"] = [{"page": blocks["paragraph4"]["source_pages"][0]}, {"text": self.tail_prose()}]
+            blocks["inline_intro"]["source"] = [{"text": "Complete valid explanatory prose before the unchanged genuine equation image. "}]
+            page = blocks["paragraph6"]["source_pages"][0]
+            blocks["paragraph6"]["source"] = [{"page": page}, {"text": "The contextual reading is development"}, {"note": "u0001_reconstruction"}]
+            output["notes"].append(self.restoration_fixture(page, "work/damage.png", status=status))
+            blocks["crop_a"].update(asset="work/crop-a.png", width=8, height=6)
+        else:
+            blocks["crop_b"].update(asset="work/crop-b.png", width=8, height=6)
+            for identifier in ("paragraph9", "secondary_list"):
+                for token in blocks[identifier]["source"]:
+                    if token.get("protected") == "OldList":
+                        token["protected"] = "u0002_PrintedList"
+            output["protected"].append({"id": "u0002_PrintedList", "kind": "math", "value": r"B_1,\ldots,M_m"})
+        # Old readonly definitions remain in full native evidence; normal merge prunes exact unused imports.
+        return prepared, binding, packet, output
+
+    def refuse_source_scope(self, job, path, reopened=("u0001", "u0002"), readiness=None):
+        before = self.recovery_tree(job)
+        with self.assertRaises(ValueError):
+            workflow.plan_units(job, "source", 6, revise=True, reopen_units=list(reopened), post_review_scope=path)
+        self.assertEqual(self.recovery_tree(job), before)
+        if readiness is None:
+            _, _, _, seal, bindings = workflow.role_readiness(job, "source", revise=True)
+            readiness = {"source_digest": seal, "bindings": bindings}
+        with self.assertRaises(ValueError):
+            units.create_plan(job, "source", pages_per_unit=6, revise=True, reopen_units=list(reopened),
+                              readiness=readiness, post_review_scope=path)
+        self.assertEqual(self.recovery_tree(job), before)
+
+    def test_v2_deletion_and_order_only_need_no_retained_field_edits(self):
+        for operation in ("deletion", "order"):
+            with self.subTest(operation=operation):
+                job = self.source_scope_job()
+                expected = core.load_json(job / "book-source.json")
+                old_asset = (job / "redundant.png").read_bytes()
+                changes = self.source_changes()
+                if operation == "deletion":
+                    expected["blocks"] = [block for block in expected["blocks"] if block["id"] != "duplicate_image"]
+                    changes["deleted_blocks"] = [{"id": "duplicate_image", "kind": "redundant-image", "retained_block_ids": ["question2"]}]
+                else:
+                    blocks = {block["id"]: block for block in expected["blocks"]}
+                    expected["blocks"].remove(blocks["question1"])
+                    expected["blocks"].insert(expected["blocks"].index(blocks["question2"]), blocks["question1"])
+                    plan = core.load_json(job / core.load_json(job / "units/source/active.json")["plan"])
+                    owned = set(plan["units"][0]["owned_block_ids"])
+                    changes["block_orders"] = [{"unit_id": "u0001", "block_ids": [block["id"] for block in expected["blocks"] if block["id"] in owned]}]
+                path, _, _ = self.write_source_scope(job, expected, changes)
+                workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+                prepared, _, _, output = self.prepare(job, "source", "u0001")
+                if operation == "deletion":
+                    output["blocks"] = [block for block in output["blocks"] if block["id"] != "duplicate_image"]
+                else:
+                    question = next(block for block in output["blocks"] if block["id"] == "question1")
+                    output["blocks"].remove(question)
+                    output["blocks"].insert(next(index for index, block in enumerate(output["blocks"]) if block["id"] == "question2"), question)
+                self.finish(job, prepared, output)
+                workflow.assemble_units(job, "source")
+                self.assertEqual(core.validate_source(job), expected)
+                self.assertEqual((job / "redundant.png").read_bytes(), old_asset)
+
+
+    def test_v2_page_only_scope_has_no_dummy_block_authority(self):
+        job = self.source_scope_job()
+        original = core.load_json(job / "book-source.json")
+        expected = copy.deepcopy(original)
+        page = expected["source_pages"][1]
+        page.update(printed_label="A-iv", label_verified=True, evidence="Synthetic direct page-label annotation.")
+        path, _, _ = self.write_source_scope(job, expected, self.source_changes(
+            page_fields={page["id"]: ["printed_label", "label_verified", "evidence"]}))
+        reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)
+        prepared, _, _, output = self.prepare(job, "source", "u0001")
+        output["source_pages"][1].update(printed_label="A-iv", label_verified=True, evidence="Synthetic direct page-label annotation.")
+        self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        self.assertEqual(core.validate_source(job), expected)
+        self.assertEqual(core.load_json(job / "book-source.json")["blocks"], original["blocks"])
+        workflow.seal_job(job, reseal=True)
+        rebased = self.recovery_terms_and_rebase(job, reference)
+        self.assertEqual(rebased["source_rebase"]["footprints"]["u0001"]["decision"], "pending")
+
+    def test_v2_mixed_full_source_crops_reconciliation_and_archive(self):
+        # Both existing Core statuses are structural data, never synthetic evidence of truth.
+        for status in ("conjectural", "confirmed"):
+            with self.subTest(restoration_status=status):
+                job = self.source_scope_job()
+                old_source = core.load_json(job / "book-source.json")
+                old_assets = {name: (job / name).read_bytes() for name in ("old-a.png", "old-b.png", "redundant.png")}
+                path, request, expected = self.mixed_source_scope(job, status=status)
+                prepared_bytes = {row["output"]["ref"]["path"]: (job / row["output"]["ref"]["path"]).read_bytes()
+                                  for row in request["source_changes"]["crop_derivations"]}
+                reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001", "u0002"], post_review_scope=path)
+                revision = core.load_json(job / reference["plan"])
+                for unit in ("u0001", "u0002"):
+                    prepared, _, packet, output = self.mixed_native_source(job, unit, status=status)
+                    # Prepared candidates never replace the old canonical source basis in input packets.
+                    self.assertEqual(next(block for block in packet["blocks"] if block["id"] == ("crop_a" if unit == "u0001" else "crop_b"))["asset"],
+                                     "old-a.png" if unit == "u0001" else "old-b.png")
+                    self.finish(job, prepared, output)
+                workflow.assemble_units(job, "source")
+                actual = core.validate_source(job)
+                self.assertEqual(actual, expected)
+                self.assertEqual(next(block for block in actual["blocks"] if block["id"] == "paragraph4")["source"][1]["text"], self.tail_prose())
+                self.assertEqual([block["id"] for block in actual["blocks"] if block["id"].startswith("question")], ["question1", "question2"])
+                self.assertEqual({item["id"] for item in actual["protected"]}, {"SharedFormula", "u0002_PrintedList"})
+                self.assertEqual(len(actual["notes"]), 1)
+                self.assertEqual(core._asset_hashes(job, actual).keys(),
+                                 {"old-a.png", "work/crop-a.png", "work/crop-b.png", "work/damage.png"})
+                for name, content in (old_assets | prepared_bytes).items():
+                    self.assertEqual((job / name).read_bytes(), content, name)
+                workflow.seal_job(job, reseal=True)
+                units.validate_aggregate(job, workflow.latest_role_receipt(job, workflow.load_job(job), "source"), "source")
+                base = core.load_json(job / revision["source_revision"]["base"]["path"])
+                archived_source = core.load_json(job / base["source"]["path"])
+                self.assertEqual(archived_source, old_source)
+                self.recovery_terms_and_rebase(job, reference)
+                self.assertEqual((workflow.load_job(job)["state"], workflow.load_job(job)["round"], workflow.load_job(job)["max_rounds"]),
+                                 ("changes_requested", 1, 3))
+
+    def test_v2_mixed_preflight_rejects_unauthorized_deltas_and_rasters(self):
+        job = self.source_scope_job()
+        path, good, expected = self.mixed_source_scope(job)
+        expected_path = job / good["expected_source"]["path"]
+        saved = {name: (job / name).read_bytes() for name in ("old-a.png", "work/crop-a.png", "work/context.txt")}
+        _, _, _, seal, bindings = workflow.role_readiness(job, "source", revise=True)
+        readiness = {"source_digest": seal, "bindings": bindings}
+        cases = ("missing_destination", "foreign_destination", "delete_body_start", "delete_protected_content",
+                 "missing_order", "incomplete_order", "foreign_order", "redundant_order", "unchanged_page_field",
+                 "unverified_label", "page_locator", "outside_owner", "unused_addition", "old_value_mutation",
+                 "surviving_global_use", "missed_secondary_user", "orphan_note", "duplicate_callout", "foreign_note_owner",
+                 "plain_note", "unresolved_note", "empty_replacement", "missing_witness", "extra_association",
+                 "sibling_crop", "wrong_input_association", "crop_owner", "source_em", "scale_evidence",
+                 "pixels", "mode", "resize", "wrong_dimensions", "fractional_rect", "empty_rect", "out_of_bounds",
+                 "whole_image", "oldassetoverwrite", "path_escape", "symlink_output", "unused_crop")
+        outside = self.root / "outside-crop.png"
+        outside.write_bytes(saved["work/crop-a.png"])
+        link = job / "work/crop-alias.png"
+        link.symlink_to(job / "work/crop-a.png")
+        for case in cases:
+            for name, content in saved.items():
+                (job / name).write_bytes(content)
+            request, proposal = copy.deepcopy(good), copy.deepcopy(expected)
+            changes = request["source_changes"]
+            crop = changes["crop_derivations"][0]
+            blocks = {block["id"]: block for block in proposal["blocks"]}
+            if case == "missing_destination":
+                changes["deleted_blocks"][0]["retained_at"] = []
+            elif case == "foreign_destination":
+                changes["deleted_blocks"][0]["retained_at"][0]["block_id"] = "paragraph9"
+            elif case in {"delete_body_start", "delete_protected_content"}:
+                identifier = "paragraph1" if case == "delete_body_start" else "paragraph5"
+                proposal["blocks"].remove(blocks[identifier])
+                changes["deleted_blocks"].append({"id": identifier, "kind": "redundant-ordinary-fragment",
+                    "retained_at": [{"block_id": "question1", "field": "label"}]})
+                changes["block_orders"][0]["block_ids"].remove(identifier)
+            elif case == "missing_order":
+                changes["block_orders"] = []
+            elif case == "incomplete_order":
+                changes["block_orders"][0]["block_ids"].pop()
+            elif case == "foreign_order":
+                changes["block_orders"][0]["block_ids"].append("paragraph9")
+            elif case == "redundant_order":
+                changes["block_orders"].append({"unit_id": "u0002", "block_ids": [block["id"] for block in proposal["blocks"]
+                    if block["source_pages"][0] in [page["id"] for page in proposal["source_pages"][6:]]]})
+            elif case == "unchanged_page_field":
+                changes["page_fields"][proposal["source_pages"][0]["id"]] = ["evidence"]
+            elif case == "unverified_label":
+                proposal["source_pages"][1]["label_verified"] = False
+                changes["page_fields"][proposal["source_pages"][1]["id"]].remove("label_verified")
+            elif case == "page_locator":
+                proposal["source_pages"][1]["locator"] = "Changed original inventory locator"
+            elif case == "outside_owner":
+                changes["added_protected"][0]["unit_id"] = "u0001"
+            elif case == "unused_addition":
+                proposal["protected"].append({"id": "u0001_unused", "kind": "math", "value": "w_i"})
+                changes["added_protected"].append({"id": "u0001_unused", "unit_id": "u0001", "witnesses": []})
+            elif case == "old_value_mutation":
+                next(item for item in proposal["protected"] if item["id"] == "SharedFormula")["value"] = "z_j"
+            elif case == "surviving_global_use":
+                proposal["protected"] = [item for item in proposal["protected"] if item["id"] != "SharedFormula"]
+                changes["removed_protected_ids"].append("SharedFormula")
+            elif case == "missed_secondary_user":
+                next(token for token in blocks["secondary_list"]["source"] if "protected" in token)["protected"] = "OldList"
+                changes["block_fields"].pop("secondary_list")
+            elif case == "orphan_note":
+                blocks["paragraph6"]["source"].pop()
+            elif case == "duplicate_callout":
+                blocks["paragraph6"]["source"].append({"note": "u0001_reconstruction"})
+            elif case == "foreign_note_owner":
+                changes["added_notes"][0]["unit_id"] = "u0002"
+            elif case == "plain_note":
+                proposal["notes"][0].pop("restoration")
+            elif case == "unresolved_note":
+                proposal["notes"][0]["restoration"]["status"] = "unresolved"
+            elif case == "empty_replacement":
+                proposal["notes"][0]["restoration"]["replacement"] = ""
+            elif case == "missing_witness":
+                changes["added_notes"][0]["witnesses"][0]["path"] = "work/absent-context.txt"
+            elif case == "extra_association":
+                blocks["question1"]["source"].append({"image": {"asset": "work/crop-a.png", "width_em": 4, "height_em": 3, "raise_em": 0}})
+                changes["block_fields"]["question1"].append("source")
+            elif case == "sibling_crop":
+                blocks["crop_a"]["asset"] = "work/crop-b.png"
+            elif case == "wrong_input_association":
+                crop["input"]["ref"] = copy.deepcopy(changes["crop_derivations"][1]["input"]["ref"])
+            elif case == "crop_owner":
+                crop["unit_id"] = "u0002"
+            elif case == "source_em":
+                blocks["crop_a"]["source_em"] = 5
+                changes["block_fields"]["crop_a"].append("source_em")
+            elif case == "scale_evidence":
+                blocks["crop_a"]["scale_evidence"] = "New invented calibration"
+            elif case in {"pixels", "mode", "resize"}:
+                with Image.open(job / "work/crop-a.png") as image:
+                    changed = image.copy()
+                if case == "pixels":
+                    changed.putpixel((0, 0), (255, 255, 255))
+                elif case == "mode":
+                    changed = changed.convert("L")
+                    crop["output"]["mode"] = "L"
+                else:
+                    changed = changed.resize((4, 3))
+                    crop["output"].update(width_px=4, height_px=3)
+                    blocks["crop_a"].update(width=4, height=3)
+                changed.save(job / "work/crop-a.png")
+                crop["output"]["ref"]["sha256"] = workflow.digest_file(job / "work/crop-a.png")
+            elif case == "wrong_dimensions":
+                crop["output"]["width_px"] = 9
+            elif case in {"fractional_rect", "empty_rect", "out_of_bounds", "whole_image"}:
+                crop["rect_px"] = {"fractional_rect": [2.5, 1, 10, 7], "empty_rect": [2, 1, 2, 7],
+                                   "out_of_bounds": [2, 1, 13, 7], "whole_image": [0, 0, 12, 8]}[case]
+            elif case == "oldassetoverwrite":
+                (job / "old-a.png").write_bytes(saved["work/crop-a.png"])
+            elif case in {"path_escape", "symlink_output"}:
+                name = str(outside) if case == "path_escape" else "work/crop-alias.png"
+                crop["output"]["ref"]["path"] = name
+                blocks["crop_a"]["asset"] = name
+            elif case == "unused_crop":
+                changes["crop_derivations"].append(copy.deepcopy(crop))
+            core.save_json(expected_path, proposal)
+            request["expected_source"]["sha256"] = workflow.digest_file(expected_path)
+            core.save_json(path, request)
+            with self.subTest(case=case):
+                self.refuse_source_scope(job, path, readiness=readiness)
+        for name, content in saved.items():
+            (job / name).write_bytes(content)
+        core.save_json(expected_path, expected)
+        good["expected_source"]["sha256"] = workflow.digest_file(expected_path)
+        core.save_json(path, good)
+        workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001", "u0002"], post_review_scope=path)
+
+    def test_v2_prepared_native_members_reject_sibling_and_extra_uses(self):
+        job = self.source_scope_job()
+        path, _, expected = self.mixed_source_scope(job)
+        workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001", "u0002"], post_review_scope=path)
+        prepared, binding, _, complete = self.mixed_native_source(job, "u0001")
+        for case in ("sibling", "extra_inline", "unlisted_asset", "geometry", "old_import"):
+            output = copy.deepcopy(complete)
+            image = next(block for block in output["blocks"] if block["id"] == "crop_a")
+            if case == "sibling":
+                image["asset"] = "work/crop-b.png"
+            elif case == "extra_inline":
+                output["blocks"][0]["source"].append({"image": {"asset": "work/crop-a.png", "width_em": 4, "height_em": 3, "raise_em": 0}})
+            elif case == "unlisted_asset":
+                arbitrary = job / "work/arbitrary.png"
+                arbitrary.write_bytes((job / "work/crop-a.png").read_bytes())
+                image["asset"] = "work/arbitrary.png"
+            elif case == "geometry":
+                image["width"] = 7
+            else:
+                next(item for item in output["protected"] if item["id"] == "SharedFormula")["value"] = "w_i"
+            core.save_json(job / binding["result"], output)
+            task = domain_fixtures.save_task_result(self.root / "coordinator-results", "source", PROVIDER, MODEL)
+            before = self.recovery_tree(job)
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                workflow.checkpoint_unit(job, "source", "u0001", task)
+            self.assertEqual(self.recovery_tree(job), before)
+        self.finish(job, prepared, complete)
+        second, _, _, output = self.mixed_native_source(job, "u0002")
+        self.finish(job, second, output)
+        workflow.assemble_units(job, "source")
+        self.assertEqual(core.load_json(job / "book-source.json"), expected)
+
+    def test_v2_prepared_inputs_members_and_archive_are_hash_bound(self):
+        job = self.source_scope_job()
+        path, request, _ = self.mixed_source_scope(job)
+        reference = workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001", "u0002"], post_review_scope=path)
+        revision = core.load_json(job / reference["plan"])
+        base_ref = revision["source_revision"]["base"]
+        base = core.load_json(job / base_ref["path"])
+        names = {"old-a.png", "old-b.png", "redundant.png", "work/context.txt"}
+        names.update(row["output"]["ref"]["path"] for row in request["source_changes"]["crop_derivations"])
+        names.update(row["input"]["ref"]["path"] for row in request["source_changes"]["crop_derivations"])
+        for name in sorted(names):
+            artifact = job / name
+            content = artifact.read_bytes()
+            try:
+                artifact.write_bytes(content + b" changed")
+                before = self.recovery_tree(job)
+                with self.subTest(precheckpoint=name), self.assertRaises(ValueError):
+                    units.unit_binding(job, "source", "u0001")
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                artifact.write_bytes(content)
+        for unit in ("u0001", "u0002"):
+            prepared, _, _, output = self.mixed_native_source(job, unit)
+            self.finish(job, prepared, output)
+        workflow.assemble_units(job, "source")
+        workflow.seal_job(job, reseal=True)
+        aggregate = workflow.latest_role_receipt(job, workflow.load_job(job), "source")
+        names.update({base_ref["path"], base["post_review"]["scope_request"]["path"]})
+        original = core.load_json(job / base["source_plan"]["plan"])
+        for plan in (original, revision):
+            for spec in plan["units"]:
+                names.update(spec[key] for key in ("packet", "result", "checkpoint"))
+        for name in sorted(names):
+            artifact = job / name
+            content = artifact.read_bytes()
+            try:
+                if name == "redundant.png":
+                    artifact.unlink()
+                elif name == base_ref["path"]:
+                    unknown = core.load_json(artifact)
+                    unknown["post_review"]["unknown_authority"] = True
+                    core.save_json(artifact, unknown)
+                else:
+                    artifact.write_bytes(content + b" changed")
+                before = self.recovery_tree(job)
+                with self.subTest(archive=name), self.assertRaises(ValueError):
+                    units.validate_aggregate(job, aggregate, "source")
+                self.assertEqual(self.recovery_tree(job), before)
+            finally:
+                artifact.write_bytes(content)
+
+
+    def test_historical_v1_scope_is_immutable_narrow_provenance_not_live_permission(self):
+        """Synthetic historical authority fixture, not evidence of a past native execution."""
+        job = self.source_scope_job()
+        old = core.load_json(job / "book-source.json")
+        expected = copy.deepcopy(old)
+        next(block for block in expected["blocks"] if block["id"] == "question1")["label"] = "1."
+        archive = job / "work/historical-fixture"
+        archive.mkdir(parents=True)
+        expected_path = archive / "expected.json"
+        core.save_json(expected_path, expected)
+        event = next(event for event in reversed(workflow.load_job(job)["history"]) if event["event"] == "review_submitted")
+        historical = {"version": 1, "kind": "post-review-source-scope",
+            "submitted_review": {"path": event["receipt"], "sha256": event["receipt_sha256"]},
+            "expected_source": {"path": expected_path.relative_to(job).as_posix(), "sha256": workflow.digest_file(expected_path)},
+            "source_changes": {"block_ids": ["question1"], "allowed_fields": ["label"]}}
+        request_path = archive / "scope.json"
+        core.save_json(request_path, historical)
+        frozen = {name: artifact.read_bytes() for name, artifact in (("scope.json", request_path), ("expected.json", expected_path))}
+        source_plan = core.load_json(job / core.load_json(job / "units/source/active.json")["plan"])
+        before = self.recovery_tree(job)
+        units._expected_source(job, old, expected, historical, source_plan, ["u0001"], historical=True)
+        broader = copy.deepcopy(expected)
+        broader["source_pages"][1].update(printed_label="iv", label_verified=True)
+        with self.assertRaises(ValueError):
+            units._expected_source(job, old, broader, historical, source_plan, ["u0001"], historical=True)
+        with self.assertRaises(ValueError):
+            units._expected_source(job, old, expected, historical, source_plan, ["u0001"])
+        self.refuse_source_scope(job, request_path, reopened=("u0001",))
+        self.assertEqual(self.recovery_tree(job), before)
+        for name, content in frozen.items():
+            self.assertEqual((archive / name).read_bytes(), content)
+
 
     def test_post_review_source_recovery_preserves_consumed_origins_feedback_and_original_cap(self):
         job, old_target, review, failed = self.recovery_job()
@@ -646,9 +1173,9 @@ class UnitContractTests(unittest.TestCase):
         expected_path = job / good["expected_source"]["path"]
         original = core.load_json(job / "book-source.json")
         cases = ["missing_expected", "incomplete_expected", "unknown_request_field", "unknown_scope_field",
-                 "wrong_kind", "wrong_version", "wrong_hash", "malformed_hash", "wrong_submitted", "missing_file",
-                 "empty_ids", "duplicate_ids", "unknown_ids", "outside_owner", "empty_fields", "duplicate_fields",
-                 "unsupported_field", "owner_field", "no_change", "extra_unchanged_id", "unlisted_change",
+                 "wrong_kind", "wrong_version", "unknown_version", "missing_category", "wrong_hash", "malformed_hash", "wrong_submitted", "missing_file",
+                 "empty_ids", "duplicate_json_keys", "unknown_ids", "outside_owner", "empty_fields", "duplicate_fields",
+                 "unsupported_field", "owner_field", "no_change", "pure_noop", "extra_unchanged_id", "extra_unchanged_field", "unlisted_change",
                  "selected_owner_extra_edit", "metadata", "notes", "definitions", "page_inventory", "page_reassignment",
                  "block_order", "block_insert", "block_delete", "block_id", "source_asset", "invalid_structure"]
         for case in cases:
@@ -664,18 +1191,25 @@ class UnitContractTests(unittest.TestCase):
                 request["source_changes"]["owner"] = "u0001"
             elif case == "wrong_kind":
                 request["kind"] = "source-revision"
-            elif case == "wrong_version":
-                request["version"] = True
-            elif case in {"empty_ids", "duplicate_ids", "unknown_ids", "outside_owner", "extra_unchanged_id"}:
-                request["source_changes"]["block_ids"] = {
-                    "empty_ids": [], "duplicate_ids": ["cross6", "cross6"], "unknown_ids": ["unknown"],
-                    "outside_owner": ["paragraph26"], "extra_unchanged_id": ["cross6", "paragraph1"]}[case]
-            elif case in {"empty_fields", "duplicate_fields", "unsupported_field", "owner_field"}:
-                request["source_changes"]["allowed_fields"] = {
+            elif case in {"wrong_version", "unknown_version"}:
+                request["version"] = True if case == "wrong_version" else 3
+            elif case == "missing_category":
+                request["source_changes"].pop("added_notes")
+            elif case in {"empty_ids", "unknown_ids", "outside_owner", "extra_unchanged_id"}:
+                fields = good["source_changes"]["block_fields"]["cross6"]
+                request["source_changes"]["block_fields"] = {
+                    "empty_ids": {}, "unknown_ids": {"unknown": fields},
+                    "outside_owner": {"paragraph26": fields},
+                    "extra_unchanged_id": {"cross6": fields, "paragraph1": ["source"]}}[case]
+            elif case in {"empty_fields", "duplicate_fields", "unsupported_field", "owner_field", "extra_unchanged_field"}:
+                request["source_changes"]["block_fields"]["cross6"] = {
                     "empty_fields": [], "duplicate_fields": ["kind", "kind"], "unsupported_field": ["target"],
-                    "owner_field": ["kind", "source_pages"]}[case]
-            elif case == "no_change":
+                    "owner_field": ["kind", "source_pages"],
+                    "extra_unchanged_field": ["kind", "label", "list_type", "list_level", "source"]}[case]
+            elif case in {"no_change", "pure_noop"}:
                 proposal = copy.deepcopy(original)
+                if case == "pure_noop":
+                    request["source_changes"] = self.source_changes()
             elif case in {"unlisted_change", "selected_owner_extra_edit"}:
                 identifier = "paragraph26" if case == "unlisted_change" else "paragraph2"
                 next(block for block in proposal["blocks"] if block["id"] == identifier)["source"].append({"text": "Unauthorized extra prose."})
@@ -712,6 +1246,10 @@ class UnitContractTests(unittest.TestCase):
             elif case == "missing_file":
                 request["expected_source"]["path"] = "work/absent.json"
             core.save_json(path, request)
+            if case == "duplicate_json_keys":
+                raw = path.read_text(encoding="utf-8")
+                path.write_text(raw.replace(
+                    '"block_fields": {', '"block_fields": {"cross6": ["source"],', 1), encoding="utf-8")
             before = self.recovery_tree(job)
             with self.subTest(case=case, entry="controller"), self.assertRaises(ValueError):
                 workflow.plan_units(job, "source", 6, revise=True, reopen_units=["u0001"], post_review_scope=path)

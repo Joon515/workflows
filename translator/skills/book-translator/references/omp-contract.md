@@ -31,11 +31,66 @@ omp --plugin-dir .omp/translator
 
 This discovers the skill and four native agents together. Invoke `/skill:book-translator` interactively with the actual task, or read the discovered skill. No extension flag, package-specific task tool, SDK loader, global configuration edit, global extension install or research checkout is required. `--skills` filters discovered names, not paths; there is no singular `--skill` flag. Copying an arbitrary nested directory without activating it does not establish skill registration.
 
-## Already-running parent
+## Complete project-native activation
 
-An existing parent may instead use explicit project-native agent copies or file symlinks under `.omp/agents/`, named `book-source.md`, `book-terminology.md`, `book-translation.md` and `book-review.md`, pointing to this package's shipped definitions. Inspect collisions first; never overwrite unrelated definitions. Installed OMP 18.12.3 refreshes project task agents during native task preflight, so this route does not require a new model/authentication controller or restarting the parent. A task description created earlier may be cached; it is not the authoritative preflight discovery result.
+Instead of --plugin-dir, materialize BOTH resource groups from the retained `.agents/translator` or `.omp/translator` distribution into the same project:
 
-Read the copied `skills/book-translator/SKILL.md` manually in that parent and follow its relative references. Native project-agent discovery does NOT by itself register the skill or establish a `/skill:book-translator` command. Do not claim plugin activation for this route unless that session actually loaded the plugin. These are two resource-loading arrangements for the same built-in native task mechanism, not alternative model executors. [verify_install.py](../scripts/verify_install.py) checks isolated copied layouts with actual CLI metadata requests and no inference; that is not evidence of a live parent's provider access or child execution.
+| Shipped resource | Native project destination |
+|---|---|
+| agents/book-source.md | .omp/agents/book-source.md |
+| agents/book-terminology.md | .omp/agents/book-terminology.md |
+| agents/book-translation.md | .omp/agents/book-translation.md |
+| agents/book-review.md | .omp/agents/book-review.md |
+| ENTIRE skills/book-translator directory | .omp/skills/book-translator |
+
+The complete skill includes scripts, references, stages, contracts, templates, requirements and tests, not just SKILL.md. Preserve the shipped relative-reference convention: agents link to `../skills/book-translator/...`; skill references link to `../../../agents/`. Agent-only copying leaves those agent links broken; file symlinks alone merely conceal that defect for consumers that resolve realpaths first. Both materialized lexical bases must close.
+
+Preflight ALL five destinations before ANY write (including parent creation). Any existing destination file, directory, valid symlink or dangling symlink rejects the whole operation. Existing `.omp`, `.omp/agents` and `.omp/skills` parents must be real directories, not symlinks or files. Preserve unrelated children in those directories. Never merge/overwrite an existing skill tree and never link the whole agents directory. This is an explicit standard-resource recipe, not an installer/configuration/extension; run it only in the intended project with no concurrent destination writers:
+
+```sh
+# Run from the target project. Choose the retained container and ONE mode.
+python3 - .agents/translator copy <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+
+retained = Path(sys.argv[1]).absolute()  # Or .omp/translator
+mode = sys.argv[2]  # copy, or symlink
+if mode not in ("copy", "symlink"):
+    raise SystemExit("Choose copy or symlink")
+names = ("book-source", "book-terminology", "book-translation", "book-review")
+pairs = [(retained / "agents" / f"{name}.md", Path(".omp/agents") / f"{name}.md") for name in names]
+pairs.append((retained / "skills/book-translator", Path(".omp/skills/book-translator")))
+if any(not source.is_file() for source, _ in pairs[:4]) or not (pairs[4][0] / "SKILL.md").is_file():
+    raise SystemExit("Missing retained translator resources")
+conflicts = [str(target) for _, target in pairs if os.path.lexists(target)]
+for parent in (Path(".omp"), Path(".omp/agents"), Path(".omp/skills")):
+    if os.path.lexists(parent) and (parent.is_symlink() or not parent.is_dir()):
+        conflicts.append(str(parent))
+if conflicts:
+    raise SystemExit("No resources written; occupied destinations: " + ", ".join(conflicts))
+for source, target in pairs:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "symlink":
+        target.symlink_to(os.path.relpath(source, target.parent), target_is_directory=source.is_dir())
+    elif source.is_dir():
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+    else:
+        shutil.copy2(source, target)
+PY
+omp
+```
+
+For the relative-symlink alternative change `copy` to `symlink`; use four FILE symlinks and one WHOLE skill-directory symlink, all relative to their destination parents. Keep the retained distribution present. Ordinary copies are independent of it after materialization. Start a NEW parent without --plugin-dir: complete copies and complete symlinks each expect one `/skill:book-translator` command and four native agents. Use `.omp/skills/book-translator` as <skill> for doctor, imports and worker paths. These are resource-loading arrangements for the same built-in native task mechanism, not different model executors.
+
+The pinned execution-time discovery evidence above concerns native task-agent preflight; it does not establish skill-command reload in an already-running parent. A create-time task description may be cached. Do not infer a live-parent skill refresh, provider access or child execution from fresh-parent CLI metadata.
+
+### Portable verifier boundary
+
+Run [verify_install.py](../scripts/verify_install.py) from the RETAINED translator distribution, for example `python3 .agents/translator/skills/book-translator/scripts/verify_install.py` (or the .omp/translator equivalent). The helper recognizes the translator package root using its lexical layout, plugin.json identity, README, skill entry and four agents BEFORE any copy. Invocation through materialized `.omp/skills/book-translator/scripts/verify_install.py`, including a whole-skill symlink, is rejected; a consumer `.omp` and its configuration are never a package to copy. This helper verifies disposable layouts, not live-project installation.
+
+It checks eight isolated NEW-parent cases: two retained containers times copied-only, --plugin-dir, complete project copy and complete project symlink. Copied-only expects 0 skills/0 agents; all six active forms expect 1 skill/4 agents. It compares every installed skill file/hash and all agent hashes, checks local Markdown references from the MATERIALIZED lexical agent and skill paths (normalizing .. before filesystem traversal), and imports modules/runs doctor from that same skill. Python bytecode caches are not shipped inventory. Metadata requests send no inference and forward no credentials; doctor reports capabilities rather than proving compilation. Discovery is separate from model authentication, task execution and translation quality.
 
 ## Explicit model choice and native configuration
 
