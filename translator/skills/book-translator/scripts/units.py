@@ -859,9 +859,9 @@ def _scope_witnesses(job: Path, values: object, *, required=False) -> None:
 def _source_scope_request(job: Path, request: dict, *, historical=False) -> None:
     _scope_shape(request, {"version", "kind", "submitted_review", "expected_source", "source_changes"}, "request")
     version = request["version"]
-    if (type(version) is not int or version not in ({1, 2} if historical else {2})
+    if (type(version) is not int or version not in ({1, 2, 3} if historical else {3})
             or request["kind"] != "post-review-source-scope"):
-        raise ValueError("Invalid strict post-review source scope request version; live authority requires version 2")
+        raise ValueError("Invalid strict post-review source scope request version; live authority requires version 3")
     for key in ("submitted_review", "expected_source"):
         _strict_ref(job, request[key])
     changes = request["source_changes"]
@@ -873,8 +873,11 @@ def _source_scope_request(job: Path, request: dict, *, historical=False) -> None
         if not set(fields) <= {"kind", "source", "label", "list_type", "list_level"}:
             raise ValueError("Unsupported historical post-review structural field")
         return
-    _scope_shape(changes, {"block_fields", "deleted_blocks", "block_orders", "page_fields", "added_protected",
-                           "removed_protected_ids", "added_notes", "crop_derivations"}, "source_changes")
+    categories = {"block_fields", "deleted_blocks", "block_orders", "page_fields", "added_protected",
+                  "removed_protected_ids", "added_notes", "crop_derivations"}
+    if version == 3:
+        categories.update({"added_blocks", "removed_self_primary_inline_uses"})
+    _scope_shape(changes, categories, "source_changes")
     for key, eligible in (("block_fields", {"kind", "source", "label", "list_type", "list_level", "asset", "width", "height"}),
                           ("page_fields", {"printed_label", "label_verified", "evidence"})):
         if not isinstance(changes[key], dict) or any(not isinstance(name, str) or not name for name in changes[key]):
@@ -883,6 +886,16 @@ def _source_scope_request(job: Path, request: dict, *, historical=False) -> None
             if not set(_scope_ids(fields, key, nonempty=True)) <= eligible:
                 raise ValueError("Unsupported post-review field authority")
     _scope_ids(changes["removed_protected_ids"], "removed protected IDs")
+    if version == 3:
+        removals = changes["removed_self_primary_inline_uses"]
+        if not isinstance(removals, list):
+            raise ValueError("Post-review removed_self_primary_inline_uses must be an array")
+        for row in removals:
+            _scope_shape(row, {"block_id", "source_token_index"}, "self-primary inline removal")
+            _scope_ids([row["block_id"]], "self-primary inline removal block")
+            if type(row["source_token_index"]) is not int or row["source_token_index"] < 0:
+                raise ValueError("Self-primary inline removal needs an exact nonnegative source-token index")
+        _scope_ids([row["block_id"] for row in removals], "self-primary inline removal blocks")
     for key in ("deleted_blocks", "block_orders", "added_protected", "added_notes", "crop_derivations"):
         if not isinstance(changes[key], list):
             raise ValueError(f"Post-review {key} must be an array")
@@ -916,17 +929,26 @@ def _source_scope_request(job: Path, request: dict, *, historical=False) -> None
         _scope_shape(row, {"unit_id", "block_ids"}, "block order")
         _scope_ids([row["unit_id"]], "order owner")
         _scope_ids(row["block_ids"], "surviving block permutation", nonempty=True)
-    for category in ("added_protected", "added_notes"):
+    addition_categories = ("added_protected", "added_notes", "added_blocks") if version == 3 else ("added_protected", "added_notes")
+    for category in addition_categories:
+        if not isinstance(changes[category], list):
+            raise ValueError(f"Post-review {category} must be an array")
         for row in changes[category]:
-            keys = {"id", "unit_id", "witnesses"} | ({"callout_block_id"} if category == "added_notes" else set())
+            keys = {"id", "unit_id", "witnesses"}
+            if category == "added_notes":
+                keys.add("callout_block_id")
+            elif category == "added_blocks":
+                keys.add("page_id")
             _scope_shape(row, keys, category)
             _scope_ids([row["id"]], "addition ID")
             _scope_ids([row["unit_id"]], "addition owner")
             if category == "added_notes":
                 _scope_ids([row["callout_block_id"]], "note callout")
-            _scope_witnesses(job, row["witnesses"], required=category == "added_notes")
+            elif category == "added_blocks":
+                _scope_ids([row["page_id"]], "addition page")
+            _scope_witnesses(job, row["witnesses"], required=category != "added_protected")
     refs = [request["submitted_review"], request["expected_source"]]
-    for category in ("added_protected", "added_notes"):
+    for category in addition_categories:
         refs.extend(ref for row in changes[category] for ref in row["witnesses"])
     for row in changes["crop_derivations"]:
         _scope_shape(row, {"unit_id", "origin", "use", "input", "rect_px", "output"}, "crop")
@@ -940,6 +962,11 @@ def _source_scope_request(job: Path, request: dict, *, historical=False) -> None
             _scope_ids([origin["block_id"]], "crop block")
             if use["block_id"] != origin["block_id"]:
                 raise ValueError("Crop must retain the same existing image block")
+        elif version == 3 and origin.get("kind") == "original-page" and use.get("kind") == "image-block":
+            _scope_shape(origin, {"kind", "page_id"}, "crop origin")
+            _scope_shape(use, {"kind", "block_id"}, "crop use")
+            _scope_ids([origin["page_id"]], "crop page")
+            _scope_ids([use["block_id"]], "new image crop block")
         elif origin.get("kind") == "original-page" and use.get("kind") == "restoration-note":
             _scope_shape(origin, {"kind", "page_id"}, "crop origin")
             _scope_shape(use, {"kind", "note_id", "callout_block_id", "source_page"}, "crop use")
@@ -962,6 +989,8 @@ def _source_scope_request(job: Path, request: dict, *, historical=False) -> None
             raise ValueError("Crop rectangle must be four exact integers")
     for key, field in (("deleted_blocks", "id"), ("block_orders", "unit_id"), ("added_protected", "id"), ("added_notes", "id")):
         _scope_ids([row[field] for row in changes[key]], key)
+    if version == 3:
+        _scope_ids([row["id"] for key in addition_categories for row in changes[key]], "global addition IDs")
     uses = [_canonical(row["use"]) for row in changes["crop_derivations"]]
     outputs = [row["output"]["ref"]["path"] for row in changes["crop_derivations"]]
     if len(set(uses)) != len(uses) or len(set(outputs)) != len(outputs):
@@ -1032,6 +1061,8 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
                      *, historical=False) -> None:
     _source_scope_request(job, request, historical=historical)
     changes = request["source_changes"]
+    if request["version"] == 3:
+        core.validate_document("book", expected)
     core._validate_structure(expected, job, None, False)
     if request["version"] == 1:
         ids, fields = changes["block_ids"], changes["allowed_fields"]
@@ -1077,17 +1108,62 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
     fields("source_pages", changes["page_fields"], page_owners, {"printed_label", "label_verified", "evidence"})
     before, after = declarations["blocks"], {item["id"]: item for item in expected["blocks"]}
     deleted = {row["id"]: row for row in changes["deleted_blocks"]}
-    if set(after) - set(before) or set(before) - set(after) != set(deleted):
-        raise ValueError("Expected source block membership differs from exact declared deletions")
+    added_blocks = {row["id"]: row for row in changes["added_blocks"]} if request["version"] == 3 else {}
+    if set(after) - set(before) != set(added_blocks) or set(before) - set(after) != set(deleted):
+        raise ValueError("Expected source block membership differs from exact declared additions/deletions")
     fields("blocks", changes["block_fields"], block_owners, {"kind", "source", "label", "list_type", "list_level", "asset", "width", "height"})
+    self_primary_inline_removals = []
+    if request["version"] == 3:
+        old_namespace = {item["id"] for category in ("source_pages", "blocks", "notes", "protected") for item in old[category]}
+        for category in ("added_blocks", "added_protected", "added_notes"):
+            for row in changes[category]:
+                owned(row["unit_id"])
+                if row["id"] in old_namespace or not row["id"].startswith(row["unit_id"] + "_"):
+                    raise ValueError("New source IDs must be globally fresh in their selected natural owner namespace")
+        # Resolve actual old-plus-new ownership before destinations, imports or callouts.
+        _, _, expected_ownership = _logical_layout(expected, plan)
+        new_block_owners, new_note_owners, _, _ = expected_ownership
+        if any(new_note_owners.get(name) != owner for name, owner in note_owners.items()):
+            raise ValueError("Existing note callout ownership must remain unchanged")
+        block_owners = {**block_owners, **new_block_owners}
+        for name, row in added_blocks.items():
+            block = after[name]
+            page = row["page_id"]
+            page_record = plan["pages"].get(page)
+            if (page_owners.get(page) != row["unit_id"] or new_block_owners[name] != row["unit_id"]
+                    or block["source_pages"] != [page] or block["kind"] not in {"heading", "paragraph", "list_item", "image"}
+                    or block["target"] != [] or page_record is None
+                    or {"path": page_record["image"], "sha256": page_record["image_sha256"]} not in row["witnesses"]):
+                raise ValueError("New blocks require their exact owned original page, kind, empty target and original-page witness")
+        for row in changes["removed_self_primary_inline_uses"]:
+            name, index = row["block_id"], row["source_token_index"]
+            if name not in before or name not in after or name in deleted:
+                raise ValueError("Self-primary inline removal requires an existing retained image block")
+            owned(block_owners[name])
+            block, retained = before[name], after[name]
+            if (block["kind"] != "image" or retained["kind"] != "image"
+                    or changes["block_fields"].get(name) != ["source"]
+                    or _changed_fields(block, retained) != {"source"}):
+                raise ValueError("Self-primary inline removal may change only the retained image source field")
+            source = block["source"]
+            if (index >= len(source) or [position for position, token in enumerate(source) if set(token) != {"page"}] != [index]
+                    or set(source[index]) != {"image"} or source[index]["image"]["asset"] != block["asset"]):
+                raise ValueError("Self-primary inline removal requires exactly its indexed sole non-page self-primary image node")
+            if retained["source"] != source[:index] + source[index + 1:]:
+                raise ValueError("Self-primary inline removal must preserve every other source token and its order")
+            if any(crop["origin"].get("block_id") == name or crop["use"].get("block_id") == name
+                   for crop in changes["crop_derivations"]):
+                raise ValueError("Self-primary inline removal cannot also crop the same retained image block")
+            self_primary_inline_removals.append(("blocks", name, "source-image", block["asset"], _canonical(source[index]["image"])))
+    caption_transfers = {}
     for name, row in deleted.items():
         block = before[name]
         owned(block_owners[name])
         if len(block["source_pages"]) != 1 or name == old["main_body_start"] or block.get("target") != []:
             raise ValueError("Cannot delete a crossing/body-boundary/nonempty-target source block")
         if row["kind"] == "redundant-image":
-            if block["kind"] != "image" or block["source"] != []:
-                raise ValueError("Redundant image deletion requires an ordinary standalone image without source tokens")
+            if block["kind"] != "image" or (request["version"] == 2 and block["source"] != []):
+                raise ValueError("Redundant image deletion requires an eligible standalone image")
             destinations = row["retained_block_ids"]
         else:
             if (block["kind"] not in {"paragraph", "list_item"} or not block["source"]
@@ -1098,6 +1174,12 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
             if (destination not in after or block_owners[destination] != block_owners[name]
                     or after[destination]["source_pages"] != block["source_pages"]):
                 raise ValueError("Deletion representation must survive on exactly the same owner/page")
+        if row["kind"] == "redundant-image" and block["source"]:
+            matches = [destination for destination in destinations
+                       if after[destination]["kind"] == "image" and after[destination]["source"] == block["source"]]
+            if len(matches) != 1:
+                raise ValueError("A deleted image caption requires one unambiguous exact full typed source survivor on a retained same-owner/page image")
+            caption_transfers[name] = matches[0]
         if row["kind"] == "redundant-ordinary-fragment":
             for destination in row["retained_at"]:
                 retained = after[destination["block_id"]]
@@ -1114,11 +1196,14 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
     for spec in canonical_specs:
         unit = spec["unit_id"]
         surviving = [name for name in spec["owned_block_ids"] if name not in deleted]
+        added = {name for name, row in added_blocks.items() if row["unit_id"] == unit}
+        if added and unit not in orders:
+            raise ValueError("Every owner with additions requires an explicit complete resulting block order")
         order = orders.get(unit, surviving)
         if unit in orders:
             owned(unit)
-            if set(order) != set(surviving) or order == surviving:
-                raise ValueError("Block order must be a real complete surviving same-owner permutation")
+            if set(order) != set(surviving) | added or (not added and order == surviving):
+                raise ValueError("Block order must be a real complete resulting same-owner permutation")
         sequence.extend(order)
     if set(orders) - {spec["unit_id"] for spec in plan["units"]} or sequence != [item["id"] for item in expected["blocks"]]:
         raise ValueError("Expected whole block order differs from declared natural-owner permutations")
@@ -1177,7 +1262,7 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
         note = new_notes[name]
         callout = row["callout_block_id"]
         if (callout not in after or block_owners[callout] != row["unit_id"]
-                or "source" not in changes["block_fields"].get(callout, [])
+                or (callout not in added_blocks and "source" not in changes["block_fields"].get(callout, []))
                 or sum(token.get("note") == name for token in after[callout]["source"]) != 1
                 or note.get("content_type") != "prose" or note.get("target") != []
                 or not isinstance(note.get("restoration"), dict) or not note["restoration"]):
@@ -1186,6 +1271,20 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
     desired = _asset_associations(old)
     for name in deleted:
         desired.subtract(_asset_associations({"blocks": [before[name]]}))
+    for name, destination in caption_transfers.items():
+        # An unchanged retained caption already has its associations in desired.
+        # Its redundant donor was deleted above; do not count the survivor twice.
+        if destination in before and before[destination]["source"] == before[name]["source"]:
+            continue
+        # Otherwise only the caption owner ID relocates; full typed arrays above
+        # retain every inline node attribute, position and multiplicity.
+        for use, count in _asset_associations({"blocks": [before[name]]}).items():
+            if use[2] == "source-image":
+                desired[(use[0], destination, *use[2:])] += count
+    for use in self_primary_inline_removals:
+        if desired[use] != 1:
+            raise ValueError("Self-primary inline removal must subtract exactly one unchanged source-image association")
+        desired[use] -= 1
     image_crops = set()
     note_crops = set()
     page_records = plan["pages"]
@@ -1210,6 +1309,20 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
                               if use[2] == "image-block"})
             desired.update({use: count for use, count in _asset_associations({"blocks": [after[name]]}).items()
                             if use[2] == "image-block"})
+        elif row["use"]["kind"] == "image-block":
+            page_id, name = row["origin"]["page_id"], row["use"]["block_id"]
+            declaration = added_blocks.get(name)
+            page_record = page_records.get(page_id)
+            if (declaration is None or declaration["unit_id"] != row["unit_id"]
+                    or declaration["page_id"] != page_id or page_record is None
+                    or page_owners.get(page_id) != row["unit_id"] or after[name]["kind"] != "image"
+                    or row["input"]["ref"] != {"path": page_record["image"], "sha256": page_record["image_sha256"]}
+                    or after[name]["asset"] != output_name
+                    or (after[name]["width"], after[name]["height"]) != (row["output"]["width_px"], row["output"]["height_px"])):
+                raise ValueError("New image crop must bind its exact declared new block, owner, original page and output geometry")
+            image_crops.add(name)
+            desired.update({use: count for use, count in _asset_associations({"blocks": [after[name]]}).items()
+                            if use[2] == "image-block"})
         else:
             page_id, use = row["origin"]["page_id"], row["use"]
             name = use["note_id"]
@@ -1229,6 +1342,8 @@ def _expected_source(job: Path, old: dict, expected: dict, request: dict, plan: 
             desired.update(_asset_associations({"notes": [new_notes[name]]}))
     if note_crops != set(new_note_rows):
         raise ValueError("Every new restoration note requires its exact declared original-page crop")
+    if {name for name in added_blocks if after[name]["kind"] == "image"} - image_crops:
+        raise ValueError("Every new image requires exactly its declared original-page crop")
     for name, fields_list in changes["block_fields"].items():
         if set(fields_list) & {"asset", "width", "height"} and name not in image_crops:
             raise ValueError("Image asset/geometry authority requires its exact declared prepared crop")
@@ -1270,41 +1385,62 @@ def _frozen_scope_request(job: Path, post: dict) -> dict:
 
 
 def _prepared_references(changes: dict) -> list:
-    refs = [ref for key in ("added_protected", "added_notes") for row in changes[key] for ref in row["witnesses"]]
+    refs = [ref for key in ("added_protected", "added_notes", "added_blocks")
+            for row in changes.get(key, []) for ref in row["witnesses"]]
     refs.extend(row[key]["ref"] for row in changes["crop_derivations"] for key in ("input", "output"))
     return refs
 
 
-def _prepared_source_scope(job: Path, post: dict, unit_id: str) -> dict | None:
+def _prepared_source_scope(job: Path, post: dict, unit_id: str, packet: dict | None = None) -> dict | None:
     request = _frozen_scope_request(job, post)
-    if request["version"] != 2:
+    if request["version"] == 1:
         return None
     changes = request["source_changes"]
     witnesses = {}
-    for key in ("added_protected", "added_notes"):
-        for row in changes[key]:
+    for key in ("added_protected", "added_notes", "added_blocks"):
+        for row in changes.get(key, []):
             if row["unit_id"] == unit_id:
                 for ref in row["witnesses"]:
                     witnesses[ref["path"]] = ref
-    return {"version": 2, "scope_request": post["scope_request"], "expected_source": post["expected_source"],
-            "crop_derivations": [row for row in changes["crop_derivations"] if row["unit_id"] == unit_id],
-            "witnesses": list(witnesses.values())}
+    prepared = {"version": request["version"], "scope_request": post["scope_request"], "expected_source": post["expected_source"],
+                "crop_derivations": [row for row in changes["crop_derivations"] if row["unit_id"] == unit_id],
+                "witnesses": list(witnesses.values())}
+    if request["version"] == 3:
+        if packet is None or packet["unit_id"] != unit_id:
+            raise ValueError("Prepared v3 authority requires the unchanged original owner packet")
+        expected = _checked(job, post["expected_source"]["path"], post["expected_source"]["sha256"])
+        projection = _source_projection(expected, packet)
+        owned = set(packet["owned_protected_ids"]) | {row["id"] for row in changes["added_protected"] if row["unit_id"] == unit_id}
+        referenced = {name for item in projection["blocks"] + projection["notes"] for name in _references(item, "protected")}
+        legacy_readonly = {item["id"]: item for item in packet["protected"]
+                           if item["id"] not in packet["owned_protected_ids"] or item["id"] in packet["shared_protected_ids"]}
+        projection["protected"] = [item for item in expected["protected"] if item["id"] in owned | referenced | legacy_readonly.keys()]
+        present = {item["id"] for item in projection["protected"]}
+        projection["protected"].extend(item for name, item in legacy_readonly.items() if name not in present)
+        prepared.update(added_blocks=[row for row in changes["added_blocks"] if row["unit_id"] == unit_id],
+                        expected_owner=projection,
+                        readonly_protected=[item for item in projection["protected"] if item["id"] not in owned or item["id"] in legacy_readonly])
+    return prepared
 
 
 def _prepared_source_inputs(job: Path, packet: dict) -> dict | None:
     prepared = packet.get("prepared_source_scope")
     if prepared is None:
         return None
-    _scope_shape(prepared, {"version", "scope_request", "expected_source", "crop_derivations", "witnesses"}, "prepared source packet")
-    if packet["role"] != "source" or type(prepared["version"]) is not int or prepared["version"] != 2:
-        raise ValueError("Prepared source authority is only version 2 source context")
+    if (not isinstance(prepared, dict) or packet["role"] != "source"
+            or type(prepared.get("version")) is not int or prepared["version"] not in {2, 3}):
+        raise ValueError("Prepared source authority requires exact version 2 or 3 source context")
+    keys = {"version", "scope_request", "expected_source", "crop_derivations", "witnesses"}
+    if prepared["version"] == 3:
+        keys |= {"added_blocks", "expected_owner", "readonly_protected"}
+    _scope_shape(prepared, keys, "prepared source packet")
     for key in ("scope_request", "expected_source"):
         _strict_ref(job, prepared[key])
     raw = _scope_json(_path(job, prepared["scope_request"]["path"]))
-    if raw.get("version") != 2:
-        raise ValueError("Prepared source context cannot grant historical v1 authority")
+    if raw.get("version") != prepared["version"]:
+        raise ValueError("Prepared source context cannot change frozen authority versions")
     post = {**prepared, "submitted_review": raw.get("submitted_review")}
-    if prepared != _prepared_source_scope(job, post, packet["unit_id"]):
+    if prepared != _prepared_source_scope(job, post, packet["unit_id"], packet):
         raise ValueError("Prepared source packet differs from its frozen owner authority")
     expected = _checked(job, prepared["expected_source"]["path"], prepared["expected_source"]["sha256"])
     blocks = {item["id"]: item for item in packet["blocks"]}
@@ -1320,7 +1456,7 @@ def _prepared_source_inputs(job: Path, packet: dict) -> dict | None:
             name = row["origin"]["page_id"]
             if (name not in packet["owned_pages"] or row["input"]["ref"] != {
                     "path": pages[name]["image"], "sha256": pages[name]["image_sha256"]}):
-                raise ValueError("Prepared restoration input differs from the owned original page")
+                raise ValueError("Prepared crop input differs from the owned original page")
     return expected
 
 
@@ -1834,8 +1970,8 @@ def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
             if live != {name: ref["sha256"] for name, ref in post["build_files"].items()}:
                 raise ValueError("Admitted build changed during post-review source authoring")
         request = _frozen_scope_request(job, post)
-        if request["version"] == 1 and _hash(job / "job.json") == plan["job_sha256"]:
-            raise ValueError("Historical version-1 source authority is read-only; no new live execution is admitted")
+        if request["version"] != 3 and _hash(job / "job.json") == plan["job_sha256"]:
+            raise ValueError("Historical source authority is read-only; no new live execution is admitted")
         expected = _checked(job, post["expected_source"]["path"], post["expected_source"]["sha256"])
         _expected_source(job, source, expected, request, original, reopened, historical=True)
     if (plan["role"] != "source" or plan["revision"] is not True or plan["base_round"] != (post["original_round"] if post is not None else 0)
@@ -1855,7 +1991,7 @@ def _source_revision_inputs(job: Path, plan: dict) -> tuple[dict, dict]:
         if (spec["unit_id"] in reopened) == (spec.get("source_carry") is not None) or spec.get("carried_checkpoint") is not None:
             raise ValueError("Source revision may freshly execute only its explicit selected units")
         packet = _checked(job, spec["packet"], spec["packet_sha256"])
-        prepared = _prepared_source_scope(job, post, spec["unit_id"]) if post is not None and spec["unit_id"] in reopened else None
+        prepared = _prepared_source_scope(job, post, spec["unit_id"], packet) if post is not None and spec["unit_id"] in reopened else None
         if packet.get("prepared_source_scope") != prepared:
             raise ValueError("Source packet prepared scope differs from frozen selected owner authority")
     return base, source
@@ -2412,7 +2548,7 @@ def create_plan(job, role: str, *, pages_per_unit: int = 8, draft_path=None, rev
             continue
         packet = packet_for(spec, identifier, page_records, ownership)
         if source_context is not None and base.get("post_review") is not None and spec["unit_id"] in source_context["reopened"]:
-            prepared = _prepared_source_scope(job, base["post_review"], spec["unit_id"])
+            prepared = _prepared_source_scope(job, base["post_review"], spec["unit_id"], packet)
             if prepared is not None:
                 packet["prepared_source_scope"] = prepared
         _packet_scope(packet)
@@ -2602,6 +2738,16 @@ def _validate_result(job: Path, packet: dict, output: dict, binding: dict) -> di
     if packet["role"] == "source":
         for category in ("source_pages", "blocks", "notes", "protected"):
             _items(category, output.get(category))
+        prepared_expected = _prepared_source_inputs(job, packet)
+        prepared = packet.get("prepared_source_scope")
+        strict_prepared = prepared is not None and prepared["version"] == 3
+        if strict_prepared:
+            projection = prepared["expected_owner"]
+            if any(output[category] != projection[category] for category in ("source_pages", "blocks", "notes", "protected")):
+                raise ValueError("Prepared native result must equal the exact complete expected owner projection")
+            if output.get("metadata") != projection.get("metadata") or (
+                    "body_start" in output and output["body_start"] != prepared_expected["main_body_start"]):
+                raise ValueError("Prepared native source metadata/body boundary differs from the frozen expected owner")
         if Counter(item["id"] for item in output["source_pages"]) != Counter(packet["owned_pages"]):
             raise ValueError("Source result must conserve exactly its owned original page records")
         pages = {item["page_id"]: item for item in packet["pages"]}
@@ -2629,6 +2775,8 @@ def _validate_result(job: Path, packet: dict, output: dict, binding: dict) -> di
                 if original_block is None or block["source_pages"] != original_block["source_pages"]:
                     raise ValueError("New cross-unit source structure needs explicit replanning; result remains unconsumed")
         original = {item["id"]: item for item in packet["protected"]}
+        if strict_prepared:
+            original.update({item["id"]: item for item in prepared["readonly_protected"]})
         produced = {item["id"]: item for item in output["protected"]}
         readonly = (set(original) - set(packet["owned_protected_ids"])) | set(packet["shared_protected_ids"])
         if any(produced.get(name) != original[name] for name in readonly):
@@ -2642,7 +2790,7 @@ def _validate_result(job: Path, packet: dict, output: dict, binding: dict) -> di
                     raise ValueError("New source IDs must use their unit_id_ namespace")
         assets = {}
         allowed_assets = _asset_names({"blocks": packet["blocks"], "notes": packet["notes"]})
-        prepared_expected = _prepared_source_inputs(job, packet)
+        # Frozen prepared inputs were validated before resolving protected imports.
         prepared_assets = {}
         if prepared_expected is not None:
             associations = _asset_associations(output)
@@ -2652,7 +2800,7 @@ def _validate_result(job: Path, packet: dict, output: dict, binding: dict) -> di
                 name = ref["path"]
                 actual = Counter({use: count for use, count in associations.items() if use[3] == name})
                 declared = Counter({use: count for use, count in expected_associations.items() if use[3] == name})
-                if actual and actual != declared:
+                if (strict_prepared or actual) and actual != declared:
                     raise ValueError("Prepared output may be used only at its exact declared block/note association and geometry")
                 prepared_assets[name] = ref["sha256"]
         for name in _asset_names(output):
@@ -3041,11 +3189,23 @@ def _merge(job: Path, plan: dict, outputs: list, *, source: dict | None = None) 
             # Stable sort retains authored reading order within each starting page.
             book[category].sort(key=lambda item: page_order[item["source_pages"][0]])
     authored = set()
+    original = None
+    retained_owned = set()
+    if plan.get("source_revision") is not None:
+        base, original = _source_revision_inputs(job, plan)
+        if base.get("post_review") is not None:
+            request = _frozen_scope_request(job, base["post_review"])
+            if request["version"] == 3:
+                retained_owned = {item["id"] for item in original["protected"]} - set(request["source_changes"]["removed_protected_ids"])
     for spec, output in zip(plan["units"], outputs):
         packet = _checked(job, spec["packet"], spec["packet_sha256"])
+        prepared = packet.get("prepared_source_scope")
         imports = {item["id"]: item for item in packet["protected"] + packet.get("context_protected", [])}
+        if prepared is not None and prepared["version"] == 3:
+            imports.update({item["id"]: item for item in prepared["readonly_protected"]})
         for item in output["protected"]:
-            if imports.get(item["id"]) != item:
+            if (imports.get(item["id"]) != item
+                    or item["id"] in retained_owned and item["id"] in packet["owned_protected_ids"]):
                 authored.add(item["id"])
     referenced = set()
     for item in book["blocks"] + book["notes"]:
@@ -3053,8 +3213,7 @@ def _merge(job: Path, plan: dict, outputs: list, *, source: dict | None = None) 
         referenced.update(token["protected"] for token in item.get("target", []) if "protected" in token)
     # Unused exact imports stay in immutable unit evidence, not the canonical symbol table.
     book["protected"] = [item for item in book["protected"] if item["id"] in referenced or item["id"] in authored]
-    if plan.get("source_revision") is not None:
-        _, original = _source_revision_inputs(job, plan)
+    if original is not None:
         order = {item["id"]: index for index, item in enumerate(original["protected"])}
         book["protected"].sort(key=lambda item: order.get(item["id"], len(order)))
     return book

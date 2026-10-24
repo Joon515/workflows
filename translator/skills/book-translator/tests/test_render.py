@@ -2372,6 +2372,161 @@ class RenderTests(unittest.TestCase):
                                {"case": label, "painted_pdf_glyphs": [(s, f, c[1], c[2], c[3]) for s, f, c in chars],
                                 "overflow_gate_passed": report["checks"]["overflow"]})
 
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for in-word apostrophe glyph and geometry evidence")
+    def test_inword_apostrophe_matches_native_latin_faces_and_typed_neighbors(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        book["protected"] = [
+            {"id": "Name", "kind": "name", "value": "Hadlock"},
+            {"id": "Other", "kind": "name", "value": "Hightower"},
+            {"id": "Compound", "kind": "name", "value": "Kernighan-Lin"},
+            {"id": "Code", "kind": "code", "value": "Lee’s"},
+            {"id": "Math", "kind": "math", "value": "x"}]
+        terms = {"terms": [{"id": "Term", "number": 1, "target": "Lee’s’"}]}
+        def renderer():
+            return render._Renderer(self.job, book, terms)
+        def native(word):
+            # Independent native Latin shaping, not the production local-class macro.
+            return r"{\XeTeXinterchartokenstate=0 " + word + "}"
+        def context(word):
+            return r'{\XeTeXcharclass"2019=0 ' + word + "}"
+        rows = [("Index" + str(index), renderer().inline([{"text": word}]), native(word))
+                for index, word in enumerate(("Hadlock’s", "Mikami’s", "Lee’s", "Soukup’s", "fpga’s", "don’t", "l’été’s"))]
+        for label, tokens, reference in (
+            ("Name", [{"protected": "Name"}, {"text": "’s"}], native("Hadlock’s")),
+            ("Other", [{"protected": "Other"}, {"text": "’s"}], native("Hightower’s")),
+            ("Split", [{"text": "Ha"}, {"text": "dlock’"}, {"text": "s"}], native("Hadlock’s")),
+            ("Marker", [{"protected": "Name"}, {"text": ""}, {"page": "P1"}, {"text": "’"}, {"text": "s"}], native("Hadlock’s")),
+            ("Quotes", [{"text": "前‘Hadlock’s’后"}], "前‘" + context("Hadlock’s") + "’后"),
+            ("Cjk", [{"text": "前Lee’s后"}], context("前Lee’s后")),
+            ("Detached", [{"text": "’s Hadlock ’s 甲’s Lee’"}], "’s Hadlock ’s 甲’s Lee’"),
+            ("CodeBarrier", [{"protected": "Code"}, {"text": "’s"}], r"{\ttfamily Lee’s}’s"),
+            ("MathBarrier", [{"text": "Lee"}, {"protected": "Math"}, {"text": "’s"}], r"Lee\(x\)’s"),
+            ("TermBarrier", [{"term": "Term"}, {"text": "’s"}], r"\BTFirstTerm{" + context("Lee’s") + "’}{1}’s"),
+            ("EndMath", [{"text": "Lee’s（"}, {"protected": "Math"}, {"text": "）乙"}], context("Lee’s") + r"（\(x\)）乙"),
+            ("NameCompound", [{"protected": "Compound"}, {"text": "’s"}],
+             r"\hbox{Kernighan}\BTNameHyphen{}" + context(r"\hbox{Lin}’s"))):
+            rows.append((label, renderer().inline(tokens), reference))
+        r = renderer()
+        rows.extend([
+            ("Emphasis", r"A\emph{" + r.inline([{"text": "前Lee’s后"}]) + "}Z", r"A\emph{" + context("前Lee’s后") + "}Z"),
+            ("Restoration", r.inline([{"text": "Lee’s Hadlock’s"}], _literal_fragment="Lee’s"), "Lee’s " + native("Hadlock’s")),
+            ("LiteralBarrier", r.inline([{"text": "LeeX’s"}], _literal_fragment="X"), "LeeX’s"),
+            ("Header", r.header_text([{"protected": "Name"}, {"text": "’s’"}]), native("Hadlock’s") + "’"),
+            ("Cell", render._cell_text("Lee’s’"), context(render._cell_literal("Lee’s")) + "’")])
+        book["title"] = "Lee’s’"
+        rows.append(("Title", renderer().title_text(), native("Lee’s") + "’"))
+        rows.append(("Protected", renderer().protected_text("Code"), r"{\ttfamily Lee’s}"))
+        url_rows = []
+        for label, tokens, reference in (
+            ("UrlLeft", [{"text": "https://example.test/Hadlock"}, {"text": "’s"}], "https://example.test/Hadlock’s"),
+            ("UrlRight", [{"text": "Hadlock’"}, {"text": "https://example.test"}], "Hadlock’https://example.test"),
+            ("UrlScalar", [{"text": "https://example.test/Hadlock’s"}], "https://example.test/Hadlock’s"),
+            ("UrlGiven", [{"text": "Hadlock"}, {"text": "’shttps://example.test"}], native("Hadlock’shttps") + "://example.test")):
+            url_rows.append((label, renderer().inline(tokens), reference))
+        url_rows.extend([
+            ("UrlDefault", render._ordinary_text("https://example.test/Hadlock’s"), "https://example.test/Hadlock’s"),
+            ("UrlOverlap", r.inline([{"text": "https://example.test/Hadlock’s Alpha’s"}],
+                                    _literal_fragment="Hadlock’s Alpha"), "https://example.test/Hadlock’s Alpha’s"),
+            ("UrlPartition", r.inline([{"text": "HadlockXhttps://example.test/Lee’s"}],
+                                      _literal_fragment="X"), "HadlockXhttps://example.test/Lee’s")])
+        body = [r"\begin{document}\pagestyle{empty}\parindent=0pt\parskip=0pt"]
+        pages = []
+        # Append new URL evidence after the original four-style pages, keeping
+        # established native controls at their original physical coordinates.
+        for row_group in (rows, url_rows):
+            for style, command in enumerate((r"\normalfont", r"\normalfont\bfseries", r"\normalfont\itshape", r"\normalfont\bfseries\itshape")):
+                for first in range(0, len(row_group), 9):
+                    if pages:
+                        body.append(r"\clearpage")
+                    batch = row_group[first:first + 9]
+                    pages.append((style, batch))
+                    body.append("{" + command)
+                    for label, actual, reference in batch:
+                        for suffix, tex in (("N", reference), ("P", actual)):
+                            key = str(style) + label + suffix
+                            body.append(r"\BTTestMetric{" + key + "}{" + tex + "}")
+                            body.append(r"\noindent\makebox[88pt][l]{" + label + suffix + r"}\hbox{" + tex + r"}\par\vspace{7pt}")
+                    body.append("}")
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture("latin-apostrophe-faces", body)
+        self.assertNotIn("Missing character:", log)
+        metrics = {key: int(value) for key, value in re.findall(r"BTFONTMETRIC\|([^|\s]+)\|(\d+)", log)}
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), len(pages))
+            for page, (style, batch) in zip(document, pages):
+                for label, _, _ in batch:
+                    actual = self.font_row_glyphs(page, label + "P", scripts=True)
+                    reference = self.font_row_glyphs(page, label + "N", scripts=True)
+                    self.assertEqual([(s, t["font"], c[1], t["size"]) for s, t, c in actual],
+                                     [(s, t["font"], c[1], t["size"]) for s, t, c in reference], (style, label))
+                    self.assertTrue(all(c[1] > 0 and t["type"] == 0 for _, t, c in actual))
+                    self.assertAlmostEqual(metrics[str(style) + label + "P"], metrics[str(style) + label + "N"], delta=2)
+                    maximum = 0
+                    for (_, _, a), (_, _, n) in zip(actual, reference):
+                        for axis in (0, 1):
+                            delta = abs((a[2][axis] - actual[0][2][2][axis]) - (n[2][axis] - reference[0][2][2][axis]))
+                            maximum = max(maximum, delta)
+                            # Native-identical barrier rows themselves incur up to .0102pt
+                            # PDF text-run coordinate quantization; positive word shaping
+                            # remains strict enough to catch the quote-only grouping defect.
+                            tolerance = .02 if label in {"Detached", "CodeBarrier", "LiteralBarrier", "TermBarrier",
+                                                        "UrlLeft", "UrlRight", "UrlScalar", "UrlDefault", "UrlOverlap", "UrlPartition"} else .0002
+                            self.assertLess(delta, tolerance, (style, label, axis))
+                    evidence.append({"style": style, "case": label, "max_relative_origin_delta_pt": maximum,
+                                     "glyphs": [(s, t["font"], c[1], t["size"], c[2]) for s, t, c in actual]})
+        core.save_json(root / "apostrophe-evidence.json", {"cases": evidence})
+
+    @unittest.skipUnless(shutil.which("xelatex"), "XeLaTeX is required for apostrophized native word breaking")
+    def test_inword_apostrophe_keeps_native_hyphenation_and_source_name_seams(self):
+        import pymupdf
+        book = core.load_json(self.job / "book.json")
+        book["protected"] = [{"id": "Name", "kind": "name", "value": "Kernighan-Lin"}]
+        r = render._Renderer(self.job, book, {"terms": []})
+        prose = "The counterrevolutionary’s algorithm changes unexpectedly."
+        cases = [
+            ("Prose", "70pt", r.inline([{"text": prose}]),
+             r"The {\XeTeXinterchartokenstate=0 counterrevolutionary’s} algorithm changes unexpectedly."),
+            ("Name", "62pt", r.inline([{"protected": "Name"}, {"text": "’s"}]),
+             r'\hbox{Kernighan}\BTNameHyphen{}{\XeTeXcharclass"2019=0 \hbox{Lin}’s}')]
+        body = [r"\begin{document}\pagestyle{empty}\parindent=0pt\parskip=0pt"]
+        contracts = []
+        for style, command in enumerate((r"\normalfont", r"\normalfont\bfseries", r"\normalfont\itshape", r"\normalfont\bfseries\itshape")):
+            for name, width, actual, reference in cases:
+                for tex in (reference, actual):
+                    if contracts:
+                        body.append(r"\clearpage")
+                    body.append("{" + command + r"\noindent\parbox{" + width + r"}{\noindent " + tex + "}}")
+                    contracts.append((style, name))
+        body.append(r"\end{document}")
+        root, log = self.compile_font_fixture("latin-apostrophe-breaks", body)
+        self.assertNotIn("Missing character:", log)
+        evidence = []
+        with pymupdf.open(root / "book.pdf") as document:
+            self.assertEqual(len(document), len(contracts))
+            for index in range(0, len(document), 2):
+                signatures, lines = [], []
+                for page in (document[index], document[index + 1]):
+                    chars = [(chr(c[0]), t, c) for t in page.get_texttrace() for c in t["chars"] if chr(c[0]).strip()]
+                    signatures.append([(s, t["font"], c[1], round(c[2][0] - chars[0][2][2][0], 3),
+                                        round(c[2][1] - chars[0][2][2][1], 3)) for s, t, c in chars])
+                    lines.append(["".join(s for s, _, c in chars if abs(c[2][1] - y) < .05)
+                                  for y in sorted({round(c[2][1], 2) for _, _, c in chars})])
+                self.assertEqual([row[:3] for row in signatures[0]], [row[:3] for row in signatures[1]], contracts[index])
+                for native_glyph, actual_glyph in zip(signatures[0], signatures[1]):
+                    for axis in (3, 4):
+                        self.assertAlmostEqual(native_glyph[axis], actual_glyph[axis], delta=.02)
+                self.assertEqual(lines[0], lines[1])
+                if contracts[index][1] == "Prose":
+                    self.assertTrue(any(line.endswith("-") for line in lines[1]), lines)
+                    self.assertTrue(any("’s" in line for line in lines[1]), lines)
+                else:
+                    self.assertEqual(lines[1], ["Kernighan-", "Lin’s"])
+                evidence.append({"style": contracts[index][0], "case": contracts[index][1], "lines": lines[1],
+                                 "glyphs": signatures[1]})
+        core.save_json(root / "apostrophe-break-evidence.json", {"cases": evidence})
+
     def compile_font_fixture(self, name, body):
         """Compile an isolated copy of the production style, retaining real PDF evidence."""
         import os

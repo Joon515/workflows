@@ -85,21 +85,91 @@ def _literal_text(text: str) -> str:
     return "".join(_LITERAL_ESCAPE.get(c, c) for c in text).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _ordinary_text(text: str) -> str:
+def _latin_apostrophe_words(text: str) -> list[tuple[int, int]]:
+    """Find Latin words, including attached marks, with a literal in-word U+2019."""
+    if "’" not in text:
+        return []
+
+    def letter(char: str) -> bool:
+        return unicodedata.category(char).startswith("L") and unicodedata.name(char, "").startswith("LATIN ")
+
+    words = []
+    index = 0
+    while index < len(text):
+        if not letter(text[index]):
+            index += 1
+            continue
+        start = index
+        apostrophe = False
+        while index < len(text):
+            if letter(text[index]) or unicodedata.category(text[index]).startswith("M"):
+                index += 1
+            elif text[index] == "’" and index + 1 < len(text) and letter(text[index + 1]):
+                apostrophe = True
+                index += 1
+            else:
+                break
+        if apostrophe:
+            words.append((start, index))
+    return words
+
+
+def _word_scoped(text: str, render_text, spans: list[tuple[int, int]] | None = None, *, offset: int = 0) -> str:
+    """Scope typed word ranges without boxing, flattening nodes, or changing spelling.
+
+    Ranges may extend beyond this fragment: the matching group then belongs to
+    another ordinary/name fragment in the same typed logical word.
+    """
+    if spans is None:
+        spans = _latin_apostrophe_words(text)
+    result = []
+    cursor = 0
+    for start, end in spans:
+        start, end = start - offset, end - offset
+        if end <= 0 or start >= len(text):
+            continue
+        first, last = max(0, start), min(len(text), end)
+        result.append(render_text(text[cursor:first]))
+        if start >= 0:
+            result.append(r"{\BTLatinWord ")
+        result.append(render_text(text[first:last]))
+        if end <= len(text):
+            result.append("}")
+        cursor = last
+    result.append(render_text(text[cursor:]))
+    return "".join(result)
+
+
+def _prose_literal(text: str) -> str:
+    return _word_scoped(text, _literal_text)
+
+
+def _ordinary_text(text: str, spans: list[tuple[int, int]] | None = None) -> str:
     """Add local prose opportunities without interpreting or changing literal URLs."""
-    def compounds(value: str) -> str:
-        return r"\BTLiteralHyphen{}".join(
-            r"/\allowbreak{}".join(escape(part) for part in _COMPOUND_SLASH.split(piece))
-            for piece in _COMPOUND_HYPHEN.split(value))
+    if spans is None:
+        view = _URL.sub(lambda match: "\0" * len(match[0]), text)
+        spans = _latin_apostrophe_words(view)
+
+    def compounds(value: str, offset: int) -> str:
+        result = []
+        cursor = 0
+        seams = sorted([*_COMPOUND_HYPHEN.finditer(value), *_COMPOUND_SLASH.finditer(value)],
+                       key=lambda match: match.start())
+        for seam in seams:
+            result.append(_word_scoped(value[cursor:seam.start()], escape, spans, offset=offset + cursor))
+            result.append(r"\BTLiteralHyphen{}" if seam[0] == "-" else r"/\allowbreak{}")
+            cursor = seam.end()
+        result.append(_word_scoped(value[cursor:], escape, spans, offset=offset + cursor))
+        return "".join(result)
 
     result = []
     cursor = 0
     for match in _URL.finditer(text):
-        result.append(compounds(text[cursor:match.start()]))
+        result.append(compounds(text[cursor:match.start()], cursor))
         result.append("".join(_literal_text(c) + (r"\allowbreak{}" if c in "./" else "")
                               for c in match[0]))
         cursor = match.end()
-    result.append(compounds(text[cursor:]))
+    result.append(compounds(text[cursor:], cursor))
     return "".join(result)
 
 
@@ -243,6 +313,10 @@ def _math_starts_safe(value: str) -> bool:
 
 
 def _cell_text(text: str) -> str:
+    return _word_scoped(text, _cell_literal)
+
+
+def _cell_literal(text: str) -> str:
     """Wrap overwide ASCII cell runs without changing normal prose breaks."""
     pieces = re.split(r"([!-~]+)", text)
     for index in range(1, len(pieces), 2):
@@ -310,7 +384,46 @@ class _Renderer:
         self.inline_images: list[dict] = []
         self.asset_pixels: dict[str, dict] = {}
 
-    def protected_text(self, identifier: str, *, before_edge: bool = False) -> str:
+    def _apostrophe_scopes(self, items: list[dict], literal_fragment: str | None = None) -> dict[int, list[tuple[int, int]]]:
+        """Only ordinary text and protected names share logical-word neighbors.
+
+        Page/empty markers are transparent. Terms, restoration literals, code,
+        math, notes and images retain their own typography and form barriers.
+        This is a read-only typed view, not a rewritten manuscript or TeX parse.
+        """
+        parts = []
+        offsets = []
+        cursor = 0
+        for item in items:
+            kind, value = next(iter(item.items()))
+            if kind == "text":
+                # Use original scalar offsets: URL and restoration opacity are a
+                # union, including the raw prose sides emitted around a literal.
+                opaque = [match.span() for match in _URL.finditer(value)]
+                if literal_fragment:
+                    first = value.find(literal_fragment)
+                    if first >= 0:
+                        last = first + len(literal_fragment)
+                        opaque.append((first, last))
+                        for offset, part in ((0, value[:first]), (last, value[last:])):
+                            opaque.extend((offset + match.start(), offset + match.end())
+                                          for match in _URL.finditer(part))
+                text = value
+                for first, last in opaque:
+                    text = text[:first] + "\0" * (last - first) + text[last:]
+            elif kind == "protected" and self.protected[value]["kind"] == "name":
+                text = self.protected[value]["value"]
+            else:
+                text = "" if kind == "page" else "\0"
+            offsets.append((cursor, cursor + len(text)))
+            parts.append(text)
+            cursor += len(text)
+        words = _latin_apostrophe_words("".join(parts))
+        return {index: [(start - first, end - first) for start, end in words if start < last and end > first]
+                for index, (first, last) in enumerate(offsets)}
+
+    def protected_text(self, identifier: str, *, before_edge: bool = False,
+                       _scopes: list[tuple[int, int]] | None = None) -> str:
         item = self.protected[identifier]
         value = item["value"]
         if item["kind"] in ("math", "variable"):
@@ -327,10 +440,19 @@ class _Renderer:
                               for c in value)
             return r"{\ttfamily " + literal + "}"
         if item["kind"] == "name" and _NAME_COMPOUND.fullmatch(value):
-            # Source hyphens only: constituent names never acquire hyphenation.
-            return r"\BTNameHyphen{}".join(r"\hbox{" + _literal_text(part) + "}"
-                                           for part in value.split("-"))
-        return _literal_text(value)
+            # Source hyphens only: retain each existing constituent box, even
+            # when the last constituent shares a Latin word scope with a suffix.
+            result = []
+            offset = 0
+            scopes = _latin_apostrophe_words(value) if _scopes is None else _scopes
+            for part in value.split("-"):
+                result.append(_word_scoped(part, lambda text: r"\hbox{" + _literal_text(text) + "}" if text else "",
+                                           scopes, offset=offset))
+                offset += len(part) + 1
+            return r"\BTNameHyphen{}".join(result)
+        return _word_scoped(value, _literal_text, _scopes)
+
+
 
     def _math_opener_edge(self, items: list[dict], index: int, text: str) -> bool:
         """Recognize a typed ordinary opener/math seam, not generated TeX."""
@@ -377,7 +499,7 @@ class _Renderer:
 
     def term_text(self, identifier: str, literal: str | None = None) -> str:
         term = self.terms[identifier]
-        text = _literal_text(term["target"] if literal is None else literal)
+        text = _prose_literal(term["target"] if literal is None else literal)
         if identifier in self.seen_terms:
             return text
         self.seen_terms.add(identifier)
@@ -389,15 +511,16 @@ class _Renderer:
         result = []
         cursor = 0
         for span in self.book.get("title_terms", []):
-            result.append(_literal_text(title[cursor:span["start"]]))
+            result.append(_prose_literal(title[cursor:span["start"]]))
             result.append(self.term_text(span["term"], title[span["start"]:span["end"]]))
             cursor = span["end"]
-        result.append(_literal_text(title[cursor:]))
+        result.append(_prose_literal(title[cursor:]))
         return "".join(result)
 
     def inline(self, items: list[dict], *, location: str = "body", deferred_notes: list[str] | None = None,
                index_offset: int = 0, _literal_fragment: str | None = None) -> str:
         result = []
+        scopes = self._apostrophe_scopes(items, _literal_fragment)
         for item_index, item in enumerate(items):
             index = item_index + index_offset
             kind, value = next(iter(item.items()))
@@ -407,14 +530,18 @@ class _Renderer:
                 text = value[:-1] if opener_edge else value
                 if _literal_fragment and _literal_fragment in text:
                     before, _, after = text.partition(_literal_fragment)
-                    result.append(_ordinary_text(before) + _literal_text(_literal_fragment) + _ordinary_text(after))
+                    after_offset = len(before) + len(_literal_fragment)
+                    after_scopes = [(start - after_offset, end - after_offset) for start, end in scopes[item_index]]
+                    result.append(_ordinary_text(before, scopes[item_index]) + _literal_text(_literal_fragment) +
+                                  _ordinary_text(after, after_scopes))
                 else:
-                    result.append(_ordinary_text(text))
+                    result.append(_ordinary_text(text, scopes[item_index]))
                 if opener_edge:
                     # Assignments only before the real glyph: xeCJK owns its glue.
                     result.append(r"\BTArmMathOpener{}" + escape(value[-1]) + r"\BTDisarmMathOpener{}")
             elif kind == "protected":
-                result.append(self.protected_text(value, before_edge=self._math_before_edge(items, item_index)))
+                result.append(self.protected_text(value, before_edge=self._math_before_edge(items, item_index),
+                                                  _scopes=scopes[item_index]))
             elif kind == "image":
                 key = "inline:" + str(len(self.inline_images) + 1)
                 path = self.asset(value["asset"])
@@ -568,10 +695,11 @@ class _Renderer:
 
     def header_text(self, items: list[dict]) -> str:
         """Render running labels without terms, notes, source marks, or image effects."""
-        return "".join(_literal_text(item["text"]) if "text" in item else
-                       _literal_text(self.terms[item["term"]]["target"]) if "term" in item else
-                       self.protected_text(item["protected"], before_edge=False) if "protected" in item else ""
-                       for item in items)
+        scopes = self._apostrophe_scopes(items)
+        return "".join(_word_scoped(item["text"], _literal_text, scopes[index]) if "text" in item else
+                       _prose_literal(self.terms[item["term"]]["target"]) if "term" in item else
+                       self.protected_text(item["protected"], before_edge=False, _scopes=scopes[index])
+                       if "protected" in item else "" for index, item in enumerate(items))
 
     def tex(self) -> str:
         title = self.title_text()

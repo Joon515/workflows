@@ -76,6 +76,9 @@
 \newcommand{\BTFirstTerm}[2]{%
   \begingroup\xeCJKsetup{CheckFullRight=true}\sbox{\BTTempBox}{\textsuperscript{#2}}%
   \textbf{\textit{\CJKfamily{BTTerm}#1\nobreak\usebox{\BTTempBox}}}\endgroup}
+% A renderer-owned, nonboxing Latin logical-word group; never a global quote map.
+% Keep the current NFSS family/face and native shaping/hyphenation unchanged.
+\newcommand{\BTLatinWord}{\XeTeXcharclass"2019=0\relax}
 % Preserve a literal compound hyphen while restoring native word hyphenation.
 \newcommand{\BTLiteralHyphen}{\leavevmode\nobreak\hskip0pt-\discretionary{}{}{}\nobreak\hskip0pt\relax}
 % Strict protected-name seam: the source hyphen is the only legal split.
