@@ -2,7 +2,7 @@ task:
   agentModelOverrides:
     book-source: openai-codex/gpt-6-luna:medium
     book-terminology: openai-codex/gpt-6-luna:low
-    book-translation: openai-codex/gpt-6-luna:low
+    book-translation: openai-codex/gpt-6-luna:medium
     book-review: openai-codex/gpt-6-luna:low
 retry:
   fallbackChains:

@@ -1,0 +1,1 @@
+read: requested skill://book-translator unavailable; read fallback /home/joon/project/workflows/translator/skills/book-translator/stages/source.md
